@@ -1,0 +1,8 @@
+node_modules
+dist
+.vite
+coverage
+data/*.json
+!data/.gitkeep
+apps/server/data/*.json
+*.log

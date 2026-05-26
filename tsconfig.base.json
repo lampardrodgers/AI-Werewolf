@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": false,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "paths": {
+      "@langrensha/shared": ["packages/shared/src/index.ts"],
+      "@langrensha/engine": ["packages/engine/src/index.ts"],
+      "@langrensha/prompts": ["packages/prompts/src/index.ts"],
+      "@langrensha/llm-gateway": ["packages/llm-gateway/src/index.ts"]
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@langrensha/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.2",
+    "@langrensha/engine": "*",
+    "@langrensha/llm-gateway": "*",
+    "@langrensha/prompts": "*",
+    "@langrensha/shared": "*",
+    "fastify": "^5.2.1"
+  }
+}
