@@ -43,7 +43,7 @@ export async function testProvider(providerId: string, apiKey?: string): Promise
   return (await response.json()) as { ok: boolean; error?: string; models?: Array<{ id: string; name: string }> };
 }
 
-export async function requestAIDecision(state: GameState, seatId?: PlayerId, requestId?: string): Promise<{
+export async function requestAIDecision(state: GameState, seatId?: PlayerId, requestId?: string, providerApiKeys?: Record<string, string>): Promise<{
   ok: boolean;
   command?: GameCommand;
   llmCall?: LLMCallLog;
@@ -54,7 +54,7 @@ export async function requestAIDecision(state: GameState, seatId?: PlayerId, req
   const response = await fetch("/api/ai/decision", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ state, seatId, requestId })
+    body: JSON.stringify({ state: compactStateForAIDecision(state), seatId, requestId, providerApiKeys: sanitizeProviderApiKeys(providerApiKeys) })
   });
   if (!response.ok) throw new Error("AI 决策请求失败");
   return (await response.json()) as {
@@ -65,6 +65,32 @@ export async function requestAIDecision(state: GameState, seatId?: PlayerId, req
     fallback: boolean;
     error?: string;
   };
+}
+
+function compactStateForAIDecision(state: GameState): GameState {
+  return {
+    ...state,
+    llmCalls: state.llmCalls.map((call) => ({
+      ...call,
+      promptTextRedacted: "",
+      rawResponse: "",
+      parsedJson: {},
+      publicSpeech: truncateText(call.publicSpeech, 600),
+      privateRationale: truncateText(call.privateRationale, 400),
+      error: truncateText(call.error, 500)
+    }))
+  };
+}
+
+function truncateText(value: string | undefined, maxLength: number): string | undefined {
+  if (!value || value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength)}...`;
+}
+
+function sanitizeProviderApiKeys(providerApiKeys: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!providerApiKeys) return undefined;
+  const sanitized = Object.fromEntries(Object.entries(providerApiKeys).filter(([, value]) => value.trim()));
+  return Object.keys(sanitized).length > 0 ? sanitized : undefined;
 }
 
 export async function loadAIDecisionStatus(requestId: string): Promise<AIDecisionStatus | undefined> {

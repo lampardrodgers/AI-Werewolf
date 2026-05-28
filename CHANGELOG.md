@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.1 - 2026-05-28
+
+- Improved AI decision handling and LLM gateway provider behavior.
+- Expanded server, engine, gateway, and readiness test coverage.
+- Updated web client API configuration, provider setup UI, and styling.
+- Changed local web/server ports and preview host configuration.
+
 ## v0.1.0 - 2026-05-26
 
 - Initial AI Werewolf workspace release.

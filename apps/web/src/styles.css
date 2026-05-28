@@ -237,6 +237,17 @@ input[type="range"] {
   padding: 0;
 }
 
+.range-with-number {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px;
+  gap: 10px;
+  align-items: center;
+}
+
+.range-with-number input[type="number"] {
+  text-align: center;
+}
+
 .file-button input {
   display: none;
 }

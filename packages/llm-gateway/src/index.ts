@@ -38,6 +38,16 @@ export interface LLMObjectResponse<TObject = unknown> extends LLMTextResponse {
   object: TObject;
 }
 
+export class LLMObjectParseError extends Error {
+  constructor(
+    message: string,
+    public readonly response: LLMTextResponse
+  ) {
+    super(message);
+    this.name = "LLMObjectParseError";
+  }
+}
+
 export interface LLMProviderAdapter {
   listModels(provider: ProviderAccount, apiKey?: string): Promise<ModelInfo[]>;
   generateText(req: LLMTextRequest): Promise<LLMTextResponse>;
@@ -134,9 +144,8 @@ class OpenAIResponsesAdapter implements LLMProviderAdapter {
     }, req.timeoutMs ?? req.provider.timeoutMs);
     const raw = (await response.json()) as OpenAIResponsePayload;
     const text = extractOpenAIText(raw);
-    return {
+    return parseObjectResponse<TObject>({
       text,
-      object: parseJsonObject<TObject>(text),
       raw,
       usage: {
         inputTokens: raw.usage?.input_tokens ?? 0,
@@ -145,7 +154,7 @@ class OpenAIResponsesAdapter implements LLMProviderAdapter {
         cachedTokens: raw.usage?.input_tokens_details?.cached_tokens ?? 0
       },
       latencyMs: Date.now() - started
-    };
+    });
   }
 }
 
@@ -171,12 +180,13 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
         temperature: req.temperature,
         top_p: req.topP,
         max_tokens: req.maxOutputTokens,
-        reasoning_effort: req.reasoningEffort
+        reasoning_effort: req.reasoningEffort,
+        thinking: deepSeekThinkingOption(req.provider)
       })
     }, req.timeoutMs ?? req.provider.timeoutMs);
     const raw = (await response.json()) as ChatCompletionPayload;
     return {
-      text: raw.choices?.[0]?.message?.content ?? "",
+      text: extractChatCompletionText(raw, { allowReasoningJson: true }),
       raw,
       usage: {
         inputTokens: raw.usage?.prompt_tokens ?? 0,
@@ -188,31 +198,32 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
 
   async generateObject<TObject>(req: LLMObjectRequest): Promise<LLMObjectResponse<TObject>> {
     const started = Date.now();
+    const responseFormat = responseFormatForObjectRequest(req.provider, req.schema);
     const response = await fetchWithTimeout(`${req.provider.baseUrl || this.defaultBaseUrl}/chat/completions`, {
       method: "POST",
       headers: { ...authHeaders(req.apiKey), "Content-Type": "application/json" },
       body: JSON.stringify({
         model: req.model,
-        messages: [{ role: "user", content: `${req.prompt}\n\n只输出 JSON，Schema: ${JSON.stringify(req.schema)}` }],
+        messages: [{ role: "user", content: `${req.prompt}\n\n只输出 JSON/json，Schema: ${JSON.stringify(req.schema)}` }],
         temperature: req.temperature,
         top_p: req.topP,
         max_tokens: req.maxOutputTokens,
         reasoning_effort: req.reasoningEffort,
-        response_format: req.provider.supportsJsonSchema ? jsonSchemaResponseFormat(req.schema) : undefined
+        thinking: deepSeekThinkingOption(req.provider),
+        response_format: responseFormat
       })
     }, req.timeoutMs ?? req.provider.timeoutMs);
     const raw = (await response.json()) as ChatCompletionPayload;
-    const text = raw.choices?.[0]?.message?.content ?? "";
-    return {
+    const text = extractChatCompletionText(raw, { allowReasoningJson: true });
+    return parseObjectResponse<TObject>({
       text,
-      object: parseJsonObject<TObject>(text),
       raw,
       usage: {
         inputTokens: raw.usage?.prompt_tokens ?? 0,
         outputTokens: raw.usage?.completion_tokens ?? 0
       },
       latencyMs: Date.now() - started
-    };
+    });
   }
 }
 
@@ -252,7 +263,7 @@ class AnthropicAdapter implements LLMProviderAdapter {
 
   async generateObject<TObject>(req: LLMObjectRequest): Promise<LLMObjectResponse<TObject>> {
     const response = await this.generateText({ ...req, prompt: `${req.prompt}\n\n只输出 JSON，Schema: ${JSON.stringify(req.schema)}` });
-    return { ...response, object: parseJsonObject<TObject>(response.text) };
+    return parseObjectResponse<TObject>(response);
   }
 }
 
@@ -310,16 +321,15 @@ class GeminiAdapter implements LLMProviderAdapter {
     }, req.timeoutMs ?? req.provider.timeoutMs);
     const raw = (await response.json()) as GeminiPayload;
     const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
-    return {
+    return parseObjectResponse<TObject>({
       text,
-      object: parseJsonObject<TObject>(text),
       raw,
       usage: {
         inputTokens: raw.usageMetadata?.promptTokenCount ?? 0,
         outputTokens: raw.usageMetadata?.candidatesTokenCount ?? 0
       },
       latencyMs: Date.now() - started
-    };
+    });
   }
 }
 
@@ -335,7 +345,7 @@ interface OpenAIResponsePayload {
 }
 
 interface ChatCompletionPayload {
-  choices?: Array<{ message?: { content?: string } }>;
+  choices?: Array<{ message?: { content?: string | null; reasoning_content?: string | null } }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number };
 }
 
@@ -352,6 +362,29 @@ interface GeminiPayload {
 function extractOpenAIText(raw: OpenAIResponsePayload): string {
   if (raw.output_text) return raw.output_text;
   return raw.output?.flatMap((item) => item.content ?? []).map((item) => item.text ?? "").join("") ?? "";
+}
+
+function extractChatCompletionText(raw: ChatCompletionPayload, options: { allowReasoningJson?: boolean } = {}): string {
+  const message = raw.choices?.[0]?.message;
+  const content = message?.content?.trim();
+  if (content) return content;
+  if (!options.allowReasoningJson) return "";
+  const reasoning = message?.reasoning_content?.trim();
+  if (!reasoning) return "";
+  return firstParseableJsonObjectText(reasoning) ?? "";
+}
+
+function firstParseableJsonObjectText(text: string): string | undefined {
+  for (const candidate of extractJsonObjectCandidates(stripMarkdownFence(text))) {
+    if (tryParseJson(candidate).ok) return candidate;
+    const escaped = escapeControlCharsInJsonStrings(candidate);
+    if (tryParseJson(escaped).ok) return escaped;
+  }
+  return undefined;
+}
+
+function deepSeekThinkingOption(provider: ProviderAccount): { type: "disabled" } | undefined {
+  return provider.baseUrl.includes("api.deepseek.com") ? { type: "disabled" } : undefined;
 }
 
 function authHeaders(apiKey?: string): Record<string, string> {
@@ -373,6 +406,12 @@ function jsonSchemaResponseFormat(schema: unknown): Record<string, unknown> {
   };
 }
 
+function responseFormatForObjectRequest(provider: ProviderAccount, schema: unknown): Record<string, unknown> | undefined {
+  if (provider.supportsJsonSchema) return jsonSchemaResponseFormat(schema);
+  if (provider.baseUrl.includes("api.deepseek.com")) return { type: "json_object" };
+  return undefined;
+}
+
 function jsonSchemaTextFormat(schema: unknown): Record<string, unknown> {
   return {
     type: "json_schema",
@@ -382,7 +421,23 @@ function jsonSchemaTextFormat(schema: unknown): Record<string, unknown> {
   };
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 15000): Promise<Response> {
+export function parseObjectResponse<TObject>(response: LLMTextResponse): LLMObjectResponse<TObject> {
+  try {
+    return { ...response, object: parseJsonObject<TObject>(response.text) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new LLMObjectParseError(message, response);
+  }
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs?: number): Promise<Response> {
+  if (!timeoutMs || timeoutMs <= 0) {
+    const response = await fetch(url, init);
+    if (!response.ok) {
+      throw new Error(`LLM request failed: ${response.status} ${response.statusText}`);
+    }
+    return response;
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -398,15 +453,108 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 1500
 
 function parseJsonObject<TObject>(text: string): TObject {
   const trimmed = text.trim();
-  const unfenced = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
-  try {
-    return JSON.parse(unfenced) as TObject;
-  } catch {
-    const start = unfenced.indexOf("{");
-    const end = unfenced.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      return JSON.parse(unfenced.slice(start, end + 1)) as TObject;
-    }
-    throw new Error("LLM response did not contain a valid JSON object");
+  const unfenced = stripMarkdownFence(trimmed);
+  const direct = tryParseJson<TObject>(unfenced);
+  if (direct.ok) return direct.value;
+
+  for (const candidate of extractJsonObjectCandidates(unfenced)) {
+    const parsed = tryParseJson<TObject>(candidate);
+    if (parsed.ok) return parsed.value;
+    const escaped = tryParseJson<TObject>(escapeControlCharsInJsonStrings(candidate));
+    if (escaped.ok) return escaped.value;
   }
+
+  throw new Error(`LLM response did not contain a valid JSON object: ${previewInvalidJsonText(text)}`);
+}
+
+function previewInvalidJsonText(text: string): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact ? compact.slice(0, 180) : "<empty>";
+}
+
+function stripMarkdownFence(text: string): string {
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```/i);
+  return (fenced?.[1] ?? text).trim();
+}
+
+function tryParseJson<TObject>(text: string): { ok: true; value: TObject } | { ok: false } {
+  try {
+    return { ok: true, value: JSON.parse(text) as TObject };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function extractJsonObjectCandidates(text: string): string[] {
+  const candidates: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+    } else if (char === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+    } else if (char === "}" && depth > 0) {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        candidates.push(text.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function escapeControlCharsInJsonStrings(text: string): string {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (!inString) {
+      result += char;
+      if (char === "\"") inString = true;
+      continue;
+    }
+
+    if (escaped) {
+      result += char;
+      escaped = false;
+    } else if (char === "\\") {
+      result += char;
+      escaped = true;
+    } else if (char === "\"") {
+      result += char;
+      inString = false;
+    } else if (char === "\r") {
+      if (text[index + 1] === "\n") index += 1;
+      result += "\\n";
+    } else if (char === "\n") {
+      result += "\\n";
+    } else if (char === "\t") {
+      result += "\\t";
+    } else {
+      result += char;
+    }
+  }
+
+  return result;
 }

@@ -457,7 +457,7 @@ export const DEFAULT_AI_CONFIG: AIConfigStore = {
       authType: "api_key",
       enabled: true,
       rateLimit: { rpm: 9999, tpm: 999999, concurrency: 12 },
-      timeoutMs: 15000,
+      timeoutMs: 0,
       retryCount: 1,
       defaultModel: "deterministic-mock",
       supportsJsonSchema: true,
@@ -506,14 +506,14 @@ export function buildAIReadiness(config: AIConfigStore): AIReadinessReport {
       detail: realProviders.length > 0 ? `已启用 ${realProviders.length} 个非 Mock 供应商。` : "至少启用一个 OpenAI、OpenAI Compatible、Anthropic、Gemini 或 xAI 供应商。"
     },
     {
-      label: "密钥或令牌已保存",
+      label: "本机密钥可用",
       ok: realProviders.length > 0 && realProviderWithSecret.length === realProviders.length,
       detail:
         realProviders.length === 0
           ? "还没有可检查的真实供应商。"
           : realProviderWithSecret.length === realProviders.length
-            ? "所有启用的真实供应商都有 API Key / Access Token。"
-            : `${realProviders.length - realProviderWithSecret.length} 个启用供应商还缺 API Key / Access Token。`
+            ? "所有启用的真实供应商都有本机 API Key / Access Token。"
+            : `${realProviders.length - realProviderWithSecret.length} 个启用供应商还缺本机 API Key / Access Token。`
     },
     {
       label: "随机角色卡指向真实供应商",

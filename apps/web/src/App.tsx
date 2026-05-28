@@ -58,12 +58,17 @@ import { AIDecisionStatus, loadAIConfig, loadAIDecisionStatus, requestAIDecision
 type AppScreen = "setup" | "game" | "admin";
 type AdminSection = "overview" | "ai" | "roles" | "logs";
 type GameSideTab = "chat" | "votes" | "exposure" | "records" | "rules";
+type LocalProviderApiKeys = Record<string, string>;
 
 const SPEECH_STYLES: AIPersona["speechStyle"][] = ["冷静", "激进", "幽默", "老玩家", "新手", "阴阳怪气", "简洁"];
 const REASONING_STRENGTHS: AIPersona["reasoningStrength"][] = ["fast", "normal", "deep"];
 const SPEECH_LENGTHS: AIPersona["speechLength"][] = ["short", "medium", "long"];
 const REASONING_EFFORTS: AIPersona["reasoningEffort"][] = ["minimal", "low", "medium", "high"];
 const AUTO_STEP_DELAY_MS = 700;
+const LOCAL_PROVIDER_KEYS_STORAGE_KEY = "langrensha.localProviderApiKeys.v1";
+const LOCAL_SECRET_SENTINEL = "__local_browser__";
+const PRIVATE_NIGHT_PHASES = new Set<GameState["phase"]["type"]>(["night_guard", "night_wolves", "night_seer", "night_witch"]);
+const PRIVATE_NIGHT_ACTIONS = new Set<PendingAction["kind"]>(["guard_protect", "seer_check", "witch_action", "wolf_discussion"]);
 
 const DEFAULT_SETUP: GameSetup = {
   totalPlayers: 8,
@@ -89,7 +94,7 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     authType: "api_key",
     enabled: true,
     rateLimit: { rpm: 60, tpm: 120000, concurrency: 3 },
-    timeoutMs: 30000,
+    timeoutMs: 0,
     retryCount: 1,
     defaultModel: "model-name",
     supportsJsonSchema: true,
@@ -105,7 +110,7 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     authType: "api_key",
     enabled: true,
     rateLimit: { rpm: 60, tpm: 120000, concurrency: 3 },
-    timeoutMs: 30000,
+    timeoutMs: 0,
     retryCount: 1,
     defaultModel: "model-name",
     supportsJsonSchema: true,
@@ -121,7 +126,7 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     authType: "api_key",
     enabled: true,
     rateLimit: { rpm: 60, tpm: 120000, concurrency: 3 },
-    timeoutMs: 30000,
+    timeoutMs: 0,
     retryCount: 1,
     defaultModel: "model-name",
     supportsJsonSchema: false,
@@ -137,7 +142,7 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     authType: "api_key",
     enabled: true,
     rateLimit: { rpm: 60, tpm: 120000, concurrency: 3 },
-    timeoutMs: 30000,
+    timeoutMs: 0,
     retryCount: 1,
     defaultModel: "model-name",
     supportsJsonSchema: true,
@@ -153,7 +158,7 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     authType: "api_key",
     enabled: true,
     rateLimit: { rpm: 60, tpm: 120000, concurrency: 3 },
-    timeoutMs: 30000,
+    timeoutMs: 0,
     retryCount: 1,
     defaultModel: "model-name",
     supportsJsonSchema: true,
@@ -169,7 +174,7 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     authType: "oauth",
     enabled: false,
     rateLimit: { rpm: 10, tpm: 50000, concurrency: 1 },
-    timeoutMs: 60000,
+    timeoutMs: 0,
     retryCount: 0,
     defaultModel: "codex-cli-local",
     supportsJsonSchema: false,
@@ -195,6 +200,7 @@ export function App(): JSX.Element {
   const [config, setConfig] = useState<AIConfigStore>(DEFAULT_AI_CONFIG);
   const [configStatus, setConfigStatus] = useState("配置尚未保存");
   const [providerTestStatus, setProviderTestStatus] = useState("");
+  const [providerApiKeys, setProviderApiKeys] = useState<LocalProviderApiKeys>(() => loadLocalProviderApiKeys());
   const [aiMode, setAiMode] = useState<"mock" | "llm">("mock");
   const [aiBusy, setAiBusy] = useState(false);
   const [aiElapsedSeconds, setAiElapsedSeconds] = useState(0);
@@ -215,11 +221,12 @@ export function App(): JSX.Element {
     if (!game) return false;
     return game.pendingActions.some((action) => game.players.find((player) => player.id === action.seatId)?.controller !== "human");
   }, [game]);
+  const configWithLocalSecretStatus = useMemo(() => markLocalProviderSecretStatus(config, providerApiKeys), [config, providerApiKeys]);
 
   useEffect(() => {
     loadAIConfig()
       .then((loaded) => {
-        setConfig({ ...loaded, costControls: loaded.costControls ?? DEFAULT_COST_CONTROLS });
+        setConfig(stripProviderSecrets({ ...loaded, costControls: loaded.costControls ?? DEFAULT_COST_CONTROLS }));
         setConfigStatus("已从后端读取配置");
       })
       .catch((error) => setConfigStatus(error instanceof Error ? error.message : "读取配置失败"));
@@ -307,6 +314,16 @@ export function App(): JSX.Element {
       return;
     }
 
+    const pendingPlayer = game.players.find((player) => player.id === pending.seatId);
+    const persona = config.personas.find((item) => item.id === pendingPlayer?.personaId) ?? config.personas[0] ?? DEFAULT_PERSONAS[0];
+    const provider = config.providers.find((item) => item.id === persona.defaultProviderId && item.enabled);
+    if (provider && !provider.baseUrl.startsWith("mock://") && !providerApiKeys[provider.id]?.trim()) {
+      setAutoRun(false);
+      setIsPaused(true);
+      setAiStepStatus(`${provider.name} 缺少本机 API Key / Access Token。请在管理控制台填写后继续。`);
+      return;
+    }
+
     setAiBusy(true);
     const requestId = `ai_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const startedAt = new Date().toISOString();
@@ -329,7 +346,7 @@ export function App(): JSX.Element {
         .catch(() => undefined);
     }, 1000);
     try {
-      const result = await requestAIDecision(game, pending.seatId, requestId);
+      const result = await requestAIDecision(game, pending.seatId, requestId, providerApiKeys);
       if (!result.ok || !result.command) {
         setAiStepStatus(result.error ? `自动处理失败：${result.error}` : "自动处理失败，请稍后重试。");
         return;
@@ -459,9 +476,9 @@ export function App(): JSX.Element {
 
   async function saveConfig(): Promise<void> {
     try {
-      const saved = await saveAIConfig(config);
-      setConfig(saved);
-      setConfigStatus("配置已保存到后端");
+      const saved = await saveAIConfig(stripProviderSecrets(config));
+      setConfig(stripProviderSecrets(saved));
+      setConfigStatus("配置已保存到后端，密钥仅保留在当前浏览器");
     } catch (error) {
       setConfigStatus(error instanceof Error ? error.message : "保存失败");
     }
@@ -470,11 +487,7 @@ export function App(): JSX.Element {
   async function runProviderTest(provider: ProviderAccount): Promise<void> {
     setProviderTestStatus("正在测试连接...");
     try {
-      const inlineKey =
-        provider.apiKeyEncrypted && provider.apiKeyEncrypted !== "__stored__" && !provider.apiKeyEncrypted.startsWith("enc:v1:")
-          ? provider.apiKeyEncrypted
-          : undefined;
-      const result = await testProvider(provider.id, inlineKey);
+      const result = await testProvider(provider.id, providerApiKeys[provider.id]?.trim() || undefined);
       if (result.ok) {
         const incoming = result.models ?? [];
         if (incoming.length > 0) {
@@ -489,15 +502,31 @@ export function App(): JSX.Element {
     }
   }
 
+  function setLocalProviderApiKey(providerId: string, apiKey: string): void {
+    setProviderApiKeys((current) => {
+      const next = { ...current };
+      if (apiKey.trim()) {
+        next[providerId] = apiKey;
+      } else {
+        delete next[providerId];
+      }
+      saveLocalProviderApiKeys(next);
+      return next;
+    });
+  }
+
   if (screen === "admin") {
     return (
       <AdminConsole
         section={adminSection}
         setSection={setAdminSection}
         config={config}
+        readinessConfig={configWithLocalSecretStatus}
         setConfig={setConfig}
         configStatus={configStatus}
         providerTestStatus={providerTestStatus}
+        providerApiKeys={providerApiKeys}
+        onProviderApiKeyChange={setLocalProviderApiKey}
         aiMode={aiMode}
         setAiMode={setAiMode}
         onSave={saveConfig}
@@ -592,9 +621,12 @@ function AdminConsole({
   section,
   setSection,
   config,
+  readinessConfig,
   setConfig,
   configStatus,
   providerTestStatus,
+  providerApiKeys,
+  onProviderApiKeyChange,
   aiMode,
   setAiMode,
   onSave,
@@ -604,16 +636,19 @@ function AdminConsole({
   section: AdminSection;
   setSection: (section: AdminSection) => void;
   config: AIConfigStore;
+  readinessConfig: AIConfigStore;
   setConfig: (config: AIConfigStore) => void;
   configStatus: string;
   providerTestStatus: string;
+  providerApiKeys: LocalProviderApiKeys;
+  onProviderApiKeyChange: (providerId: string, apiKey: string) => void;
   aiMode: "mock" | "llm";
   setAiMode: (value: "mock" | "llm") => void;
   onSave: () => void;
   onTestProvider: (provider: ProviderAccount) => void;
   onBack: () => void;
 }): JSX.Element {
-  const readiness = buildAIReadiness(config);
+  const readiness = buildAIReadiness(readinessConfig);
   const nav: Array<{ id: AdminSection; label: string }> = [
     { id: "overview", label: "控制台" },
     { id: "ai", label: "AI 配置" },
@@ -694,9 +729,12 @@ function AdminConsole({
         {section === "ai" && (
           <AISettingsPanel
             config={config}
+            readinessConfig={readinessConfig}
             setConfig={setConfig}
             configStatus={configStatus}
             providerTestStatus={providerTestStatus}
+            providerApiKeys={providerApiKeys}
+            onProviderApiKeyChange={onProviderApiKeyChange}
             onSave={onSave}
             onTestProvider={onTestProvider}
           />
@@ -828,8 +866,8 @@ function GameRoom({
           </div>
         </div>
         <div className="room-phase-head">
-          <span>{game.phase.label}</span>
-          <strong>{game.phase.progressLabel ?? "等待行动"}</strong>
+          <span>{visiblePhaseLabel(game, humanPlayerId)}</span>
+          <strong>{visiblePhaseProgress(game, humanPlayerId)}</strong>
         </div>
         <div className="room-actions">
           <button className="ghost-button" onClick={onOpenAdmin}>
@@ -861,6 +899,7 @@ function GameRoom({
           streamingSpeech={streamingSpeech}
           isPaused={isPaused}
           autoRun={autoRun}
+          humanPlayerId={humanPlayerId}
           humanPending={humanPending}
         />
         <aside className="right-panel room-side">
@@ -937,8 +976,8 @@ function SetupScreen({
   const aiPlayers = setup.totalPlayers - setup.humanPlayers;
 
   function patch(next: Partial<GameSetup>): void {
-    const totalPlayers = next.totalPlayers ?? setup.totalPlayers;
-    const humanPlayers = Math.min(next.humanPlayers ?? setup.humanPlayers, totalPlayers);
+    const totalPlayers = clampNumber(next.totalPlayers ?? setup.totalPlayers, 6, 12);
+    const humanPlayers = clampNumber(next.humanPlayers ?? setup.humanPlayers, 0, totalPlayers);
     setSetup({ ...setup, ...next, totalPlayers, humanPlayers, aiPlayers: totalPlayers - humanPlayers });
   }
 
@@ -951,12 +990,32 @@ function SetupScreen({
       <div className="setup-grid">
         <label>
           总人数
-          <input type="range" min={6} max={12} value={setup.totalPlayers} onChange={(event) => patch({ totalPlayers: Number(event.target.value) })} />
+          <div className="range-with-number">
+            <input type="range" min={6} max={12} value={setup.totalPlayers} onChange={(event) => patch({ totalPlayers: Number(event.target.value) })} />
+            <input
+              aria-label="总人数数字"
+              type="number"
+              min={6}
+              max={12}
+              value={setup.totalPlayers}
+              onChange={(event) => patch({ totalPlayers: Number(event.target.value) })}
+            />
+          </div>
           <strong>{setup.totalPlayers} 人</strong>
         </label>
         <label>
           真人数量
-          <input type="range" min={0} max={setup.totalPlayers} value={setup.humanPlayers} onChange={(event) => patch({ humanPlayers: Number(event.target.value) })} />
+          <div className="range-with-number">
+            <input type="range" min={0} max={setup.totalPlayers} value={setup.humanPlayers} onChange={(event) => patch({ humanPlayers: Number(event.target.value) })} />
+            <input
+              aria-label="真人数量数字"
+              type="number"
+              min={0}
+              max={setup.totalPlayers}
+              value={setup.humanPlayers}
+              onChange={(event) => patch({ humanPlayers: Number(event.target.value) })}
+            />
+          </div>
           <strong>{setup.humanPlayers} 真人 · {aiPlayers} AI</strong>
         </label>
         <label>
@@ -984,6 +1043,8 @@ function SeatPanel({ game, humanPlayerId }: { game: GameState; humanPlayerId?: P
     human?.role === "werewolf" ? game.players.filter((player) => player.role === "werewolf" && player.id !== human.id) : [];
   const steps = ["夜晚行动", "警长竞选", "白天发言", "投票放逐", "游戏结束"];
   const activeStep = game.status === "ended" ? 4 : game.phase.type.startsWith("night") ? 0 : game.phase.type.startsWith("sheriff") ? 1 : game.phase.type.includes("vote") ? 3 : 2;
+  const phaseLabel = visiblePhaseLabel(game, humanPlayerId);
+  const phaseProgress = visiblePhaseProgress(game, humanPlayerId);
   return (
     <aside className="seat-panel room-left">
       <section className="identity-card hero-identity">
@@ -1033,8 +1094,8 @@ function SeatPanel({ game, humanPlayerId }: { game: GameState; humanPlayerId?: P
           <Moon size={17} />
           当前环节
         </div>
-        <strong>{game.phase.label}</strong>
-        <p>{game.phase.actingSeatId ? `${seatName(game, game.phase.actingSeatId)} 行动中` : game.phase.progressLabel ?? "等待行动"}</p>
+        <strong>{phaseLabel}</strong>
+        <p>{phaseProgress}</p>
         <div className="phase-track">
           {steps.map((step, index) => (
             <div className={`phase-step ${index <= activeStep ? "done" : ""} ${index === activeStep ? "current" : ""}`} key={step}>
@@ -1065,6 +1126,7 @@ function CenterPanel({
   streamingSpeech,
   isPaused,
   autoRun,
+  humanPlayerId,
   humanPending
 }: {
   game: GameState;
@@ -1076,20 +1138,24 @@ function CenterPanel({
   streamingSpeech: string;
   isPaused: boolean;
   autoRun: boolean;
+  humanPlayerId?: PlayerId;
   humanPending?: PendingAction;
 }): JSX.Element {
   const latestSpeech = [...visibleEvents].reverse().find((event) => event.type === "SpeechPublished" || event.type === "LastWordsPublished" || event.type === "WolfDiscussionMessage");
   const aiPending = game.pendingActions.find((action) => game.players.find((player) => player.id === action.seatId)?.controller !== "human");
-  const actingPlayer = game.phase.actingSeatId ? game.players.find((player) => player.id === game.phase.actingSeatId) : undefined;
-  const statusText = buildActionStatusText(game, humanPending, aiPending, aiBusy, aiElapsedSeconds, aiProgress, isPaused, autoRun, aiStepStatus);
+  const visibleActingSeat = visibleActingSeatId(game, humanPlayerId);
+  const actingPlayer = visibleActingSeat ? game.players.find((player) => player.id === visibleActingSeat) : undefined;
+  const statusText = buildActionStatusText(game, humanPlayerId, humanPending, aiPending, aiBusy, aiElapsedSeconds, aiProgress, isPaused, autoRun, aiStepStatus);
   const speechLabel = aiBusy ? thinkingLabel(aiProgress, aiElapsedSeconds) : streamingSpeech ? "流式输出" : "最近发言";
+  const phaseLabel = visiblePhaseLabel(game, humanPlayerId);
+  const phaseProgress = visiblePhaseProgress(game, humanPlayerId);
   return (
     <section className="center-panel table-panel">
       <div className="table-scene">
         <div className="moonlit-table">
           {game.players.map((player, index) => {
             const angle = -90 + (360 / game.players.length) * index;
-            const active = game.phase.actingSeatId === player.id;
+            const active = visibleActingSeat === player.id;
             return (
               <div
                 className={`table-seat ${active ? "active" : ""} ${!player.alive ? "dead" : ""}`}
@@ -1099,7 +1165,7 @@ function CenterPanel({
                 <div className="seat-orbit-card">
                   <span className="seat-number">{player.seatNumber}</span>
                   <div className="avatar portrait">{publicPlayerAvatar(player)}</div>
-                  {player.id === game.phase.actingSeatId && (
+                  {player.id === visibleActingSeat && (
                     <span className={`thinking-dot ${aiBusy ? "thinking" : ""}`}>
                       {seatActivityLabel(player, humanPending, aiBusy, isPaused, autoRun)}
                     </span>
@@ -1113,11 +1179,11 @@ function CenterPanel({
           })}
           <div className="table-core">
             <StatusBadge game={game} />
-            <h2>{game.phase.label}</h2>
+            <h2>{phaseLabel}</h2>
             <strong>
               {actingPlayer
                 ? `${seatName(game, actingPlayer.id)} · ${seatActivityLabel(actingPlayer, humanPending, aiBusy, isPaused, autoRun)}`
-                : game.phase.progressLabel ?? "等待行动"}
+                : phaseProgress}
             </strong>
             <div className="table-speech">
               <span>{speechLabel}</span>
@@ -1152,6 +1218,7 @@ function seatActivityLabel(
 
 function buildActionStatusText(
   game: GameState,
+  humanPlayerId: PlayerId | undefined,
   humanPending: PendingAction | undefined,
   aiPending: PendingAction | undefined,
   aiBusy: boolean,
@@ -1170,11 +1237,54 @@ function buildActionStatusText(
     const elapsed = aiElapsedSeconds > 0 ? `，已等待 ${aiElapsedSeconds}s` : "";
     const progress = aiProgress ? `后台状态：${aiProgress.message}` : "后台状态：等待服务端确认。";
     const stuck = thinkingWatchdogText(aiProgress, aiElapsedSeconds);
+    if (shouldHidePendingAction(game, aiPending, humanPlayerId)) {
+      return `夜晚行动正在处理${elapsed}。${progress}${stuck} 思考内容隐藏，正式输出会在中间流式显示。`;
+    }
     return `${seatName(game, aiPending.seatId)} 正在${pendingLabel(aiPending)}${elapsed}。${progress}${stuck} 思考内容隐藏，正式输出会在中间流式显示。`;
   }
+  if (aiPending && shouldHidePendingAction(game, aiPending, humanPlayerId) && autoRun) return "夜晚行动即将自动处理。";
+  if (aiPending && shouldHidePendingAction(game, aiPending, humanPlayerId)) return "夜晚行动等待 AI 处理，继续后会自动行动。";
   if (aiPending && autoRun) return `${seatName(game, aiPending.seatId)} 即将自动进行${pendingLabel(aiPending)}。`;
   if (aiPending) return `${seatName(game, aiPending.seatId)} 等待 AI 处理，继续后会自动行动。`;
   return aiStepStatus;
+}
+
+function visiblePhaseLabel(game: GameState, humanPlayerId?: PlayerId): string {
+  return shouldHideCurrentPhaseDetails(game, humanPlayerId) ? "夜晚行动" : game.phase.label;
+}
+
+function visiblePhaseProgress(game: GameState, humanPlayerId?: PlayerId): string {
+  if (shouldHideCurrentPhaseDetails(game, humanPlayerId)) return "夜晚行动中";
+  if (game.phase.actingSeatId) return `${seatName(game, game.phase.actingSeatId)} 行动中`;
+  return game.phase.progressLabel ?? "等待行动";
+}
+
+function visibleActingSeatId(game: GameState, humanPlayerId?: PlayerId): PlayerId | undefined {
+  return shouldHideCurrentPhaseDetails(game, humanPlayerId) ? undefined : game.phase.actingSeatId;
+}
+
+function shouldHideCurrentPhaseDetails(game: GameState, humanPlayerId?: PlayerId): boolean {
+  if (!PRIVATE_NIGHT_PHASES.has(game.phase.type)) return false;
+  return !canViewerSeeNightPhase(game, humanPlayerId, game.phase.type, game.phase.actingSeatId);
+}
+
+function shouldHidePendingAction(game: GameState, pending: PendingAction, humanPlayerId?: PlayerId): boolean {
+  if (!PRIVATE_NIGHT_ACTIONS.has(pending.kind)) return false;
+  return !canViewerSeeNightPhase(game, humanPlayerId, game.phase.type, pending.seatId, pending.kind);
+}
+
+function canViewerSeeNightPhase(
+  game: GameState,
+  humanPlayerId: PlayerId | undefined,
+  phaseType: GameState["phase"]["type"],
+  actingSeatId?: PlayerId,
+  pendingKind?: PendingAction["kind"]
+): boolean {
+  if (game.setup.debugMode.revealRoles || game.setup.debugMode.revealNightActions || game.setup.debugMode.revealWolfChat) return true;
+  const human = humanPlayerId ? game.players.find((player) => player.id === humanPlayerId) : undefined;
+  if (!human) return false;
+  if ((phaseType === "night_wolves" || pendingKind === "wolf_discussion") && human.role === "werewolf") return true;
+  return actingSeatId === human.id;
 }
 
 function thinkingLabel(progress: AIDecisionStatus | null, elapsedSeconds: number): string {
@@ -1187,11 +1297,10 @@ function thinkingLabel(progress: AIDecisionStatus | null, elapsedSeconds: number
 }
 
 function thinkingWatchdogText(progress: AIDecisionStatus | null, elapsedSeconds: number): string {
-  if (!progress?.timeoutMs) return "";
   const elapsedMs = elapsedSeconds * 1000;
-  const expectedMs = progress.expectedThinkingMs ?? Math.floor(progress.timeoutMs * 0.7);
-  if (elapsedMs >= progress.timeoutMs) return " 已达到本档位硬上限，服务端会触发失败/兜底，避免整局卡死。";
-  if (elapsedMs >= expectedMs) return " 已超过该思考档位的常规等待，服务端仍确认请求在等待模型返回。";
+  const expectedMs = progress?.expectedThinkingMs ?? (progress?.timeoutMs ? Math.floor(progress.timeoutMs * 0.7) : undefined);
+  if (progress?.timeoutMs && elapsedMs >= progress.timeoutMs) return " 已超过当前供应商配置的常规等待值；服务端仍会等待模型返回。";
+  if (expectedMs !== undefined && elapsedMs >= expectedMs) return " 已超过该思考档位的常规等待，服务端仍确认请求在等待模型返回。";
   return "";
 }
 
@@ -1517,21 +1626,27 @@ function roleAbilityTemplate(roleId: RoleId): string {
 
 function AISettingsPanel({
   config,
+  readinessConfig,
   setConfig,
   configStatus,
   providerTestStatus,
+  providerApiKeys,
+  onProviderApiKeyChange,
   onSave,
   onTestProvider
 }: {
   config: AIConfigStore;
+  readinessConfig: AIConfigStore;
   setConfig: (config: AIConfigStore) => void;
   configStatus: string;
   providerTestStatus: string;
+  providerApiKeys: LocalProviderApiKeys;
+  onProviderApiKeyChange: (providerId: string, apiKey: string) => void;
   onSave: () => void;
   onTestProvider: (provider: ProviderAccount) => void;
 }): JSX.Element {
   const firstPersona = config.personas[0] ?? DEFAULT_PERSONAS[0];
-  const readiness = buildAIReadiness(config);
+  const readiness = buildAIReadiness(readinessConfig);
   const preview = buildPromptPreview({
     preset: STANDARD_PRESET,
     role: "seer",
@@ -1565,8 +1680,7 @@ function AISettingsPanel({
           ? {
               ...provider,
               ...preset,
-              id: provider.id,
-              apiKeyEncrypted: provider.apiKeyEncrypted
+              id: provider.id
             }
           : provider
       )
@@ -1738,11 +1852,12 @@ function AISettingsPanel({
               <input value={provider.baseUrl} onChange={(event) => updateProvider(provider.id, { baseUrl: event.target.value })} />
             </label>
             <label>
-              API Key
+              本机 API Key
               <input
                 type="password"
-                placeholder={provider.apiKeyEncrypted ? "__stored__" : "输入后保存到后端"}
-                onChange={(event) => updateProvider(provider.id, { apiKeyEncrypted: event.target.value })}
+                value={providerApiKeys[provider.id] ?? ""}
+                placeholder="仅保存在当前浏览器，不保存到 VPS"
+                onChange={(event) => onProviderApiKeyChange(provider.id, event.target.value)}
               />
             </label>
             <label>
@@ -1759,7 +1874,7 @@ function AISettingsPanel({
             </label>
             <div className="model-grid">
               <label>
-                超时 ms
+                连接测试超时 ms（游戏思考不限制）
                 <input type="number" value={provider.timeoutMs} onChange={(event) => updateProvider(provider.id, { timeoutMs: Number(event.target.value) })} />
               </label>
               <label>
@@ -1796,6 +1911,9 @@ function AISettingsPanel({
               <button className="ghost-button" onClick={() => onTestProvider(provider)}>
                 <Eye size={15} />
                 测试连接
+              </button>
+              <button className="ghost-button" onClick={() => onProviderApiKeyChange(provider.id, "")} disabled={!providerApiKeys[provider.id]}>
+                清除本机密钥
               </button>
               <Toggle label="启用" checked={provider.enabled} onChange={(value) => updateProvider(provider.id, { enabled: value })} />
               <Toggle label="JSON Schema" checked={provider.supportsJsonSchema} onChange={(value) => updateProvider(provider.id, { supportsJsonSchema: value })} />
@@ -2649,10 +2767,10 @@ function defaultTargetFor(
   allowAbstain: boolean
 ): PlayerId | "abstain" | "skip" | "destroy" {
   if (pending.kind === "wolf_discussion") return legalTargets.find((id) => id !== pending.seatId) ?? legalTargets[0] ?? "abstain";
-  if (legalTargets[0]) return legalTargets[0];
   if (pending.kind === "hunter_shot") return "skip";
   if (pending.kind === "badge_decision") return "destroy";
   if (pending.kind === "vote") return allowAbstain ? "abstain" : legalTargets[0] ?? "abstain";
+  if (legalTargets[0]) return legalTargets[0];
   return "abstain";
 }
 
@@ -2796,6 +2914,10 @@ function seatName(game: GameState, id?: PlayerId): string {
   return player.controller === "human" ? `${player.seatNumber}号${player.name}` : `${player.seatNumber}号玩家`;
 }
 
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Number.isFinite(value) ? value : min));
+}
+
 function deathReason(reason: string | undefined): string {
   if (reason === "wolf") return "夜间死亡";
   if (reason === "poison") return "毒杀";
@@ -2845,4 +2967,38 @@ function upsertFetchedModels(
     });
   }
   return { ...config, models: nextModels };
+}
+
+function stripProviderSecrets(config: AIConfigStore): AIConfigStore {
+  return {
+    ...config,
+    providers: config.providers.map((provider) => ({ ...provider, apiKeyEncrypted: undefined }))
+  };
+}
+
+function markLocalProviderSecretStatus(config: AIConfigStore, apiKeys: LocalProviderApiKeys): AIConfigStore {
+  return {
+    ...config,
+    providers: config.providers.map((provider) => ({
+      ...provider,
+      apiKeyEncrypted: apiKeys[provider.id]?.trim() ? LOCAL_SECRET_SENTINEL : undefined
+    }))
+  };
+}
+
+function loadLocalProviderApiKeys(): LocalProviderApiKeys {
+  try {
+    const raw = window.localStorage.getItem(LOCAL_PROVIDER_KEYS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const entries = Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim().length > 0);
+    return Object.fromEntries(entries);
+  } catch {
+    return {};
+  }
+}
+
+function saveLocalProviderApiKeys(apiKeys: LocalProviderApiKeys): void {
+  const sanitized = Object.fromEntries(Object.entries(apiKeys).filter(([, value]) => value.trim()));
+  window.localStorage.setItem(LOCAL_PROVIDER_KEYS_STORAGE_KEY, JSON.stringify(sanitized));
 }

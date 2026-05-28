@@ -7,7 +7,7 @@ describe("AI readiness", () => {
 
     expect(readiness.ready).toBe(false);
     expect(item(readiness, "启用真实供应商").ok).toBe(false);
-    expect(item(readiness, "密钥或令牌已保存").ok).toBe(false);
+    expect(item(readiness, "本机密钥可用").ok).toBe(false);
     expect(item(readiness, "随机角色卡指向真实供应商").ok).toBe(false);
     expect(item(readiness, "成本保护").ok).toBe(true);
   });

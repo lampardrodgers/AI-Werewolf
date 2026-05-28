@@ -13,12 +13,14 @@ const WORKSPACE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = process.env.LANGRENSHA_DATA_DIR ? path.resolve(process.env.LANGRENSHA_DATA_DIR) : path.join(WORKSPACE_ROOT, "data");
 const CONFIG_PATH = path.join(DATA_DIR, "ai-config.json");
 const LEGACY_CONFIG_PATH = path.join(WORKSPACE_ROOT, "apps/server/data/ai-config.json");
-const STORED_SECRET_SENTINEL = "__stored__";
 const ALLOWED_ORIGINS = buildAllowedOrigins(process.env.LANGRENSHA_ALLOWED_ORIGINS);
 const AI_STATUS_TTL_MS = 10 * 60 * 1000;
 const aiStatuses = new Map<string, AIDecisionProgress & { startedAt: string; updatedAt: string }>();
 
-const fastify = Fastify({ logger: true });
+const fastify = Fastify({
+  logger: true,
+  bodyLimit: Number(process.env.LANGRENSHA_BODY_LIMIT_BYTES ?? 10 * 1024 * 1024)
+});
 await fastify.register(cors, {
   origin: (origin, callback) => {
     callback(null, isAllowedCorsOrigin(origin, ALLOWED_ORIGINS));
@@ -27,13 +29,12 @@ await fastify.register(cors, {
 
 fastify.get("/api/health", async () => ({ ok: true }));
 
-fastify.get("/api/config", async () => maskConfig(await loadConfig()));
+fastify.get("/api/config", async () => loadConfig());
 
 fastify.put<{ Body: AIConfigStore }>("/api/config", async (request) => {
-  const existing = await loadConfig();
-  const normalized = normalizeIncomingConfig(request.body, existing);
+  const normalized = normalizeIncomingConfig(request.body);
   await saveConfig(normalized);
-  return maskConfig(normalized);
+  return normalized;
 });
 
 fastify.post<{
@@ -49,7 +50,10 @@ fastify.post<{
   }
   try {
     const adapter = createProviderAdapter(provider);
-    const apiKey = request.body.apiKey || decryptSecret(provider.apiKeyEncrypted);
+    const apiKey = request.body.apiKey?.trim();
+    if (!provider.baseUrl.startsWith("mock://") && !apiKey) {
+      return { ok: false, error: "缺少本机 API Key / Access Token" };
+    }
     const models = await adapter.listModels(provider, apiKey);
     return { ok: true, models: models.slice(0, 20) };
   } catch (error) {
@@ -57,11 +61,10 @@ fastify.post<{
   }
 });
 
-fastify.get<{ Params: { requestId: string } }>("/api/ai/status/:requestId", async (request, reply) => {
+fastify.get<{ Params: { requestId: string } }>("/api/ai/status/:requestId", async (request) => {
   pruneAIStatuses();
   const status = aiStatuses.get(request.params.requestId);
   if (!status) {
-    reply.code(404);
     return { ok: false, error: "找不到 AI 请求状态" };
   }
   return { ok: true, status };
@@ -75,10 +78,10 @@ fastify.post<{ Body: AIDecisionRequest }>("/api/ai/decision", async (request) =>
     status: "received",
     message: "服务端已收到 AI 决策请求。"
   });
-  return buildAIDecision({ ...request.body, requestId }, config, decryptSecret, createProviderAdapter, recordAIProgress);
+  return buildAIDecision({ ...request.body, requestId }, config, undefined, createProviderAdapter, recordAIProgress);
 });
 
-const port = Number(process.env.PORT ?? 8787);
+const port = Number(process.env.PORT ?? 12001);
 const host = process.env.HOST ?? "127.0.0.1";
 await fastify.listen({ port, host });
 
@@ -87,17 +90,22 @@ async function loadConfig(): Promise<AIConfigStore> {
   await migrateLegacyConfig();
   try {
     const raw = await fs.readFile(CONFIG_PATH, "utf8");
-    return withConfigDefaults(JSON.parse(raw) as AIConfigStore);
+    const parsed = JSON.parse(raw) as AIConfigStore;
+    const config = withConfigDefaults(parsed);
+    if (hasStoredProviderSecrets(parsed)) {
+      await saveConfig(config);
+    }
+    return config;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     await saveConfig(DEFAULT_AI_CONFIG);
-    return DEFAULT_AI_CONFIG;
+    return normalizeIncomingConfig(DEFAULT_AI_CONFIG);
   }
 }
 
 async function saveConfig(config: AIConfigStore): Promise<void> {
   await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  await fs.writeFile(CONFIG_PATH, `${JSON.stringify(normalizeIncomingConfig(config), null, 2)}\n`, "utf8");
 }
 
 function recordAIProgress(progress: AIDecisionProgress): void {
@@ -124,64 +132,23 @@ function pruneAIStatuses(): void {
   }
 }
 
-function normalizeIncomingConfig(next: AIConfigStore, existing: AIConfigStore): AIConfigStore {
-  const existingProviders = new Map(existing.providers.map((provider) => [provider.id, provider]));
+function normalizeIncomingConfig(next: AIConfigStore): AIConfigStore {
   return {
     ...next,
-    costControls: next.costControls ?? existing.costControls ?? DEFAULT_COST_CONTROLS,
-    providers: next.providers.map((provider) => {
-      const previous = existingProviders.get(provider.id);
-      const incomingSecret = provider.apiKeyEncrypted;
-      let apiKeyEncrypted = incomingSecret;
-      if (!incomingSecret || incomingSecret === STORED_SECRET_SENTINEL) {
-        apiKeyEncrypted = previous?.apiKeyEncrypted;
-      } else if (!incomingSecret.startsWith("enc:v1:")) {
-        apiKeyEncrypted = encryptSecret(incomingSecret);
-      }
-      return { ...provider, apiKeyEncrypted };
-    })
+    costControls: next.costControls ?? DEFAULT_COST_CONTROLS,
+    providers: next.providers.map((provider) => ({ ...provider, apiKeyEncrypted: undefined }))
   };
 }
 
 function withConfigDefaults(config: AIConfigStore): AIConfigStore {
-  return {
+  return normalizeIncomingConfig({
     ...config,
     costControls: config.costControls ?? DEFAULT_COST_CONTROLS
-  };
+  });
 }
 
-function maskConfig(config: AIConfigStore): AIConfigStore {
-  return {
-    ...config,
-    providers: config.providers.map((provider) => ({
-      ...provider,
-      apiKeyEncrypted: provider.apiKeyEncrypted ? STORED_SECRET_SENTINEL : undefined
-    }))
-  };
-}
-
-function encryptSecret(secret: string | undefined): string | undefined {
-  if (!secret) return undefined;
-  const key = getEncryptionKey();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-  const encrypted = Buffer.concat([cipher.update(secret, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return `enc:v1:${iv.toString("base64")}:${tag.toString("base64")}:${encrypted.toString("base64")}`;
-}
-
-function decryptSecret(encrypted: string | undefined): string | undefined {
-  if (!encrypted) return undefined;
-  if (!encrypted.startsWith("enc:v1:")) return encrypted;
-  const [, , ivText, tagText, payloadText] = encrypted.split(":");
-  const decipher = crypto.createDecipheriv("aes-256-gcm", getEncryptionKey(), Buffer.from(ivText, "base64"));
-  decipher.setAuthTag(Buffer.from(tagText, "base64"));
-  return Buffer.concat([decipher.update(Buffer.from(payloadText, "base64")), decipher.final()]).toString("utf8");
-}
-
-function getEncryptionKey(): Buffer {
-  const secret = process.env.LANGRENSHA_CONFIG_SECRET || "langrensha-local-development-secret";
-  return crypto.createHash("sha256").update(secret).digest();
+function hasStoredProviderSecrets(config: AIConfigStore): boolean {
+  return config.providers.some((provider) => Boolean(provider.apiKeyEncrypted));
 }
 
 async function migrateLegacyConfig(): Promise<void> {

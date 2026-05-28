@@ -140,37 +140,36 @@ describe("werewolf engine", () => {
     ).toThrow("非法目标 player_999");
   });
 
-  it("allows wolves to propose any alive player, including self and wolf teammates", () => {
+  it("only allows wolves to propose living non-wolves", () => {
     let state = createGame({
       totalPlayers: 6,
       humanPlayers: 0,
       aiPlayers: 6,
-      seed: "wolf-self-target",
+      seed: "wolf-non-wolf-targets",
       rulePresetId: STANDARD_PRESET.id,
       debugMode: DEFAULT_DEBUG_MODE
     });
     const firstPending = state.pendingActions[0];
     if (firstPending.kind !== "wolf_discussion") throw new Error("expected wolf discussion as first pending action");
 
-    const aliveIds = state.players.filter((player) => player.alive).map((player) => player.id);
-    expect(firstPending.legalTargets.sort()).toEqual(aliveIds.sort());
-    expect(firstPending.legalTargets).toContain(firstPending.seatId);
+    const livingNonWolfIds = state.players.filter((player) => player.alive && player.role !== "werewolf").map((player) => player.id);
+    expect(firstPending.legalTargets.sort()).toEqual(livingNonWolfIds.sort());
+    expect(firstPending.legalTargets).not.toContain(firstPending.seatId);
 
     const teammateId = state.players.find((player) => player.role === "werewolf" && player.id !== firstPending.seatId)?.id;
     if (!teammateId) throw new Error("expected a wolf teammate");
-    expect(firstPending.legalTargets).toContain(teammateId);
+    expect(firstPending.legalTargets).not.toContain(teammateId);
 
-    state = applyCommand(state, {
-      type: "SubmitWolfDiscussionMessage",
-      seatId: firstPending.seatId,
-      messageToWolves: "我测试自刀合法性。",
-      proposedTargetId: firstPending.seatId,
-      agreeCurrentProposal: true,
-      privateReason: "自刀应是合法狼刀目标。"
-    });
-
-    const message = state.events.find((event) => event.type === "WolfDiscussionMessage" && event.seatId === firstPending.seatId);
-    expect(message?.payload).toMatchObject({ proposedTarget: firstPending.seatId });
+    expect(() =>
+      applyCommand(state, {
+        type: "SubmitWolfDiscussionMessage",
+        seatId: firstPending.seatId,
+        messageToWolves: "我测试自刀非法性。",
+        proposedTargetId: firstPending.seatId,
+        agreeCurrentProposal: true,
+        privateReason: "自刀不应是合法狼刀目标。"
+      })
+    ).toThrow(`非法目标 ${firstPending.seatId}`);
   });
 
   it("honors rule presets that forbid vote abstentions", () => {
@@ -195,7 +194,7 @@ describe("werewolf engine", () => {
     state.day = 1;
     state.phase = { type: "day_vote", day: 1, label: "白天投票" };
     state.round.day = { speechQueue: [], votes: {}, pkCandidates: [], pkSpeechQueue: [], pkVotes: {} };
-    state.pendingActions = aliveIds.map((seatId) => ({ kind: "vote", seatId, voteType: "day", legalTargets: aliveIds }));
+    state.pendingActions = aliveIds.map((seatId) => ({ kind: "vote", seatId, voteType: "day", legalTargets: aliveIds.filter((id) => id !== seatId) }));
 
     expect(() =>
       applyCommand(state, {
@@ -209,7 +208,37 @@ describe("werewolf engine", () => {
 
     const timedOut = applyCommand(state, { type: "ResolveTimeout", seatId: voterId });
     const timeoutVote = timedOut.events.find((event) => event.type === "VoteCast" && event.seatId === voterId);
-    expect(timeoutVote?.payload).toMatchObject({ targetId: aliveIds[0] });
+    expect(timeoutVote?.payload).toMatchObject({ targetId: aliveIds[1] });
+  });
+
+  it("does not allow day voters to vote for themselves", () => {
+    const state = createGame({
+      totalPlayers: 6,
+      humanPlayers: 0,
+      aiPlayers: 6,
+      seed: "no-self-vote",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const aliveIds = state.players.filter((player) => player.alive).map((player) => player.id);
+    const voterId = aliveIds[0];
+    state.day = 1;
+    state.phase = { type: "day_vote", day: 1, label: "白天投票" };
+    state.round.day = { speechQueue: [], votes: {}, pkCandidates: [], pkSpeechQueue: [], pkVotes: {} };
+    state.pendingActions = aliveIds.map((seatId) => ({ kind: "vote", seatId, voteType: "day", legalTargets: aliveIds.filter((id) => id !== seatId) }));
+
+    const pending = state.pendingActions.find((action) => action.seatId === voterId);
+    if (!pending || pending.kind !== "vote") throw new Error("expected vote pending action");
+    expect(pending.legalTargets).not.toContain(voterId);
+    expect(() =>
+      applyCommand(state, {
+        type: "SubmitVote",
+        seatId: voterId,
+        targetId: voterId,
+        privateReason: "测试不允许自投。",
+        confidence: 1
+      })
+    ).toThrow("不能投票给自己");
   });
 
   it("uses the random second-tie policy for day PK votes", () => {
@@ -408,6 +437,33 @@ describe("werewolf engine", () => {
     expect(getPlayerVisibleEvents(state, nonWolfViewer).some((event) => event.type === "WolfDiscussionMessage")).toBe(false);
   });
 
+  it("redacts private night phase actors from non-eligible viewers", () => {
+    let state = createGame({
+      totalPlayers: 10,
+      humanPlayers: 0,
+      aiPlayers: 10,
+      seed: "private-phase-redaction",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+
+    for (let index = 0; index < 8 && !state.events.some((event) => event.type === "PhaseStarted" && (event.payload as { phase?: string }).phase === "night_wolves"); index += 1) {
+      state = applyMockStep(state);
+    }
+
+    const wolfViewer = state.players.find((player) => player.role === "werewolf")?.id;
+    const nonWolfViewer = state.players.find((player) => player.role !== "werewolf")?.id;
+    if (!wolfViewer || !nonWolfViewer) throw new Error("expected wolf and non-wolf viewers");
+
+    const wolfPhasePayloads = JSON.stringify(getPlayerVisibleEvents(state, wolfViewer).filter((event) => event.type === "PhaseStarted").map((event) => event.payload));
+    const nonWolfPhasePayloads = JSON.stringify(getPlayerVisibleEvents(state, nonWolfViewer).filter((event) => event.type === "PhaseStarted").map((event) => event.payload));
+
+    expect(wolfPhasePayloads).toContain("night_wolves");
+    expect(nonWolfPhasePayloads).not.toContain("night_wolves");
+    expect(nonWolfPhasePayloads).not.toContain(wolfViewer);
+    expect(nonWolfPhasePayloads).toContain("night_hidden");
+  });
+
   it("shows locked wolf kill facts only to wolves without backend reasons", () => {
     let state = createGame({
       totalPlayers: 6,
@@ -545,10 +601,11 @@ describe("werewolf engine", () => {
     state.phase = { type: "day_vote", day: 1, label: "白天投票" };
     state.round.day = { speechQueue: [], votes: {}, pkCandidates: [], pkSpeechQueue: [], pkVotes: {} };
     const aliveIds = state.players.filter((player) => player.alive).map((player) => player.id);
-    state.pendingActions = aliveIds.map((seatId) => ({ kind: "vote", seatId, voteType: "day", legalTargets: aliveIds }));
+    state.pendingActions = aliveIds.map((seatId) => ({ kind: "vote", seatId, voteType: "day", legalTargets: aliveIds.filter((id) => id !== seatId) }));
 
     for (const voterId of aliveIds) {
-      state = applyCommand(state, { type: "SubmitVote", seatId: voterId, targetId: sheriffId, privateReason: "测试出掉警长。", confidence: 1 });
+      const targetId = voterId === sheriffId ? recipientId : sheriffId;
+      state = applyCommand(state, { type: "SubmitVote", seatId: voterId, targetId, privateReason: "测试出掉警长。", confidence: 1 });
     }
 
     expect(state.phase.type).toBe("badge_decision");

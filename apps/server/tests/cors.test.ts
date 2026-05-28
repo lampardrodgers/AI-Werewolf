@@ -6,9 +6,8 @@ describe("server CORS allowlist", () => {
     const allowedOrigins = buildAllowedOrigins();
 
     expect(isAllowedCorsOrigin(undefined, allowedOrigins)).toBe(true);
-    expect(isAllowedCorsOrigin("http://127.0.0.1:5173", allowedOrigins)).toBe(true);
-    expect(isAllowedCorsOrigin("http://localhost:5173", allowedOrigins)).toBe(true);
-    expect(isAllowedCorsOrigin("http://127.0.0.1:4173", allowedOrigins)).toBe(true);
+    expect(isAllowedCorsOrigin("http://127.0.0.1:12000", allowedOrigins)).toBe(true);
+    expect(isAllowedCorsOrigin("http://localhost:12000", allowedOrigins)).toBe(true);
   });
 
   it("rejects arbitrary websites unless explicitly configured", () => {

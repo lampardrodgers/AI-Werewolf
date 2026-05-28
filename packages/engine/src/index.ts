@@ -854,12 +854,40 @@ export function getVisibleEvents(state: GameState, viewerId?: PlayerId): GameEve
 export function getPlayerVisibleEvents(state: GameState, viewerId?: PlayerId): GameEvent[] {
   const viewer = viewerId ? state.players.find((player) => player.id === viewerId) : undefined;
   const canSeeWolfChat = viewer?.role === "werewolf";
-  return state.events.filter(
-    (event) =>
+  return state.events.flatMap((event) => {
+    const visible =
       event.visibility === "public" ||
       (event.visibility === "private" && viewerId && event.seatId === viewerId) ||
-      (canSeeWolfChat && (event.type === "WolfDiscussionMessage" || event.type === "WolfKillLocked"))
-  );
+      (canSeeWolfChat && (event.type === "WolfDiscussionMessage" || event.type === "WolfKillLocked"));
+    return visible ? [redactVisibleEventForViewer(event, viewer)] : [];
+  });
+}
+
+function redactVisibleEventForViewer(event: GameEvent, viewer: PlayerState | undefined): GameEvent {
+  if (event.type !== "PhaseStarted" || !isRecord(event.payload) || !shouldRedactPhaseStartedPayload(event.payload, viewer)) {
+    return event;
+  }
+  return {
+    ...event,
+    payload: {
+      phase: "night_hidden",
+      day: event.payload.day,
+      label: "夜晚行动"
+    }
+  };
+}
+
+function shouldRedactPhaseStartedPayload(payload: Record<string, unknown>, viewer: PlayerState | undefined): boolean {
+  const phase = String(payload.phase ?? "");
+  if (!isPrivateNightPhase(phase)) return false;
+  const actingSeatId = typeof payload.actingSeatId === "string" ? payload.actingSeatId : undefined;
+  if (phase === "night_wolves" && viewer?.role === "werewolf") return false;
+  if (viewer && actingSeatId === viewer.id) return false;
+  return true;
+}
+
+function isPrivateNightPhase(phase: string): boolean {
+  return phase === "night_guard" || phase === "night_wolves" || phase === "night_seer" || phase === "night_witch";
 }
 
 export function getLegalTargetsForPending(state: GameState, pending: PendingAction): PlayerState[] {
@@ -973,7 +1001,7 @@ function enterNightStep(state: GameState, step: ConfiguredNightStep): void {
       {
         kind: "wolf_discussion",
         seatId: firstSpeaker,
-        legalTargets: aliveIds(state),
+        legalTargets: aliveNonWolfIds(state),
         round: 1
       }
     ];
@@ -1426,7 +1454,7 @@ function enterDayVote(state: GameState, voteType: "day" | "day_pk", candidates?:
   const eligible = aliveIds(state).filter((id) => !candidates?.includes(id));
   const voters = eligible.length > 0 ? eligible : aliveIds(state);
   setPhase(state, voteType === "day" ? "day_vote" : "day_pk_vote", state.day, voteType === "day" ? "白天投票" : "PK 投票");
-  state.pendingActions = voters.map((seatId) => ({ kind: "vote", seatId, voteType, legalTargets }));
+  state.pendingActions = voters.map((seatId) => ({ kind: "vote", seatId, voteType, legalTargets: legalTargets.filter((id) => id !== seatId) }));
 }
 
 function handleSpeech(state: GameState, command: Extract<GameCommand, { type: "SubmitSpeech" }>): void {
@@ -1517,6 +1545,9 @@ function handleSpeech(state: GameState, command: Extract<GameCommand, { type: "S
 function handleVote(state: GameState, command: Extract<GameCommand, { type: "SubmitVote" }>): void {
   const pending = findPending(state, command.seatId, "vote");
   if (!pending) return;
+  if (command.targetId === command.seatId) {
+    throw new Error("不能投票给自己");
+  }
   const targetId = command.targetId === "abstain" ? "abstain" : ensureLegalTarget(command.targetId, pending.legalTargets);
   if (targetId === "abstain" && !state.rulePreset.voteRules.allowAbstain) {
     throw new Error("当前规则不允许弃票");
@@ -1725,7 +1756,9 @@ function handleTimeout(state: GameState, seatId?: PlayerId): void {
     return;
   }
   if (pending.kind === "vote") {
-    const targetId = state.rulePreset.voteRules.allowAbstain ? "abstain" : pending.legalTargets[0];
+    const fallbackTargets = pending.legalTargets.filter((id) => id !== pending.seatId);
+    const targetId = state.rulePreset.voteRules.allowAbstain ? "abstain" : fallbackTargets[0];
+    if (!targetId) return;
     handleVote(state, {
       type: "SubmitVote",
       seatId: pending.seatId,
@@ -1887,6 +1920,12 @@ function alivePlayers(state: GameState): PlayerState[] {
 
 function aliveIds(state: GameState): PlayerId[] {
   return alivePlayers(state).map((player) => player.id);
+}
+
+function aliveNonWolfIds(state: GameState): PlayerId[] {
+  return alivePlayers(state)
+    .filter((player) => player.role !== "werewolf")
+    .map((player) => player.id);
 }
 
 function findAliveRole(state: GameState, role: RoleId): PlayerState | undefined {
