@@ -17,7 +17,7 @@ import {
   Upload,
   Vote
 } from "lucide-react";
-import { type CSSProperties, type ChangeEvent, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, type ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   AgentMemoryUpdate,
   GameCommand,
@@ -27,6 +27,7 @@ import {
   applyCommand,
   applyAgentMemoryUpdate,
   applyMockStep,
+  canWolfSelfExplode,
   createSnapshotFixture,
   createGame,
   generateMarkdownLog,
@@ -34,7 +35,6 @@ import {
   restoreSnapshotFixture,
   runMockBatch
 } from "@langrensha/engine";
-import { buildPromptPreview } from "@langrensha/prompts";
 import {
   AIConfigStore,
   AIPersona,
@@ -44,14 +44,12 @@ import {
   DEFAULT_PERSONAS,
   GameSetup,
   LLMCallLog,
-  ModelConfig,
   PlayerId,
   ProviderAccount,
   ProviderType,
   ROLE_DEFINITIONS,
   RoleId,
-  STANDARD_PRESET,
-  buildAIReadiness
+  STANDARD_PRESET
 } from "@langrensha/shared";
 import { AIDecisionStatus, loadAIConfig, loadAIDecisionStatus, requestAIDecision, saveAIConfig, testProvider } from "./api";
 
@@ -59,11 +57,9 @@ type AppScreen = "setup" | "game" | "admin";
 type AdminSection = "overview" | "ai" | "roles" | "logs";
 type GameSideTab = "chat" | "votes" | "exposure" | "records" | "rules";
 type LocalProviderApiKeys = Record<string, string>;
+type ProviderTestState = "testing" | "success" | "failed";
+type ProviderTestResults = Record<string, ProviderTestState>;
 
-const SPEECH_STYLES: AIPersona["speechStyle"][] = ["冷静", "激进", "幽默", "老玩家", "新手", "阴阳怪气", "简洁"];
-const REASONING_STRENGTHS: AIPersona["reasoningStrength"][] = ["fast", "normal", "deep"];
-const SPEECH_LENGTHS: AIPersona["speechLength"][] = ["short", "medium", "long"];
-const REASONING_EFFORTS: AIPersona["reasoningEffort"][] = ["minimal", "low", "medium", "high"];
 const AUTO_STEP_DELAY_MS = 700;
 const LOCAL_PROVIDER_KEYS_STORAGE_KEY = "langrensha.localProviderApiKeys.v1";
 const LOCAL_SECRET_SENTINEL = "__local_browser__";
@@ -200,6 +196,7 @@ export function App(): JSX.Element {
   const [config, setConfig] = useState<AIConfigStore>(DEFAULT_AI_CONFIG);
   const [configStatus, setConfigStatus] = useState("配置尚未保存");
   const [providerTestStatus, setProviderTestStatus] = useState("");
+  const [providerTestResults, setProviderTestResults] = useState<ProviderTestResults>({});
   const [providerApiKeys, setProviderApiKeys] = useState<LocalProviderApiKeys>(() => loadLocalProviderApiKeys());
   const [aiMode, setAiMode] = useState<"mock" | "llm">("mock");
   const [aiBusy, setAiBusy] = useState(false);
@@ -207,8 +204,10 @@ export function App(): JSX.Element {
   const [aiProgress, setAiProgress] = useState<AIDecisionStatus | null>(null);
   const [aiStepStatus, setAiStepStatus] = useState("等待玩家行动。");
   const [streamingSpeech, setStreamingSpeech] = useState("");
+  const [streamingSpeechSeatId, setStreamingSpeechSeatId] = useState<PlayerId | undefined>();
   const [batchResult, setBatchResult] = useState<MockBatchRunResult | null>(null);
   const [debugStatus, setDebugStatus] = useState("");
+  const streamingTimerRef = useRef<number | undefined>();
 
   const humanPlayerId = useMemo(() => game?.players.find((player) => player.controller === "human")?.id, [game]);
   const publicGame = useMemo(() => (game ? toPublicViewState(game) : null), [game]);
@@ -221,6 +220,7 @@ export function App(): JSX.Element {
     if (!game) return false;
     return game.pendingActions.some((action) => game.players.find((player) => player.id === action.seatId)?.controller !== "human");
   }, [game]);
+  const canHumanSelfExplode = useMemo(() => Boolean(game && humanPlayerId && canWolfSelfExplode(game, humanPlayerId)), [game, humanPlayerId]);
   const configWithLocalSecretStatus = useMemo(() => markLocalProviderSecretStatus(config, providerApiKeys), [config, providerApiKeys]);
 
   useEffect(() => {
@@ -241,6 +241,14 @@ export function App(): JSX.Element {
     }, AUTO_STEP_DELAY_MS);
     return () => window.clearTimeout(timer);
   }, [autoRun, automatablePending, game, aiBusy, aiMode, isPaused]);
+
+  useEffect(() => {
+    return () => {
+      if (streamingTimerRef.current !== undefined) {
+        window.clearInterval(streamingTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!aiBusy) {
@@ -275,7 +283,7 @@ export function App(): JSX.Element {
     setBatchResult(null);
     setIsPaused(false);
     setAutoRun(true);
-    setStreamingSpeech("");
+    clearStreamingOutput();
     setAiProgress(null);
     setTab("chat");
     setScreen("game");
@@ -290,7 +298,7 @@ export function App(): JSX.Element {
       seed: setup.seed.trim() || `seed-${Date.now()}`
     };
     setGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
-    setStreamingSpeech("");
+    clearStreamingOutput();
     setAiProgress(null);
     setBatchResult(null);
     setTab("chat");
@@ -308,9 +316,10 @@ export function App(): JSX.Element {
       const next = applyMockStep(game);
       setGame(next);
       setAiStepStatus(`${seatName(game, pending.seatId)} 已完成 ${pendingLabel(pending)}。`);
-      setStreamingSpeech("");
-      const publicText = latestOfficialSpeechText(next);
-      if (publicText) streamOfficialOutput(publicText);
+      clearStreamingOutput();
+      const publicText = officialOutputForPending(next, pending, humanPlayerId);
+      if (publicText) streamOfficialOutput(publicText, pending.seatId);
+      pauseAfterReadableAIOutput(pending, publicText, next);
       return;
     }
 
@@ -332,11 +341,11 @@ export function App(): JSX.Element {
       status: "received",
       seatId: pending.seatId,
       phase: game.phase.label,
-      message: "客户端已提交 AI 决策请求，等待服务端确认。",
+      message: "AI 行动已提交，正在等待回应。",
       startedAt,
       updatedAt: startedAt
     });
-    setStreamingSpeech("");
+    clearStreamingOutput();
     setAiStepStatus(`${seatName(game, pending.seatId)} 正在${pendingLabel(pending)}。`);
     const pollTimer = window.setInterval(() => {
       void loadAIDecisionStatus(requestId)
@@ -365,22 +374,28 @@ export function App(): JSX.Element {
         if (result.llmCall) next.llmCalls.push(result.llmCall as LLMCallLog);
         return next;
       });
-      const publicText =
-        "text" in result.command
-          ? result.command.text
-          : "publicSpeech" in result.command
-            ? result.command.publicSpeech
-            : "messageToWolves" in result.command
-              ? result.command.messageToWolves
-              : "";
-      if (publicText) streamOfficialOutput(publicText);
+      const publicText = officialOutputForCommand(game, pending, result.command, humanPlayerId);
+      if (publicText) streamOfficialOutput(publicText, pending.seatId);
       setAiStepStatus(result.fallback ? "真实模型未返回可用动作，已用规则兜底继续。" : `${seatName(game, pending.seatId)} 已完成 ${pendingLabel(pending)}。`);
+      if (result.command) {
+        const nextState = applyCommand(game, result.command as GameCommand);
+        pauseAfterReadableAIOutput(pending, publicText, nextState);
+      }
     } catch (error) {
       setAiStepStatus(error instanceof Error ? `自动处理失败：${error.message}` : "自动处理失败，请稍后重试。");
     } finally {
       window.clearInterval(pollTimer);
       setAiBusy(false);
     }
+  }
+
+  function pauseAfterReadableAIOutput(pending: PendingAction, publicText: string, nextState: GameState): void {
+    if (!humanPlayerId) return;
+    const hasReadableSpeech = Boolean(publicText) && (pending.kind === "speech" || pending.kind === "wolf_discussion");
+    if (!hasReadableSpeech) return;
+    setAutoRun(false);
+    setIsPaused(true);
+    setAiStepStatus(`${seatName(nextState, pending.seatId)} 发言结束，点击继续进入下一位。`);
   }
 
   function submitHumanAction(): void {
@@ -391,8 +406,24 @@ export function App(): JSX.Element {
   }
 
   function withdrawSheriffCandidacy(): void {
-    if (!game || !humanPending || humanPending.kind !== "speech" || humanPending.speechType !== "sheriff") return;
-    setGame(applyCommand(game, { type: "WithdrawSheriffCandidacy", seatId: humanPending.seatId, privateReason: "真人警上退水。" }));
+    if (!game || !humanPlayerId || !canWithdrawSheriff(game, humanPlayerId)) return;
+    setGame(applyCommand(game, { type: "WithdrawSheriffCandidacy", seatId: humanPlayerId, privateReason: "真人警上退水。" }));
+  }
+
+  function submitWolfSelfExplosion(): void {
+    if (!game || !humanPlayerId || !canWolfSelfExplode(game, humanPlayerId)) return;
+    const next = applyCommand(game, {
+      type: "SubmitWolfSelfExplosion",
+      seatId: humanPlayerId,
+      privateReason: "真人狼人选择自爆，结束当前回合并直接进入夜晚。"
+    });
+    setGame(next);
+    setAutoRun(true);
+    setIsPaused(false);
+    clearStreamingOutput();
+    setAiProgress(null);
+    setAiStepStatus(`${seatName(game, humanPlayerId)} 自爆，当前回合结束，直接进入夜晚。`);
+    setTab("chat");
   }
 
   function exportMarkdown(): void {
@@ -423,7 +454,7 @@ export function App(): JSX.Element {
       setSetup(restored.setup);
       setAutoRun(true);
       setBatchResult(null);
-      setStreamingSpeech("");
+      clearStreamingOutput();
       setAiProgress(null);
       setIsPaused(false);
       setTab("exposure");
@@ -464,19 +495,33 @@ export function App(): JSX.Element {
     setTab("exposure");
   }
 
-  function streamOfficialOutput(text: string): void {
-    let index = 0;
+  function clearStreamingOutput(): void {
+    if (streamingTimerRef.current !== undefined) {
+      window.clearInterval(streamingTimerRef.current);
+      streamingTimerRef.current = undefined;
+    }
     setStreamingSpeech("");
-    const timer = window.setInterval(() => {
+    setStreamingSpeechSeatId(undefined);
+  }
+
+  function streamOfficialOutput(text: string, seatId: PlayerId): void {
+    let index = 0;
+    clearStreamingOutput();
+    setStreamingSpeechSeatId(seatId);
+    streamingTimerRef.current = window.setInterval(() => {
       index += 3;
       setStreamingSpeech(text.slice(0, index));
-      if (index >= text.length) window.clearInterval(timer);
+      if (index >= text.length && streamingTimerRef.current !== undefined) {
+        window.clearInterval(streamingTimerRef.current);
+        streamingTimerRef.current = undefined;
+      }
     }, 24);
   }
 
   async function saveConfig(): Promise<void> {
     try {
-      const saved = await saveAIConfig(stripProviderSecrets(config));
+      const synced = syncHiddenAIProviderConfig(config);
+      const saved = await saveAIConfig(stripProviderSecrets(synced));
       setConfig(stripProviderSecrets(saved));
       setConfigStatus("配置已保存到后端，密钥仅保留在当前浏览器");
     } catch (error) {
@@ -485,7 +530,8 @@ export function App(): JSX.Element {
   }
 
   async function runProviderTest(provider: ProviderAccount): Promise<void> {
-    setProviderTestStatus("正在测试连接...");
+    setProviderTestStatus(`正在测试 ${provider.name} 连接...`);
+    setProviderTestResults((current) => ({ ...current, [provider.id]: "testing" }));
     try {
       const result = await testProvider(provider.id, providerApiKeys[provider.id]?.trim() || undefined);
       if (result.ok) {
@@ -493,16 +539,24 @@ export function App(): JSX.Element {
         if (incoming.length > 0) {
           setConfig((current) => upsertFetchedModels(current, provider.id, incoming));
         }
-        setProviderTestStatus(`连接成功，返回 ${incoming.length} 个模型${incoming.length > 0 ? "，已合并到模型管理" : ""}`);
+        setProviderTestResults((current) => ({ ...current, [provider.id]: "success" }));
+        setProviderTestStatus(`${provider.name} 连接成功，返回 ${incoming.length} 个模型`);
       } else {
-        setProviderTestStatus(`连接失败：${result.error}`);
+        setProviderTestResults((current) => ({ ...current, [provider.id]: "failed" }));
+        setProviderTestStatus(`${provider.name} 连接失败：${result.error}`);
       }
     } catch (error) {
-      setProviderTestStatus(error instanceof Error ? error.message : "测试失败");
+      setProviderTestResults((current) => ({ ...current, [provider.id]: "failed" }));
+      setProviderTestStatus(error instanceof Error ? `${provider.name} 测试失败：${error.message}` : `${provider.name} 测试失败`);
     }
   }
 
   function setLocalProviderApiKey(providerId: string, apiKey: string): void {
+    setProviderTestResults((current) => {
+      const next = { ...current };
+      delete next[providerId];
+      return next;
+    });
     setProviderApiKeys((current) => {
       const next = { ...current };
       if (apiKey.trim()) {
@@ -525,8 +579,16 @@ export function App(): JSX.Element {
         setConfig={setConfig}
         configStatus={configStatus}
         providerTestStatus={providerTestStatus}
+        providerTestResults={providerTestResults}
         providerApiKeys={providerApiKeys}
         onProviderApiKeyChange={setLocalProviderApiKey}
+        onProviderConfigChange={(providerId) =>
+          setProviderTestResults((current) => {
+            const next = { ...current };
+            delete next[providerId];
+            return next;
+          })
+        }
         aiMode={aiMode}
         setAiMode={setAiMode}
         onSave={saveConfig}
@@ -545,7 +607,7 @@ export function App(): JSX.Element {
               <Moon size={24} />
               <div>
                 <h1>暗月庄园 · 狼人杀</h1>
-                <p>Web 可玩 · 规则引擎稳定 · 真实 AI 配置在管理控制台</p>
+                <p>Web 可玩 · 规则引擎稳定 · API 接入在管理控制台</p>
               </div>
             </div>
             <div className="topbar-actions">
@@ -574,6 +636,7 @@ export function App(): JSX.Element {
           aiProgress={aiProgress}
           aiStepStatus={aiStepStatus}
           streamingSpeech={streamingSpeech}
+          streamingSpeechSeatId={streamingSpeechSeatId}
           humanPlayerId={humanPlayerId}
           humanPending={humanPending}
           selectedTarget={selectedTarget}
@@ -584,11 +647,22 @@ export function App(): JSX.Element {
           setWolfAgree={setWolfAgree}
           sheriffRun={sheriffRun}
           setSheriffRun={setSheriffRun}
+          canWithdrawSheriff={Boolean(humanPlayerId && canWithdrawSheriff(game, humanPlayerId))}
+          canSelfExplode={canHumanSelfExplode}
           batchResult={batchResult}
           debugStatus={debugStatus}
           onSubmitHuman={submitHumanAction}
           onWithdrawSheriff={withdrawSheriffCandidacy}
+          onSelfExplode={submitWolfSelfExplosion}
           onStepAI={stepAI}
+          onPauseForNotice={() => {
+            setAutoRun(false);
+            setIsPaused(true);
+          }}
+          onContinueAfterNotice={() => {
+            setIsPaused(false);
+            setAutoRun(true);
+          }}
           onTogglePause={() => {
             setIsPaused((current) => {
               const next = !current;
@@ -625,8 +699,10 @@ function AdminConsole({
   setConfig,
   configStatus,
   providerTestStatus,
+  providerTestResults,
   providerApiKeys,
   onProviderApiKeyChange,
+  onProviderConfigChange,
   aiMode,
   setAiMode,
   onSave,
@@ -640,21 +716,29 @@ function AdminConsole({
   setConfig: (config: AIConfigStore) => void;
   configStatus: string;
   providerTestStatus: string;
+  providerTestResults: ProviderTestResults;
   providerApiKeys: LocalProviderApiKeys;
   onProviderApiKeyChange: (providerId: string, apiKey: string) => void;
+  onProviderConfigChange: (providerId: string) => void;
   aiMode: "mock" | "llm";
   setAiMode: (value: "mock" | "llm") => void;
   onSave: () => void;
   onTestProvider: (provider: ProviderAccount) => void;
   onBack: () => void;
 }): JSX.Element {
-  const readiness = buildAIReadiness(readinessConfig);
+  const apiSummary = buildApiAccessSummary(config, providerApiKeys, providerTestResults);
   const nav: Array<{ id: AdminSection; label: string }> = [
     { id: "overview", label: "控制台" },
-    { id: "ai", label: "AI 配置" },
-    { id: "roles", label: "角色设置" },
+    { id: "ai", label: "API 接入" },
+    { id: "roles", label: "游戏规则" },
     { id: "logs", label: "日志记录" }
   ];
+  const sectionDescriptions: Record<AdminSection, string> = {
+    overview: "查看当前运行模式、接口接入状态和基础规则入口。",
+    ai: "只配置供应商接口、密钥和模型；游戏身份分配不在这里处理。",
+    roles: "查看创建房间时使用的规则包、人数和身份分配摘要。",
+    logs: "查看复盘、事件导出和真实模型调用记录说明。"
+  };
   return (
     <main className="admin-shell">
       <aside className="admin-sidebar">
@@ -672,40 +756,41 @@ function AdminConsole({
             </button>
           ))}
         </nav>
-        <button className="ghost-button" onClick={onBack}>
-          返回游戏
-        </button>
       </aside>
       <section className="admin-main">
         <header className="admin-topbar">
           <div>
             <h2>{nav.find((item) => item.id === section)?.label}</h2>
-            <p>配置狼人杀中 AI 玩家、身份规则和复盘记录。</p>
+            <p>{sectionDescriptions[section]}</p>
           </div>
           <div className="admin-actions">
-            <label className="admin-mode">
-              当前 AI
-              <select value={aiMode} onChange={(event) => setAiMode(event.target.value as "mock" | "llm")}>
-                <option value="mock">Mock AI</option>
-                <option value="llm">真实供应商</option>
-              </select>
-            </label>
+            <div className="admin-mode-switch" aria-label="当前 AI 模式">
+              <button className={aiMode === "mock" ? "selected" : ""} onClick={() => setAiMode("mock")}>
+                Mock AI
+              </button>
+              <button className={aiMode === "llm" ? "selected" : ""} onClick={() => setAiMode("llm")}>
+                真实供应商
+              </button>
+            </div>
             <button className="primary-button" onClick={onSave}>
               <Save size={16} />
               保存配置
             </button>
+            <button className="ghost-button" onClick={onBack}>
+              返回游戏
+            </button>
           </div>
         </header>
         {section === "overview" && (
-          <div className="admin-grid">
-            <section className={`readiness-panel ${readiness.ready ? "ready" : "pending"}`}>
+          <div className="admin-grid admin-overview-grid">
+            <section className={`readiness-panel ${apiSummary.ready ? "ready" : "pending"}`}>
               <div className="panel-title">
                 <Bot size={17} />
-                真实 AI 就绪
+                API 接入状态
               </div>
-              <p>{readiness.ready ? "真实供应商配置已就绪，可以进行 DeepSeek/真实模型测试。" : "真实 AI 测试前仍有配置项需要补齐。"}</p>
+              <p>{apiSummary.ready ? "真实供应商已具备跑局条件。" : "真实供应商跑局前还需要补齐接口信息。"}</p>
               <div className="readiness-list">
-                {readiness.items.map((item) => (
+                {apiSummary.items.map((item) => (
                   <div className={`readiness-item ${item.ok ? "ok" : "warn"}`} key={item.label}>
                     <strong>{item.ok ? "通过" : "待补"}</strong>
                     <span>{item.label}</span>
@@ -718,25 +803,30 @@ function AdminConsole({
               <h3>配置概览</h3>
               <div className="stats-grid">
                 <div><span>供应商</span><strong>{config.providers.length}</strong></div>
-                <div><span>模型</span><strong>{config.models.length}</strong></div>
-                <div><span>AI 角色卡</span><strong>{config.personas.length}</strong></div>
-                <div><span>随机角色卡</span><strong>{config.personas.filter((persona) => persona.allowRandomSelection).length}</strong></div>
+                <div><span>已启用</span><strong>{config.providers.filter((provider) => provider.enabled).length}</strong></div>
+                <div><span>已填密钥</span><strong>{Object.values(providerApiKeys).filter((value) => value.trim()).length}</strong></div>
+                <div><span>连接成功</span><strong>{Object.values(providerTestResults).filter((value) => value === "success").length}</strong></div>
               </div>
               <p className="muted">{configStatus}</p>
             </section>
           </div>
         )}
         {section === "ai" && (
-          <AISettingsPanel
+          <ApiAccessPanel
             config={config}
             readinessConfig={readinessConfig}
             setConfig={setConfig}
             configStatus={configStatus}
             providerTestStatus={providerTestStatus}
+            providerTestResults={providerTestResults}
             providerApiKeys={providerApiKeys}
             onProviderApiKeyChange={onProviderApiKeyChange}
+            onProviderConfigChange={onProviderConfigChange}
             onSave={onSave}
             onTestProvider={onTestProvider}
+            aiMode={aiMode}
+            setAiMode={setAiMode}
+            onOpenRules={() => setSection("roles")}
           />
         )}
         {section === "roles" && <RoleSettingsPanel />}
@@ -755,7 +845,7 @@ function RoleSettingsPanel(): JSX.Element {
   return (
     <div className="admin-grid">
       <section className="compact-table">
-        <h3>游戏身份牌</h3>
+        <h3>身份分配摘要</h3>
         {Object.values(ROLE_DEFINITIONS).map((role) => (
           <div className="role-row" key={role.id}>
             <div className="avatar small">{role.name.slice(0, 1)}</div>
@@ -769,6 +859,7 @@ function RoleSettingsPanel(): JSX.Element {
       </section>
       <section className="compact-table">
         <h3>标准渐进规则包</h3>
+        <p className="muted">创建房间时会按人数自动分配身份；API 接入页不会处理这些游戏身份。</p>
         {Object.entries(STANDARD_PRESET.roleTable).map(([players, roles]) => (
           <div className="table-row" key={players}>
             <span>{players} 人</span>
@@ -778,6 +869,96 @@ function RoleSettingsPanel(): JSX.Element {
       </section>
     </div>
   );
+}
+
+interface ApiAccessItem {
+  label: string;
+  detail: string;
+  ok: boolean;
+}
+
+interface ApiAccessSummary {
+  ready: boolean;
+  items: ApiAccessItem[];
+}
+
+function buildApiAccessSummary(config: AIConfigStore, apiKeys: LocalProviderApiKeys, testResults: ProviderTestResults): ApiAccessSummary {
+  const enabledRealProviders = config.providers.filter((provider) => provider.enabled && isRealProvider(provider));
+  const firstProvider = enabledRealProviders[0];
+  const hasRealProvider = Boolean(firstProvider);
+  const keyReady = Boolean(firstProvider && hasProviderSecret(firstProvider, apiKeys));
+  const modelReady = Boolean(firstProvider?.defaultModel.trim());
+  const testReady = enabledRealProviders.some((provider) => testResults[provider.id] === "success");
+  const ready = hasRealProvider && keyReady && modelReady && testReady;
+  return {
+    ready,
+    items: [
+      {
+        label: "已填写 API Key",
+        ok: keyReady,
+        detail: keyReady ? `${firstProvider?.name ?? "供应商"} 已有本机密钥。` : "先选择一个真实供应商，并粘贴供应商给你的 API Key。"
+      },
+      {
+        label: "已选择模型",
+        ok: modelReady,
+        detail: modelReady ? `默认模型：${firstProvider?.defaultModel}` : "填写这个供应商要使用的模型名。"
+      },
+      {
+        label: "连接测试通过",
+        ok: testReady,
+        detail: testReady ? "至少一个启用的真实供应商连接成功。" : "点击“测试连接”，确认接口地址、密钥和模型可用。"
+      },
+      {
+        label: "可用于真实 AI 跑局",
+        ok: ready,
+        detail: ready ? "保存配置后，真实供应商可用于自动跑局。" : hasRealProvider ? "补齐上面的项目后再切换真实供应商跑局。" : "先添加并启用一个真实供应商。"
+      }
+    ]
+  };
+}
+
+function isRealProvider(provider: ProviderAccount): boolean {
+  return !provider.baseUrl.startsWith("mock://") && provider.type !== "codex_cli_local";
+}
+
+function hasProviderSecret(provider: ProviderAccount, apiKeys: LocalProviderApiKeys): boolean {
+  return Boolean(apiKeys[provider.id]?.trim() || provider.apiKeyEncrypted?.trim());
+}
+
+function providerTypeLabel(type: ProviderType): string {
+  const labels: Record<ProviderType, string> = {
+    openai: "OpenAI",
+    openai_compatible: "兼容接口",
+    anthropic: "Anthropic",
+    gemini: "Gemini",
+    xai: "xAI",
+    codex_cli_local: "本地"
+  };
+  return labels[type];
+}
+
+function providerKeyLabel(provider: ProviderAccount, apiKeys: LocalProviderApiKeys): string {
+  if (!isRealProvider(provider)) return "无需密钥";
+  return hasProviderSecret(provider, apiKeys) ? "已设置" : "未设置";
+}
+
+function providerKeyClass(provider: ProviderAccount, apiKeys: LocalProviderApiKeys): string {
+  if (!isRealProvider(provider)) return "neutral";
+  return hasProviderSecret(provider, apiKeys) ? "success" : "danger";
+}
+
+function providerTestLabel(state: ProviderTestState | undefined): string {
+  if (state === "testing") return "测试中";
+  if (state === "success") return "已连接";
+  if (state === "failed") return "失败";
+  return "待测试";
+}
+
+function providerTestClass(state: ProviderTestState | undefined): string {
+  if (state === "testing") return "pending";
+  if (state === "success") return "success";
+  if (state === "failed") return "danger";
+  return "neutral";
 }
 
 function GameRoom({
@@ -792,6 +973,7 @@ function GameRoom({
   aiProgress,
   aiStepStatus,
   streamingSpeech,
+  streamingSpeechSeatId,
   humanPlayerId,
   humanPending,
   selectedTarget,
@@ -802,11 +984,16 @@ function GameRoom({
   setWolfAgree,
   sheriffRun,
   setSheriffRun,
+  canWithdrawSheriff,
+  canSelfExplode,
   batchResult,
   debugStatus,
   onSubmitHuman,
   onWithdrawSheriff,
+  onSelfExplode,
   onStepAI,
+  onPauseForNotice,
+  onContinueAfterNotice,
   onTogglePause,
   onRestart,
   onOpenAdmin,
@@ -829,6 +1016,7 @@ function GameRoom({
   aiProgress: AIDecisionStatus | null;
   aiStepStatus: string;
   streamingSpeech: string;
+  streamingSpeechSeatId?: PlayerId;
   humanPlayerId?: PlayerId;
   humanPending?: PendingAction;
   selectedTarget: PlayerId | "abstain" | "skip" | "destroy";
@@ -839,11 +1027,16 @@ function GameRoom({
   setWolfAgree: (value: boolean) => void;
   sheriffRun: boolean;
   setSheriffRun: (value: boolean) => void;
+  canWithdrawSheriff: boolean;
+  canSelfExplode: boolean;
   batchResult: MockBatchRunResult | null;
   debugStatus: string;
   onSubmitHuman: () => void;
   onWithdrawSheriff: () => void;
+  onSelfExplode: () => void;
   onStepAI: () => void;
+  onPauseForNotice: () => void;
+  onContinueAfterNotice: () => void;
   onTogglePause: () => void;
   onRestart: () => void;
   onOpenAdmin: () => void;
@@ -855,6 +1048,35 @@ function GameRoom({
   onForceKill: (seatId: PlayerId) => void;
   onRunMockBatch: () => void;
 }): JSX.Element {
+  const [dismissedNoticeSeq, setDismissedNoticeSeq] = useState(0);
+  const [dismissedFlowNoticeKeys, setDismissedFlowNoticeKeys] = useState<string[]>([]);
+  const sheriffNotice = useMemo(() => buildSheriffElectionNotice(game), [game.events.length, game.id]);
+  const showSheriffNotice = Boolean(sheriffNotice && sheriffNotice.seq > dismissedNoticeSeq);
+  const flowNotice = useMemo(
+    () => buildFlowNotice(game, visibleEvents, humanPlayerId, dismissedFlowNoticeKeys),
+    [dismissedFlowNoticeKeys, game.events.length, game.id, humanPlayerId, visibleEvents]
+  );
+  const activeNotice = showSheriffNotice && sheriffNotice ? sheriffNoticeToFlowNotice(sheriffNotice) : flowNotice;
+
+  useEffect(() => {
+    setDismissedNoticeSeq(0);
+    setDismissedFlowNoticeKeys([]);
+  }, [game.id]);
+
+  useEffect(() => {
+    if (activeNotice && humanPlayerId && !isPaused) onPauseForNotice();
+  }, [activeNotice?.key, humanPlayerId, isPaused, onPauseForNotice]);
+
+  function closeNotice(): void {
+    if (!activeNotice) return;
+    if (showSheriffNotice && sheriffNotice) {
+      setDismissedNoticeSeq(sheriffNotice.seq);
+    } else {
+      setDismissedFlowNoticeKeys((current) => (current.includes(activeNotice.key) ? current : [...current, activeNotice.key]));
+    }
+    onContinueAfterNotice();
+  }
+
   return (
     <section className="room-shell">
       <header className="room-topbar">
@@ -870,6 +1092,12 @@ function GameRoom({
           <strong>{visiblePhaseProgress(game, humanPlayerId)}</strong>
         </div>
         <div className="room-actions">
+          {canSelfExplode && (
+            <button className="danger-button self-explode-button" onClick={onSelfExplode}>
+              <Skull size={16} />
+              自爆
+            </button>
+          )}
           <button className="ghost-button" onClick={onOpenAdmin}>
             <Settings size={16} />
             管理控制台
@@ -897,10 +1125,12 @@ function GameRoom({
           aiProgress={aiProgress}
           aiStepStatus={aiStepStatus}
           streamingSpeech={streamingSpeech}
+          streamingSpeechSeatId={streamingSpeechSeatId}
           isPaused={isPaused}
           autoRun={autoRun}
           humanPlayerId={humanPlayerId}
           humanPending={humanPending}
+          onTogglePause={onTogglePause}
         />
         <aside className="right-panel room-side">
           <TabBar active={sideTab} onChange={setSideTab} />
@@ -917,6 +1147,7 @@ function GameRoom({
               setWolfAgree={setWolfAgree}
               sheriffRun={sheriffRun}
               setSheriffRun={setSheriffRun}
+              canWithdrawSheriff={canWithdrawSheriff}
               onSubmitHuman={onSubmitHuman}
               onWithdrawSheriff={onWithdrawSheriff}
             />
@@ -960,6 +1191,35 @@ function GameRoom({
         </button>
         <div className="dock-status">{isPaused ? "AI 自动行动已暂停" : "AI 自动行动已开启"}</div>
       </footer>
+      {activeNotice && humanPlayerId && (
+        <div className="notice-backdrop" role="dialog" aria-modal="true" aria-label={activeNotice.kicker}>
+          <div className="notice-dialog">
+            <div>
+              <span className="phase-kicker">{activeNotice.kicker}</span>
+              <h2>{activeNotice.title}</h2>
+            </div>
+            {activeNotice.rows.length > 0 && (
+              <div className="notice-list">
+                {activeNotice.rows.map((row) => (
+                  <p key={row}>{row}</p>
+                ))}
+              </div>
+            )}
+            {activeNotice.chips.length > 0 && (
+              <div className="notice-tally">
+                {activeNotice.chips.map((row) => (
+                  <span key={row}>{row}</span>
+                ))}
+              </div>
+            )}
+            <p>{activeNotice.body}</p>
+            <button className="primary-button" onClick={closeNotice}>
+              <StepForward size={16} />
+              继续
+            </button>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -985,7 +1245,7 @@ function SetupScreen({
     <section className="setup-page">
       <div className="setup-copy">
         <h2>创建可观战/可参与的 AI 狼人杀</h2>
-        <p>第一版聚焦稳定规则、AI 配置、透明日志和可顺畅跑完一局。真人数可以为 0，剩余座位由 AI 补齐。</p>
+        <p>第一版聚焦稳定规则、API 接入、透明日志和可顺畅跑完一局。真人数可以为 0，剩余座位由 AI 补齐。</p>
       </div>
       <div className="setup-grid">
         <label>
@@ -1069,7 +1329,7 @@ function SeatPanel({ game, humanPlayerId }: { game: GameState; humanPlayerId?: P
                   {wolfTeammates.map((player) => (
                     <span key={player.id}>
                       {seatName(game, player.id)}
-                      {!player.alive && ` · ${deathReason(player.death?.reason)}`}
+                      {!player.alive && ` · ${deathReasonForViewer(game, player, humanPlayerId)}`}
                     </span>
                   ))}
                 </div>
@@ -1124,10 +1384,12 @@ function CenterPanel({
   aiProgress,
   aiStepStatus,
   streamingSpeech,
+  streamingSpeechSeatId,
   isPaused,
   autoRun,
   humanPlayerId,
-  humanPending
+  humanPending,
+  onTogglePause
 }: {
   game: GameState;
   visibleEvents: ReturnType<typeof getVisibleEvents>;
@@ -1136,17 +1398,32 @@ function CenterPanel({
   aiProgress: AIDecisionStatus | null;
   aiStepStatus: string;
   streamingSpeech: string;
+  streamingSpeechSeatId?: PlayerId;
   isPaused: boolean;
   autoRun: boolean;
   humanPlayerId?: PlayerId;
   humanPending?: PendingAction;
+  onTogglePause: () => void;
 }): JSX.Element {
-  const latestSpeech = [...visibleEvents].reverse().find((event) => event.type === "SpeechPublished" || event.type === "LastWordsPublished" || event.type === "WolfDiscussionMessage");
   const aiPending = game.pendingActions.find((action) => game.players.find((player) => player.id === action.seatId)?.controller !== "human");
   const visibleActingSeat = visibleActingSeatId(game, humanPlayerId);
   const actingPlayer = visibleActingSeat ? game.players.find((player) => player.id === visibleActingSeat) : undefined;
+  const activePending = visibleActingSeat ? game.pendingActions.find((action) => action.seatId === visibleActingSeat) : undefined;
+  const activePendingExpectsSpeech =
+    activePending?.kind === "speech" || activePending?.kind === "wolf_discussion" || activePending?.kind === "sheriff_candidacy";
+  const activeStreamingSpeech = visibleActingSeat && streamingSpeechSeatId === visibleActingSeat ? streamingSpeech : "";
+  const latestActingSpeech =
+    visibleActingSeat === undefined || activePendingExpectsSpeech
+      ? undefined
+      : [...visibleEvents]
+          .reverse()
+          .find(
+            (event) =>
+              event.seatId === visibleActingSeat &&
+              (event.type === "SpeechPublished" || event.type === "LastWordsPublished" || event.type === "WolfDiscussionMessage")
+          );
   const statusText = buildActionStatusText(game, humanPlayerId, humanPending, aiPending, aiBusy, aiElapsedSeconds, aiProgress, isPaused, autoRun, aiStepStatus);
-  const speechLabel = aiBusy ? thinkingLabel(aiProgress, aiElapsedSeconds) : streamingSpeech ? "流式输出" : "最近发言";
+  const speechLabel = aiBusy ? thinkingLabel(aiProgress, aiElapsedSeconds) : activeStreamingSpeech ? "流式输出" : latestActingSpeech ? "最近发言" : "当前玩家发言";
   const phaseLabel = visiblePhaseLabel(game, humanPlayerId);
   const phaseProgress = visiblePhaseProgress(game, humanPlayerId);
   return (
@@ -1171,7 +1448,7 @@ function CenterPanel({
                     </span>
                   )}
                   <strong>{publicPlayerLabel(player)}</strong>
-                  <p>{player.alive ? "存活" : deathReason(player.death?.reason)}</p>
+                  <p>{player.alive ? "存活" : deathReasonForViewer(game, player, humanPlayerId)}</p>
                   {player.isSheriff && <Award size={15} className="sheriff-icon" />}
                 </div>
               </div>
@@ -1188,8 +1465,8 @@ function CenterPanel({
             <div className="table-speech">
               <span>{speechLabel}</span>
               <p>
-                {streamingSpeech ||
-                  (latestSpeech ? eventSummary(game, latestSpeech.type, latestSpeech.payload, latestSpeech.seatId) : "等待玩家发言。")}
+                {activeStreamingSpeech ||
+                  (latestActingSpeech ? eventSummary(game, latestActingSpeech.type, latestActingSpeech.payload, latestActingSpeech.seatId) : "等待当前玩家发言。")}
               </p>
             </div>
           </div>
@@ -1197,6 +1474,12 @@ function CenterPanel({
         <div className="speech-stream">
           <span>系统状态</span>
           <p>{statusText}</p>
+          {isPaused && aiPending && !humanPending && (
+            <button className="primary-button continue-button" onClick={onTogglePause}>
+              <StepForward size={16} />
+              继续下一位
+            </button>
+          )}
         </div>
       </div>
     </section>
@@ -1235,18 +1518,37 @@ function buildActionStatusText(
   if (isPaused) return "已暂停。AI 自动行动已停止，点击继续后恢复。";
   if (aiBusy && aiPending) {
     const elapsed = aiElapsedSeconds > 0 ? `，已等待 ${aiElapsedSeconds}s` : "";
-    const progress = aiProgress ? `后台状态：${aiProgress.message}` : "后台状态：等待服务端确认。";
+    const progress = aiProgress ? `当前状态：${displayAIProgressMessage(aiProgress)}` : "当前状态：等待 AI 返回。";
     const stuck = thinkingWatchdogText(aiProgress, aiElapsedSeconds);
     if (shouldHidePendingAction(game, aiPending, humanPlayerId)) {
-      return `夜晚行动正在处理${elapsed}。${progress}${stuck} 思考内容隐藏，正式输出会在中间流式显示。`;
+      return `夜晚行动正在处理${elapsed}。${progress}${stuck} 结果会在可见时显示。`;
     }
-    return `${seatName(game, aiPending.seatId)} 正在${pendingLabel(aiPending)}${elapsed}。${progress}${stuck} 思考内容隐藏，正式输出会在中间流式显示。`;
+    return `${seatName(game, aiPending.seatId)} 正在${pendingLabel(aiPending)}${elapsed}。${progress}${stuck} 发言或行动完成后会显示。`;
   }
   if (aiPending && shouldHidePendingAction(game, aiPending, humanPlayerId) && autoRun) return "夜晚行动即将自动处理。";
   if (aiPending && shouldHidePendingAction(game, aiPending, humanPlayerId)) return "夜晚行动等待 AI 处理，继续后会自动行动。";
   if (aiPending && autoRun) return `${seatName(game, aiPending.seatId)} 即将自动进行${pendingLabel(aiPending)}。`;
   if (aiPending) return `${seatName(game, aiPending.seatId)} 等待 AI 处理，继续后会自动行动。`;
   return aiStepStatus;
+}
+
+function displayAIProgressMessage(progress: AIDecisionStatus): string {
+  return cleanAIProgressMessage(progress.message);
+}
+
+function cleanAIProgressMessage(message: string): string {
+  const replacements: Array<[RegExp, string]> = [
+    [/客户端已提交 AI 决策请求，等待服务端确认。/g, "AI 行动已提交，正在等待回应。"],
+    [/服务端正在整理该玩家可见信息、记忆和本阶段合法动作。/g, "正在整理该玩家可见信息和本阶段可做动作。"],
+    [/服务端已向模型发送请求，正在等待模型返回。/g, "AI 正在思考，等待结果。"],
+    [/服务端已发送修复请求，正在等待模型返回。/g, "AI 正在校验发言格式，等待结果。"],
+    [/的 AI 动作已进入服务端队列。/g, "的 AI 行动已排队处理。"],
+    [/服务端/g, "系统"],
+    [/客户端/g, "页面"],
+    [/后台/g, "系统"],
+    [/供应商/g, "模型"]
+  ];
+  return replacements.reduce((text, [pattern, replacement]) => text.replace(pattern, replacement), message);
 }
 
 function visiblePhaseLabel(game: GameState, humanPlayerId?: PlayerId): string {
@@ -1290,17 +1592,17 @@ function canViewerSeeNightPhase(
 function thinkingLabel(progress: AIDecisionStatus | null, elapsedSeconds: number): string {
   const elapsed = elapsedSeconds > 0 ? ` · ${elapsedSeconds}s` : "";
   if (!progress) return `AI 思考中${elapsed}`;
-  if (progress.status === "building_prompt") return `后台整理信息${elapsed}`;
+  if (progress.status === "building_prompt") return `整理可见信息${elapsed}`;
   if (progress.status === "provider_request") return `模型思考中${elapsed}`;
-  if (progress.status === "repairing") return `校验修复中${elapsed}`;
+  if (progress.status === "repairing") return `格式校验中${elapsed}`;
   return `AI 思考中${elapsed}`;
 }
 
 function thinkingWatchdogText(progress: AIDecisionStatus | null, elapsedSeconds: number): string {
   const elapsedMs = elapsedSeconds * 1000;
   const expectedMs = progress?.expectedThinkingMs ?? (progress?.timeoutMs ? Math.floor(progress.timeoutMs * 0.7) : undefined);
-  if (progress?.timeoutMs && elapsedMs >= progress.timeoutMs) return " 已超过当前供应商配置的常规等待值；服务端仍会等待模型返回。";
-  if (expectedMs !== undefined && elapsedMs >= expectedMs) return " 已超过该思考档位的常规等待，服务端仍确认请求在等待模型返回。";
+  if (progress?.timeoutMs && elapsedMs >= progress.timeoutMs) return " 已超过常规等待时间，仍在等待 AI 返回。";
+  if (expectedMs !== undefined && elapsedMs >= expectedMs) return " 已超过该思考档位的常规等待，仍在等待 AI 返回。";
   return "";
 }
 
@@ -1335,6 +1637,7 @@ function ActionPanel({
   setWolfAgree,
   sheriffRun,
   setSheriffRun,
+  canWithdrawSheriff,
   onSubmitHuman,
   onWithdrawSheriff
 }: {
@@ -1349,6 +1652,7 @@ function ActionPanel({
   setWolfAgree: (value: boolean) => void;
   sheriffRun: boolean;
   setSheriffRun: (value: boolean) => void;
+  canWithdrawSheriff: boolean;
   onSubmitHuman: () => void;
   onWithdrawSheriff: () => void;
 }): JSX.Element {
@@ -1359,6 +1663,7 @@ function ActionPanel({
       event.type === "SpeechPublished" ||
       event.type === "LastWordsPublished" ||
       event.type === "WolfDiscussionMessage" ||
+      event.type === "WolfSelfExploded" ||
       event.type === "SheriffCandidatesAnnounced" ||
       event.type === "NightDeathsAnnounced"
   );
@@ -1393,11 +1698,20 @@ function ActionPanel({
           发言 / 投票
         </div>
         {!humanPending ? (
-          <p className="muted">当前没有等待你输入的动作，AI 会自动行动；需要暂停时使用顶部按钮。</p>
+          canWithdrawSheriff ? (
+            <div className="action-form">
+              <p className="pending-label">你仍在警上，可在投票前退水。</p>
+              <button className="ghost-button" onClick={onWithdrawSheriff}>
+                退水
+              </button>
+            </div>
+          ) : (
+            <p className="muted">当前没有等待你输入的动作，AI 会自动行动；需要暂停时使用顶部按钮。</p>
+          )
         ) : (
           <div className="action-form">
             <p className="pending-label">轮到你 · {pendingLabel(humanPending)} · {seatName(game, humanPending.seatId)}</p>
-            {(humanPending.kind === "speech" || humanPending.kind === "wolf_discussion" || humanPending.kind === "sheriff_candidacy") && (
+            {(humanPending.kind === "speech" || humanPending.kind === "wolf_discussion") && (
               <textarea value={speechText} onChange={(event) => setSpeechText(event.target.value)} rows={5} />
             )}
             {legal.length > 0 && (
@@ -1431,7 +1745,7 @@ function ActionPanel({
                 <Save size={16} />
                 提交
               </button>
-              {humanPending.kind === "speech" && humanPending.speechType === "sheriff" && (
+              {canWithdrawSheriff && (
                 <button className="ghost-button" onClick={onWithdrawSheriff}>
                   退水
                 </button>
@@ -1489,6 +1803,7 @@ function RulesPanel(): JSX.Element {
         <ul>
           <li>夜晚顺序：守卫 → 狼人私聊并刀人 → 预言家查验 → 女巫行动 → 死亡结算。</li>
           <li>狼人每晚最多 3 轮私聊，全员同意同一目标会提前锁刀。</li>
+          <li>存活狼人可在公开回合随时自爆；自爆后该狼出局，当前回合结束并直接进入夜晚。</li>
           <li>警长白天投票权重为 1.5，首次平票进入 PK，再平票无人当选或无人出局。</li>
           <li>女巫解药和毒药各一次，默认同晚不能同时救毒，首夜允许自救。</li>
         </ul>
@@ -1624,55 +1939,56 @@ function roleAbilityTemplate(roleId: RoleId): string {
   return templates[roleId];
 }
 
-function AISettingsPanel({
+function ApiAccessPanel({
   config,
   readinessConfig,
   setConfig,
   configStatus,
   providerTestStatus,
+  providerTestResults,
   providerApiKeys,
   onProviderApiKeyChange,
+  onProviderConfigChange,
   onSave,
-  onTestProvider
+  onTestProvider,
+  aiMode,
+  setAiMode,
+  onOpenRules
 }: {
   config: AIConfigStore;
   readinessConfig: AIConfigStore;
   setConfig: (config: AIConfigStore) => void;
   configStatus: string;
   providerTestStatus: string;
+  providerTestResults: ProviderTestResults;
   providerApiKeys: LocalProviderApiKeys;
   onProviderApiKeyChange: (providerId: string, apiKey: string) => void;
+  onProviderConfigChange: (providerId: string) => void;
   onSave: () => void;
   onTestProvider: (provider: ProviderAccount) => void;
+  aiMode: "mock" | "llm";
+  setAiMode: (value: "mock" | "llm") => void;
+  onOpenRules: () => void;
 }): JSX.Element {
-  const firstPersona = config.personas[0] ?? DEFAULT_PERSONAS[0];
-  const readiness = buildAIReadiness(readinessConfig);
-  const preview = buildPromptPreview({
-    preset: STANDARD_PRESET,
-    role: "seer",
-    persona: firstPersona,
-    phaseTask: "当前阶段：白天发言。请结合公开记录给出发言策略并输出 JSON。",
-    memorySummary: "公开摘要：首夜后进入警长竞选，警上发言正在进行。",
-    visibleFacts: ["1号上警", "3号没有上警", "昨夜死亡信息暂未公布"],
-    schemaName: "speech"
-  });
+  const [selectedProviderId, setSelectedProviderId] = useState(config.providers[0]?.id ?? "");
+  const selectedProvider = config.providers.find((provider) => provider.id === selectedProviderId) ?? config.providers[0];
+  const apiSummary = buildApiAccessSummary(readinessConfig, providerApiKeys, providerTestResults);
+  const testedProviders = config.providers.filter((provider) => providerTestResults[provider.id]);
+
+  useEffect(() => {
+    if (!selectedProvider || !config.providers.some((provider) => provider.id === selectedProviderId)) {
+      setSelectedProviderId(config.providers[0]?.id ?? "");
+    }
+  }, [config.providers, selectedProvider, selectedProviderId]);
 
   function updateProvider(id: string, patch: Partial<ProviderAccount>): void {
+    onProviderConfigChange(id);
     setConfig({ ...config, providers: config.providers.map((provider) => (provider.id === id ? { ...provider, ...patch } : provider)) });
-  }
-
-  function updateCostControls(patch: Partial<typeof DEFAULT_COST_CONTROLS>): void {
-    setConfig({
-      ...config,
-      costControls: {
-        ...(config.costControls ?? DEFAULT_COST_CONTROLS),
-        ...patch
-      }
-    });
   }
 
   function updateProviderType(id: string, type: ProviderType): void {
     const preset = PROVIDER_PRESETS[type];
+    onProviderConfigChange(id);
     setConfig({
       ...config,
       providers: config.providers.map((provider) =>
@@ -1693,288 +2009,46 @@ function AISettingsPanel({
       ...config,
       providers: [...config.providers, { id, ...PROVIDER_PRESETS[type] }]
     });
-  }
-
-  function updatePersona(id: string, patch: Partial<AIPersona>): void {
-    setConfig({ ...config, personas: config.personas.map((persona) => (persona.id === id ? { ...persona, ...patch } : persona)) });
-  }
-
-  function addPersona(): void {
-    const base = config.personas[0] ?? DEFAULT_PERSONAS[0];
-    const id = `persona-${Date.now()}`;
-    setConfig({
-      ...config,
-      personas: [
-        ...config.personas,
-        {
-          ...base,
-          id,
-          name: "新 AI 角色卡",
-          avatar: "新",
-          customPrompt: "",
-          allowRandomSelection: true,
-          weight: 1
-        }
-      ]
-    });
-  }
-
-  function updateModel(id: string, patch: Partial<ModelConfig>): void {
-    setConfig({ ...config, models: config.models.map((model) => (model.id === id ? { ...model, ...patch } : model)) });
-  }
-
-  function addManualModel(): void {
-    const provider = config.providers[0];
-    if (!provider) return;
-    const id = `model-${Date.now()}`;
-    setConfig({
-      ...config,
-      models: [
-        ...config.models,
-        {
-          id,
-          providerId: provider.id,
-          name: provider.defaultModel || "model-name",
-          displayName: provider.defaultModel || "Model",
-          contextWindow: 32000,
-          maxOutputTokens: 800,
-          inputPricePerMillion: 0,
-          outputPricePerMillion: 0,
-          supportsStructuredOutput: true,
-          supportsReasoningEffort: false,
-          supportsCachedTokens: false,
-          enabled: true,
-          notes: ""
-        }
-      ]
-    });
-  }
-
-  function applyFirstRealProvider(): void {
-    const provider = config.providers.find((item) => item.enabled && !item.baseUrl.startsWith("mock://"));
-    if (!provider) {
-      return;
-    }
-    setConfig({
-      ...config,
-      personas: config.personas.map((persona) => ({
-        ...persona,
-        defaultProviderId: provider.id,
-        defaultModel: provider.defaultModel
-      }))
-    });
+    setSelectedProviderId(id);
   }
 
   return (
-    <div className="tab-content ai-settings">
-      <section className={`readiness-panel ${readiness.ready ? "ready" : "pending"}`}>
-        <div className="panel-title">
-          <Bot size={17} />
-          真实 AI 就绪检查
-        </div>
-        <p>{readiness.ready ? "配置看起来已具备真实 AI 跑局条件。" : "切换到真实供应商前建议先补齐以下项目。"}</p>
-        <div className="readiness-list">
-          {readiness.items.map((item) => (
-            <div className={`readiness-item ${item.ok ? "ok" : "warn"}`} key={item.label}>
-              <strong>{item.ok ? "通过" : "待补"}</strong>
-              <span>{item.label}</span>
-              <p>{item.detail}</p>
-            </div>
-          ))}
-        </div>
-      </section>
-      <section className="control-group">
-        <div className="panel-title">
-          <Shield size={17} />
-          成本保护
-        </div>
-        <div className="model-grid">
-          <label>
-            单局费用上限
-            <input
-              type="number"
-              min={0}
-              step="0.01"
-              value={(config.costControls ?? DEFAULT_COST_CONTROLS).maxGameCost}
-              onChange={(event) => updateCostControls({ maxGameCost: Number(event.target.value) })}
-            />
-          </label>
-          <label>
-            单 AI 费用上限
-            <input
-              type="number"
-              min={0}
-              step="0.01"
-              value={(config.costControls ?? DEFAULT_COST_CONTROLS).maxSeatCost}
-              onChange={(event) => updateCostControls({ maxSeatCost: Number(event.target.value) })}
-            />
-          </label>
-          <label>
-            单次最大输出 Token
-            <input
-              type="number"
-              min={0}
-              value={(config.costControls ?? DEFAULT_COST_CONTROLS).maxOutputTokensPerCall}
-              onChange={(event) => updateCostControls({ maxOutputTokensPerCall: Number(event.target.value) })}
-            />
-          </label>
-        </div>
-        <Toggle label="启用成本保护" checked={(config.costControls ?? DEFAULT_COST_CONTROLS).enabled} onChange={(value) => updateCostControls({ enabled: value })} />
-      </section>
-      <section className="control-group">
-        <div className="panel-title">
-          <Settings size={17} />
-          供应商管理
-        </div>
-        <div className="preset-row">
-          {(Object.keys(PROVIDER_PRESETS) as ProviderType[]).filter((type) => type !== "codex_cli_local").map((type) => (
-            <button className="ghost-button mini" key={type} onClick={() => addProvider(type)}>
-              <Plus size={13} />
-              {PROVIDER_PRESETS[type].name}
-            </button>
-          ))}
-        </div>
-        {config.providers.map((provider) => (
-          <div className="provider-card" key={provider.id}>
-            <div className="provider-head">
-              <input value={provider.name} onChange={(event) => updateProvider(provider.id, { name: event.target.value })} />
-              <select value={provider.type} onChange={(event) => updateProviderType(provider.id, event.target.value as ProviderType)}>
-                <option value="openai">OpenAI</option>
-                <option value="openai_compatible">OpenAI Compatible</option>
-                <option value="anthropic">Anthropic</option>
-                <option value="gemini">Gemini</option>
-                <option value="xai">xAI</option>
-                <option value="codex_cli_local">Codex Local</option>
-              </select>
-            </div>
-            <label>
-              Base URL
-              <input value={provider.baseUrl} onChange={(event) => updateProvider(provider.id, { baseUrl: event.target.value })} />
-            </label>
-            <label>
-              本机 API Key
-              <input
-                type="password"
-                value={providerApiKeys[provider.id] ?? ""}
-                placeholder="仅保存在当前浏览器，不保存到 VPS"
-                onChange={(event) => onProviderApiKeyChange(provider.id, event.target.value)}
-              />
-            </label>
-            <label>
-              默认模型
-              <input value={provider.defaultModel} onChange={(event) => updateProvider(provider.id, { defaultModel: event.target.value })} />
-            </label>
-            <label>
-              认证方式
-              <select value={provider.authType} onChange={(event) => updateProvider(provider.id, { authType: event.target.value as ProviderAccount["authType"] })}>
-                <option value="api_key">API Key</option>
-                <option value="access_token">Access Token</option>
-                <option value="oauth">OAuth</option>
-              </select>
-            </label>
-            <div className="model-grid">
-              <label>
-                连接测试超时 ms（游戏思考不限制）
-                <input type="number" value={provider.timeoutMs} onChange={(event) => updateProvider(provider.id, { timeoutMs: Number(event.target.value) })} />
-              </label>
-              <label>
-                重试次数
-                <input type="number" min={0} value={provider.retryCount} onChange={(event) => updateProvider(provider.id, { retryCount: Number(event.target.value) })} />
-              </label>
-              <label>
-                RPM
-                <input
-                  type="number"
-                  value={provider.rateLimit.rpm}
-                  onChange={(event) => updateProvider(provider.id, { rateLimit: { ...provider.rateLimit, rpm: Number(event.target.value) } })}
-                />
-              </label>
-              <label>
-                TPM
-                <input
-                  type="number"
-                  value={provider.rateLimit.tpm}
-                  onChange={(event) => updateProvider(provider.id, { rateLimit: { ...provider.rateLimit, tpm: Number(event.target.value) } })}
-                />
-              </label>
-              <label>
-                并发
-                <input
-                  type="number"
-                  min={1}
-                  value={provider.rateLimit.concurrency}
-                  onChange={(event) => updateProvider(provider.id, { rateLimit: { ...provider.rateLimit, concurrency: Number(event.target.value) } })}
-                />
-              </label>
-            </div>
-            <div className="button-row">
-              <button className="ghost-button" onClick={() => onTestProvider(provider)}>
-                <Eye size={15} />
-                测试连接
-              </button>
-              <button className="ghost-button" onClick={() => onProviderApiKeyChange(provider.id, "")} disabled={!providerApiKeys[provider.id]}>
-                清除本机密钥
-              </button>
-              <Toggle label="启用" checked={provider.enabled} onChange={(value) => updateProvider(provider.id, { enabled: value })} />
-              <Toggle label="JSON Schema" checked={provider.supportsJsonSchema} onChange={(value) => updateProvider(provider.id, { supportsJsonSchema: value })} />
-              <Toggle label="Tool Call" checked={provider.supportsToolCall} onChange={(value) => updateProvider(provider.id, { supportsToolCall: value })} />
-              <Toggle label="Streaming" checked={provider.supportsStreaming} onChange={(value) => updateProvider(provider.id, { supportsStreaming: value })} />
-              <Toggle label="Reasoning" checked={provider.supportsReasoningEffort} onChange={(value) => updateProvider(provider.id, { supportsReasoningEffort: value })} />
-              <Toggle label="模型列表" checked={provider.supportsModelList} onChange={(value) => updateProvider(provider.id, { supportsModelList: value })} />
-            </div>
+    <div className="api-access-layout">
+      <div className="api-main-column">
+        <section className="api-panel api-mode-panel">
+          <div className="panel-title">
+            <Bot size={17} />
+            接入模式
           </div>
-        ))}
-        <div className="button-row">
-          <button className="ghost-button" onClick={() => addProvider()}>
-            <Plus size={16} />
-            添加供应商
-          </button>
-          <button className="primary-button" onClick={onSave}>
-            <Save size={16} />
-            保存配置
-          </button>
-        </div>
-        <p className="muted">{configStatus}</p>
-        {providerTestStatus && <p className="muted">{providerTestStatus}</p>}
-      </section>
+          <div className="mode-choice-grid">
+            <button className={aiMode === "mock" ? "selected" : ""} onClick={() => setAiMode("mock")}>
+              <strong>Mock AI</strong>
+              <span>使用内置模拟 AI 测试规则和流程</span>
+            </button>
+            <button className={aiMode === "llm" ? "selected" : ""} onClick={() => setAiMode("llm")}>
+              <strong>真实供应商</strong>
+              <span>使用外部 API 服务进行真实跑局</span>
+            </button>
+          </div>
+        </section>
 
-      <section className="compact-table">
-        <div className="section-head">
-          <h3>AI 角色卡</h3>
-          <div className="button-row">
-            <button className="ghost-button mini" onClick={applyFirstRealProvider}>
-              应用首个真实供应商
-            </button>
-            <button className="ghost-button mini" onClick={addPersona}>
-              <Plus size={13} />
-              新增角色卡
+        <section className="api-panel provider-setup-panel">
+          <div className="section-head">
+            <div className="panel-title">
+              <Settings size={17} />
+              供应商配置
+            </div>
+            <button className="ghost-button" onClick={() => addProvider()}>
+              <Plus size={16} />
+              添加供应商
             </button>
           </div>
-        </div>
-        {config.personas.map((persona) => (
-          <details className="persona-card" key={persona.id}>
-            <summary>
-              <div className="avatar small">{persona.avatar}</div>
-              <div>
-                <strong>{persona.name}</strong>
-                <p>
-                  {persona.speechStyle} · 推理 {persona.reasoningStrength} · {persona.defaultModel} · 权重 {persona.weight}
-                </p>
-              </div>
-            </summary>
-            <div className="persona-form">
-              <div className="model-grid">
+          {selectedProvider ? (
+            <>
+              <div className="provider-picker-row">
                 <label>
-                  名称
-                  <input value={persona.name} onChange={(event) => updatePersona(persona.id, { name: event.target.value })} />
-                </label>
-                <label>
-                  头像
-                  <input value={persona.avatar} maxLength={2} onChange={(event) => updatePersona(persona.id, { avatar: event.target.value })} />
-                </label>
-                <label>
-                  供应商
-                  <select value={persona.defaultProviderId} onChange={(event) => updatePersona(persona.id, { defaultProviderId: event.target.value })}>
+                  当前编辑
+                  <select value={selectedProvider.id} onChange={(event) => setSelectedProviderId(event.target.value)}>
                     {config.providers.map((provider) => (
                       <option value={provider.id} key={provider.id}>
                         {provider.name}
@@ -1982,167 +2056,175 @@ function AISettingsPanel({
                     ))}
                   </select>
                 </label>
+                <span className={`status-chip ${providerTestClass(providerTestResults[selectedProvider.id])}`}>
+                  {providerTestLabel(providerTestResults[selectedProvider.id])}
+                </span>
+              </div>
+              <div className="api-form-grid">
                 <label>
-                  模型
-                  <input value={persona.defaultModel} onChange={(event) => updatePersona(persona.id, { defaultModel: event.target.value })} />
+                  供应商
+                  <div className="split-field">
+                    <input value={selectedProvider.name} onChange={(event) => updateProvider(selectedProvider.id, { name: event.target.value })} />
+                    <select value={selectedProvider.type} onChange={(event) => updateProviderType(selectedProvider.id, event.target.value as ProviderType)}>
+                      <option value="openai">OpenAI</option>
+                      <option value="openai_compatible">OpenAI Compatible</option>
+                      <option value="anthropic">Anthropic</option>
+                      <option value="gemini">Gemini</option>
+                      <option value="xai">xAI</option>
+                      <option value="codex_cli_local">Codex Local</option>
+                    </select>
+                  </div>
                 </label>
                 <label>
-                  说话风格
-                  <select value={persona.speechStyle} onChange={(event) => updatePersona(persona.id, { speechStyle: event.target.value as AIPersona["speechStyle"] })}>
-                    {SPEECH_STYLES.map((style) => (
-                      <option value={style} key={style}>
-                        {style}
-                      </option>
-                    ))}
-                  </select>
+                  Base URL
+                  <input value={selectedProvider.baseUrl} onChange={(event) => updateProvider(selectedProvider.id, { baseUrl: event.target.value })} />
                 </label>
                 <label>
-                  推理强度
-                  <select
-                    value={persona.reasoningStrength}
-                    onChange={(event) => updatePersona(persona.id, { reasoningStrength: event.target.value as AIPersona["reasoningStrength"] })}
-                  >
-                    {REASONING_STRENGTHS.map((strength) => (
-                      <option value={strength} key={strength}>
-                        {strength}
-                      </option>
-                    ))}
-                  </select>
+                  API Key
+                  <input
+                    type="password"
+                    value={providerApiKeys[selectedProvider.id] ?? ""}
+                    placeholder={isRealProvider(selectedProvider) ? "粘贴供应商给你的密钥" : "Mock 模式不需要密钥"}
+                    onChange={(event) => onProviderApiKeyChange(selectedProvider.id, event.target.value)}
+                    disabled={!isRealProvider(selectedProvider)}
+                  />
                 </label>
                 <label>
-                  发言长度
-                  <select value={persona.speechLength} onChange={(event) => updatePersona(persona.id, { speechLength: event.target.value as AIPersona["speechLength"] })}>
-                    {SPEECH_LENGTHS.map((length) => (
-                      <option value={length} key={length}>
-                        {length}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  Reasoning Effort
-                  <select
-                    value={persona.reasoningEffort}
-                    onChange={(event) => updatePersona(persona.id, { reasoningEffort: event.target.value as AIPersona["reasoningEffort"] })}
-                  >
-                    {REASONING_EFFORTS.map((effort) => (
-                      <option value={effort} key={effort}>
-                        {effort}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  上下文限制
-                  <input type="number" value={persona.contextLimit} onChange={(event) => updatePersona(persona.id, { contextLimit: Number(event.target.value) })} />
-                </label>
-                <label>
-                  最大输出
-                  <input type="number" value={persona.maxOutputTokens} onChange={(event) => updatePersona(persona.id, { maxOutputTokens: Number(event.target.value) })} />
-                </label>
-                <label>
-                  Temperature
-                  <input type="number" step="0.05" min={0} max={2} value={persona.temperature} onChange={(event) => updatePersona(persona.id, { temperature: Number(event.target.value) })} />
-                </label>
-                <label>
-                  Top P
-                  <input type="number" step="0.05" min={0} max={1} value={persona.topP} onChange={(event) => updatePersona(persona.id, { topP: Number(event.target.value) })} />
-                </label>
-                <label>
-                  随机权重
-                  <input type="number" min={0} value={persona.weight} onChange={(event) => updatePersona(persona.id, { weight: Number(event.target.value) })} />
+                  默认模型
+                  <input value={selectedProvider.defaultModel} onChange={(event) => updateProvider(selectedProvider.id, { defaultModel: event.target.value })} />
                 </label>
               </div>
-              <label>
-                性格
-                <input value={persona.personality} onChange={(event) => updatePersona(persona.id, { personality: event.target.value })} />
-              </label>
-              <label>
-                口头禅
-                <input value={persona.catchphrase} onChange={(event) => updatePersona(persona.id, { catchphrase: event.target.value })} />
-              </label>
-              <div className="slider-grid">
-                <PersonaSlider label="进攻性" value={persona.aggression} onChange={(value) => updatePersona(persona.id, { aggression: value })} />
-                <PersonaSlider label="保守性" value={persona.conservatism} onChange={(value) => updatePersona(persona.id, { conservatism: value })} />
-                <PersonaSlider label="风险偏好" value={persona.riskTolerance} onChange={(value) => updatePersona(persona.id, { riskTolerance: value })} />
-                <PersonaSlider label="撒谎能力" value={persona.deceptionSkill} onChange={(value) => updatePersona(persona.id, { deceptionSkill: value })} />
-                <PersonaSlider label="倒钩倾向" value={persona.bussingTendency} onChange={(value) => updatePersona(persona.id, { bussingTendency: value })} />
-                <PersonaSlider label="起跳倾向" value={persona.claimTendency} onChange={(value) => updatePersona(persona.id, { claimTendency: value })} />
-                <PersonaSlider label="投票独立性" value={persona.voteIndependence} onChange={(value) => updatePersona(persona.id, { voteIndependence: value })} />
+              <div className="api-action-row">
+                <button className="primary-button" onClick={() => onTestProvider(selectedProvider)} disabled={!selectedProvider.enabled}>
+                  <Eye size={16} />
+                  测试连接
+                </button>
+                <button className="ghost-button" onClick={() => onProviderApiKeyChange(selectedProvider.id, "")} disabled={!providerApiKeys[selectedProvider.id]}>
+                  清除密钥
+                </button>
+                <label className="switch-field">
+                  <input type="checkbox" checked={selectedProvider.enabled} onChange={(event) => updateProvider(selectedProvider.id, { enabled: event.target.checked })} />
+                  <span>启用</span>
+                </label>
+                <button className="ghost-button" onClick={onSave}>
+                  <Save size={16} />
+                  保存配置
+                </button>
               </div>
-              <label>
-                自定义追加 prompt
-                <textarea value={persona.customPrompt} onChange={(event) => updatePersona(persona.id, { customPrompt: event.target.value })} rows={4} />
-              </label>
-              <Toggle label="允许开局随机抽取" checked={persona.allowRandomSelection} onChange={(value) => updatePersona(persona.id, { allowRandomSelection: value })} />
-            </div>
-          </details>
-        ))}
-      </section>
+              <p className="muted">{configStatus}</p>
+              {providerTestStatus && <p className="muted">{providerTestStatus}</p>}
+            </>
+          ) : (
+            <p className="muted">暂无供应商配置，请先添加一个供应商。</p>
+          )}
+        </section>
 
-      <section className="compact-table">
-        <div className="section-head">
-          <h3>模型管理</h3>
-          <button className="ghost-button mini" onClick={addManualModel}>
-            手动添加模型
-          </button>
-        </div>
-        {config.models.map((model) => (
-          <div className="model-row" key={model.id}>
-            <div className="model-grid">
-              <label>
-                供应商
-                <select value={model.providerId} onChange={(event) => updateModel(model.id, { providerId: event.target.value })}>
-                  {config.providers.map((provider) => (
-                    <option value={provider.id} key={provider.id}>
-                      {provider.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                模型名
-                <input value={model.name} onChange={(event) => updateModel(model.id, { name: event.target.value, displayName: event.target.value })} />
-              </label>
-              <label>
-                显示名
-                <input value={model.displayName} onChange={(event) => updateModel(model.id, { displayName: event.target.value })} />
-              </label>
-              <label>
-                上下文
-                <input type="number" value={model.contextWindow} onChange={(event) => updateModel(model.id, { contextWindow: Number(event.target.value) })} />
-              </label>
-              <label>
-                最大输出
-                <input type="number" value={model.maxOutputTokens} onChange={(event) => updateModel(model.id, { maxOutputTokens: Number(event.target.value) })} />
-              </label>
-              <label>
-                输入价 / 百万
-                <input type="number" step="0.01" value={model.inputPricePerMillion} onChange={(event) => updateModel(model.id, { inputPricePerMillion: Number(event.target.value) })} />
-              </label>
-              <label>
-                输出价 / 百万
-                <input type="number" step="0.01" value={model.outputPricePerMillion} onChange={(event) => updateModel(model.id, { outputPricePerMillion: Number(event.target.value) })} />
-              </label>
-            </div>
-            <div className="button-row">
-              <Toggle label="启用" checked={model.enabled} onChange={(value) => updateModel(model.id, { enabled: value })} />
-              <Toggle label="结构化输出" checked={model.supportsStructuredOutput} onChange={(value) => updateModel(model.id, { supportsStructuredOutput: value })} />
-              <Toggle label="推理强度" checked={model.supportsReasoningEffort} onChange={(value) => updateModel(model.id, { supportsReasoningEffort: value })} />
-              <Toggle label="缓存 Token" checked={model.supportsCachedTokens} onChange={(value) => updateModel(model.id, { supportsCachedTokens: value })} />
-            </div>
-            <label>
-              备注
-              <input value={model.notes} onChange={(event) => updateModel(model.id, { notes: event.target.value })} />
-            </label>
+        <section className="api-panel">
+          <div className="section-head">
+            <h3>已配置的供应商</h3>
+            <span className="muted">启用的真实供应商会按列表顺序优先使用</span>
           </div>
-        ))}
-      </section>
+          <div className="provider-table">
+            <div className="provider-table-head">
+              <span>供应商名称</span>
+              <span>类型</span>
+              <span>默认模型</span>
+              <span>密钥状态</span>
+              <span>连接测试</span>
+              <span>启用</span>
+            </div>
+            {config.providers.map((provider) => (
+              <div
+                className={`provider-table-row ${selectedProvider?.id === provider.id ? "selected" : ""}`}
+                key={provider.id}
+                role="button"
+                tabIndex={0}
+                onClick={() => setSelectedProviderId(provider.id)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") setSelectedProviderId(provider.id);
+                }}
+              >
+                <strong>{provider.name}</strong>
+                <span>{providerTypeLabel(provider.type)}</span>
+                <span>{provider.defaultModel || "-"}</span>
+                <span className={`status-chip ${providerKeyClass(provider, providerApiKeys)}`}>{providerKeyLabel(provider, providerApiKeys)}</span>
+                <span className={`status-chip ${providerTestClass(providerTestResults[provider.id])}`}>{providerTestLabel(providerTestResults[provider.id])}</span>
+                <label className="switch-only" onClick={(event) => event.stopPropagation()}>
+                  <input type="checkbox" checked={provider.enabled} onChange={(event) => updateProvider(provider.id, { enabled: event.target.checked })} />
+                  <span />
+                </label>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
 
-      <section className="prompt-preview">
-        <h3>Prompt 查看</h3>
-        <pre>{preview}</pre>
-      </section>
+      <aside className="api-side-column">
+        <section className={`api-panel readiness-panel ${apiSummary.ready ? "ready" : "pending"}`}>
+          <div className="panel-title">
+            <Bot size={17} />
+            接入状态检查
+          </div>
+          <div className="readiness-list compact">
+            {apiSummary.items.map((item) => (
+              <div className={`readiness-item ${item.ok ? "ok" : "warn"}`} key={item.label}>
+                <strong>{item.ok ? "通过" : "待补"}</strong>
+                <span>{item.label}</span>
+                <p>{item.detail}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+        <section className="api-panel help-panel">
+          <h3>如何填写</h3>
+          <div className="help-row">
+            <strong>供应商</strong>
+            <p>选择你正在使用的 AI 服务商，例如 OpenAI、DeepSeek 或其他兼容接口。</p>
+          </div>
+          <div className="help-row">
+            <strong>Base URL</strong>
+            <p>填写供应商给你的接口地址，通常以 https:// 开头。</p>
+          </div>
+          <div className="help-row">
+            <strong>API Key</strong>
+            <p>在供应商控制台创建密钥后粘贴到这里，只保存在当前浏览器。</p>
+          </div>
+          <div className="help-row">
+            <strong>默认模型</strong>
+            <p>填写你要用于跑局的模型名，例如 deepseek-chat。</p>
+          </div>
+        </section>
+        <section className="api-panel">
+          <div className="section-head">
+            <h3>最近连接测试</h3>
+            <span className="muted">{testedProviders.length ? `${testedProviders.length} 条` : "暂无"}</span>
+          </div>
+          {testedProviders.length > 0 ? (
+            <div className="test-log-list">
+              {testedProviders.map((provider) => (
+                <div className="test-log-row" key={provider.id}>
+                  <span className={`status-dot ${providerTestClass(providerTestResults[provider.id])}`} />
+                  <strong>{provider.name}</strong>
+                  <span>{providerTestLabel(providerTestResults[provider.id])}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">点击“测试连接”后会在这里显示结果。</p>
+          )}
+        </section>
+        <section className="api-panel">
+          <div className="panel-title">
+            <FileText size={17} />
+            游戏规则说明
+          </div>
+          <p className="muted">狼人、预言家、女巫等身份由游戏规则和创建房间流程自动分配，不属于 API 接入设置。</p>
+          <button className="ghost-button full-width" onClick={onOpenRules}>
+            前往游戏规则
+            <StepForward size={16} />
+          </button>
+        </section>
+      </aside>
     </div>
   );
 }
@@ -2580,13 +2662,28 @@ function toPublicViewState(state: GameState): GameState {
   };
 }
 
-function latestOfficialSpeechText(state: GameState): string {
-  const event = [...state.events]
-    .reverse()
-    .find((item) => item.type === "SpeechPublished" || item.type === "LastWordsPublished" || item.type === "WolfDiscussionMessage" || item.type === "SheriffCandidacySubmitted");
+function officialOutputForPending(state: GameState, pending: PendingAction, viewerId?: PlayerId): string {
+  if (pending.kind !== "speech" && pending.kind !== "wolf_discussion") return "";
+  if (pending.kind === "wolf_discussion") return canViewerSeeWolfChat(state, viewerId) ? latestEventText(state, ["WolfDiscussionMessage"]) : "";
+  return latestEventText(state, ["SpeechPublished", "LastWordsPublished"]);
+}
+
+function officialOutputForCommand(state: GameState, pending: PendingAction, command: GameCommand, viewerId?: PlayerId): string {
+  if (pending.kind === "speech" && "text" in command) return command.text;
+  if (pending.kind === "wolf_discussion" && "messageToWolves" in command && canViewerSeeWolfChat(state, viewerId)) return command.messageToWolves;
+  return "";
+}
+
+function latestEventText(state: GameState, types: string[]): string {
+  const event = [...state.events].reverse().find((item) => types.includes(item.type));
   if (!event) return "";
   const payload = event.payload as { text?: unknown; publicSpeech?: unknown; messageToWolves?: unknown };
   return String(payload.text ?? payload.publicSpeech ?? payload.messageToWolves ?? "");
+}
+
+function canViewerSeeWolfChat(state: GameState, viewerId?: PlayerId): boolean {
+  if (state.setup.debugMode.revealRoles || state.setup.debugMode.revealWolfChat || state.setup.debugMode.revealNightActions) return true;
+  return state.players.find((player) => player.id === viewerId)?.role === "werewolf";
 }
 
 function StatusBadge({ game }: { game: GameState }): JSX.Element {
@@ -2611,18 +2708,6 @@ function Toggle({ label, checked, onChange }: { label: string; checked: boolean;
     <label className="toggle">
       <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
       <span>{label}</span>
-    </label>
-  );
-}
-
-function PersonaSlider({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }): JSX.Element {
-  return (
-    <label className="persona-slider">
-      <span>
-        {label}
-        <strong>{value}</strong>
-      </span>
-      <input type="range" min={0} max={100} value={value} onChange={(event) => onChange(Number(event.target.value))} />
     </label>
   );
 }
@@ -2730,7 +2815,7 @@ function buildHumanCommand(
       type: "SubmitSheriffCandidacy",
       seatId: pending.seatId,
       runForSheriff: sheriffRun,
-      publicSpeech: speechText,
+      publicSpeech: sheriffRun ? "我选择上警，正式警上发言再展开。" : "我不上警，警下听发言和票型。",
       privateReason: sheriffRun ? "真人选择上警。" : "真人选择不上警。"
     };
   }
@@ -2759,6 +2844,11 @@ function buildHumanCommand(
 
 function legalTargetsFor(pending: PendingAction): PlayerId[] {
   return "legalTargets" in pending ? pending.legalTargets : [];
+}
+
+function canWithdrawSheriff(game: GameState, seatId: PlayerId): boolean {
+  const player = game.players.find((item) => item.id === seatId);
+  return Boolean(player?.isSheriffCandidate && !player.hasWithdrawnSheriff && game.phase.type === "sheriff_speech");
 }
 
 function defaultTargetFor(
@@ -2807,6 +2897,8 @@ function eventName(type: string): string {
     WolfDiscussionPrivateReason: "后台理由",
     WolfKillLocked: "狼人锁刀",
     WolfKillLockedPrivateReason: "锁刀理由",
+    WolfSelfExploded: "狼人自爆",
+    WolfSelfExplosionPrivateReason: "自爆理由",
     SeerChecked: "预言家查验",
     SeerCheckPrivateReason: "查验理由",
     WitchActionSubmitted: "女巫行动",
@@ -2829,10 +2921,295 @@ function eventName(type: string): string {
     AgentMemoryUpdated: "AI 记忆更新",
     DebugForceKill: "调试强制死亡",
     PlayerKilled: "玩家死亡",
+    PlayerDeathCauseRecorded: "死亡原因记录",
     PlayerExiled: "玩家放逐",
     GameEnded: "游戏结束"
   };
   return names[type] ?? type;
+}
+
+interface SheriffElectionNotice {
+  seq: number;
+  title: string;
+  voteRows: string[];
+  tallyRows: string[];
+  result: string;
+}
+
+interface FlowNotice {
+  key: string;
+  kicker: string;
+  title: string;
+  body: string;
+  rows: string[];
+  chips: string[];
+}
+
+function buildSheriffElectionNotice(game: GameState): SheriffElectionNotice | undefined {
+  const conclusion = [...game.events].reverse().find((event) => event.type === "SheriffElected" || event.type === "SheriffSkipped");
+  if (!conclusion) return undefined;
+  const voteEvent = [...game.events].reverse().find((event) => event.seq <= conclusion.seq && event.type === "SheriffVoteResolved");
+  const conclusionPayload = conclusion.payload as Record<string, unknown>;
+  const votePayload = voteEvent?.payload as Record<string, unknown> | undefined;
+  const votes = votePayload?.votes as Record<PlayerId, PlayerId | "abstain"> | undefined;
+  const tally = votePayload?.tally as Record<PlayerId, number> | undefined;
+  const winner = conclusionPayload.sheriffId as PlayerId | undefined;
+  return {
+    seq: conclusion.seq,
+    title: winner ? `${seatName(game, winner)} 当选警长` : "本局无警长",
+    voteRows: votes
+      ? Object.entries(votes).map(([voterId, targetId]) => `${seatName(game, voterId)} ${targetId === "abstain" ? "弃票" : `投给 ${seatName(game, targetId)}`}`)
+      : [],
+    tallyRows: tally ? Object.entries(tally).map(([targetId, count]) => `${seatName(game, targetId)} ${count}票`) : [],
+    result: winner ? `最终警徽给到 ${seatName(game, winner)}。` : `结果：${String(conclusionPayload.reason ?? "无人当选")}。`
+  };
+}
+
+function sheriffNoticeToFlowNotice(notice: SheriffElectionNotice): FlowNotice {
+  return {
+    key: `sheriff:${notice.seq}`,
+    kicker: "警长竞选结果",
+    title: notice.title,
+    body: notice.result,
+    rows: notice.voteRows,
+    chips: notice.tallyRows
+  };
+}
+
+function buildFlowNotice(
+  game: GameState,
+  visibleEvents: ReturnType<typeof getVisibleEvents>,
+  humanPlayerId: PlayerId | undefined,
+  dismissedKeys: string[]
+): FlowNotice | undefined {
+  if (!humanPlayerId) return undefined;
+  const phaseKeys = new Set<string>();
+  for (const event of visibleEvents) {
+    const notice = flowNoticeForEvent(game, event, humanPlayerId, phaseKeys);
+    if (notice && !dismissedKeys.includes(notice.key)) return notice;
+  }
+  return undefined;
+}
+
+function flowNoticeForEvent(
+  game: GameState,
+  event: ReturnType<typeof getVisibleEvents>[number],
+  humanPlayerId: PlayerId,
+  phaseKeys: Set<string>
+): FlowNotice | undefined {
+  const data = event.payload as Record<string, unknown>;
+  if (event.type === "PhaseStarted") return phaseNotice(game, event, humanPlayerId, phaseKeys);
+  if (event.type === "NightDeathsAnnounced") {
+    const deaths = (data.deaths as PlayerId[] | undefined) ?? [];
+    return {
+      key: event.id,
+      kicker: "天亮了",
+      title: deaths.length === 0 ? "昨夜平安夜" : `昨夜死亡 ${deaths.length} 人`,
+      body: deaths.length === 0 ? "昨夜无人死亡。" : `死亡玩家：${deaths.map((id) => seatName(game, id)).join("、")}。`,
+      rows: deaths.map((id) => `${seatName(game, id)} 死亡`),
+      chips: []
+    };
+  }
+  if (event.type === "SeerChecked" && event.seatId === humanPlayerId) {
+    return {
+      key: event.id,
+      kicker: "你的夜间行动",
+      title: "查验结果",
+      body: `${seatName(game, data.targetId as PlayerId)} 的查验结果是：${data.result === "werewolf" ? "狼人" : "好人"}。`,
+      rows: [],
+      chips: [data.result === "werewolf" ? "狼人" : "好人"]
+    };
+  }
+  if (event.type === "NightActionSubmitted" && event.seatId === humanPlayerId) {
+    const action = String(data.action ?? "");
+    return {
+      key: event.id,
+      kicker: "你的夜间行动",
+      title: action === "guard_protect" ? "守护已确认" : "夜间行动已确认",
+      body: data.targetId ? `你本晚选择了 ${seatName(game, data.targetId as PlayerId)}。` : "你的夜间行动已提交。",
+      rows: [],
+      chips: []
+    };
+  }
+  if (event.type === "WitchActionSubmitted" && event.seatId === humanPlayerId) {
+    const rows = [
+      data.wolfTarget ? `今晚刀口：${seatName(game, data.wolfTarget as PlayerId)}` : "今晚没有刀口信息",
+      data.save ? "你选择使用解药" : "你选择不使用解药",
+      data.poisonTargetId ? `毒药目标：${seatName(game, data.poisonTargetId as PlayerId)}` : "未使用毒药"
+    ];
+    return {
+      key: event.id,
+      kicker: "你的夜间行动",
+      title: "女巫行动已确认",
+      body: "你的用药选择已记录，其他玩家不会看到你的药况。",
+      rows,
+      chips: []
+    };
+  }
+  if (event.type === "WolfKillLocked") {
+    return {
+      key: event.id,
+      kicker: "狼人夜间结果",
+      title: "刀口已确认",
+      body: `狼队今晚的刀口是 ${seatName(game, data.targetId as PlayerId)}。`,
+      rows: [],
+      chips: []
+    };
+  }
+  if (event.type === "SheriffVoteResolved") {
+    const top = (data.top as PlayerId[] | undefined) ?? [];
+    const voteType = String(data.voteType ?? "");
+    if (voteType !== "sheriff" || top.length <= 1) return undefined;
+    const votes = formatVoteRows(game, data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined);
+    const tiedPlayers = top.map((id) => seatName(game, id)).join("、");
+    return {
+      key: event.id,
+      kicker: "警长投票结果",
+      title: "首轮平票，进入 PK",
+      body: tiedPlayers ? `平票玩家：${tiedPlayers}。进入警长 PK 发言。` : "首轮警长投票平票，进入 PK 发言。",
+      rows: votes ? [votes] : [],
+      chips: tallyChips(game, data.tally as Record<PlayerId, number> | undefined)
+    };
+  }
+  if (event.type === "DayVoteResolved") {
+    const votes = formatVoteRows(game, data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined);
+    return {
+      key: event.id,
+      kicker: "投票结果",
+      title: String(data.voteType ?? "") === "day_pk" ? "PK 投票结束" : "白天投票结束",
+      body: votes || "投票已经结算。",
+      rows: [],
+      chips: tallyChips(game, data.tally as Record<PlayerId, number> | undefined)
+    };
+  }
+  if (event.type === "NoExile") {
+    return {
+      key: event.id,
+      kicker: "投票结果",
+      title: "无人出局",
+      body: String(data.reason ?? "本轮无人被放逐。"),
+      rows: [],
+      chips: []
+    };
+  }
+  if (event.type === "PlayerExiled") {
+    return {
+      key: event.id,
+      kicker: "放逐结果",
+      title: `${seatName(game, data.targetId as PlayerId)} 被放逐`,
+      body: "放逐公开发生，身份不会自动翻开。",
+      rows: [],
+      chips: []
+    };
+  }
+  if (event.type === "WolfSelfExploded") {
+    return {
+      key: event.id,
+      kicker: "狼人自爆",
+      title: `${seatName(game, event.seatId)} 自爆`,
+      body: "狼人公开自爆，本回合立即结束并进入夜晚。",
+      rows: [],
+      chips: ["直接天黑"]
+    };
+  }
+  if (event.type === "HunterShotResolved") {
+    return {
+      key: event.id,
+      kicker: "猎人开枪",
+      title: `${seatName(game, event.seatId)} 开枪`,
+      body: `${seatName(game, event.seatId)} 带走了 ${seatName(game, data.targetId as PlayerId)}。`,
+      rows: [],
+      chips: []
+    };
+  }
+  if (event.type === "HunterShotSkipped") {
+    return {
+      key: event.id,
+      kicker: "猎人开枪",
+      title: `${seatName(game, event.seatId)} 不开枪`,
+      body: "猎人选择不开枪。",
+      rows: [],
+      chips: []
+    };
+  }
+  return undefined;
+}
+
+function phaseNotice(
+  game: GameState,
+  event: ReturnType<typeof getVisibleEvents>[number],
+  humanPlayerId: PlayerId,
+  phaseKeys: Set<string>
+): FlowNotice | undefined {
+  const data = event.payload as Record<string, unknown>;
+  const phase = String(data.phase ?? "");
+  const day = Number(data.day ?? game.day);
+  const actingSeatId = typeof data.actingSeatId === "string" ? data.actingSeatId : undefined;
+  const key = phaseNoticeKey(phase, day, actingSeatId === humanPlayerId);
+  if (!key || phaseKeys.has(key)) return undefined;
+  phaseKeys.add(key);
+
+  if (phase === "night_hidden") {
+    return {
+      key,
+      kicker: "夜晚阶段",
+      title: "天黑请闭眼",
+      body: day === 0 ? "首夜开始，夜间行动将按规则顺序进行。" : `第 ${day + 1} 夜开始，夜间行动将按规则顺序进行。`,
+      rows: [],
+      chips: []
+    };
+  }
+  if (phase === "night_guard" && actingSeatId === humanPlayerId) {
+    return { key, kicker: "夜晚阶段", title: "守卫行动", body: "请选择今晚要守护的玩家。", rows: [], chips: [] };
+  }
+  if (phase === "night_wolves" && canViewerSeeWolfChat(game, humanPlayerId)) {
+    return { key, kicker: "夜晚阶段", title: "狼人夜聊", body: "狼队可以讨论并确认今晚刀口。", rows: [], chips: [] };
+  }
+  if (phase === "night_seer" && actingSeatId === humanPlayerId) {
+    return { key, kicker: "夜晚阶段", title: "预言家查验", body: "请选择今晚要查验的玩家，提交后会显示查验结果。", rows: [], chips: [] };
+  }
+  if (phase === "night_witch" && actingSeatId === humanPlayerId) {
+    return { key, kicker: "夜晚阶段", title: "女巫行动", body: "请根据今晚刀口和药量选择是否用药。", rows: [], chips: [] };
+  }
+  if (phase === "sheriff_candidacy") {
+    return { key, kicker: "警长竞选", title: "是否上警", body: "请选择是否参与警长竞选；这一步不是正式警上发言。", rows: [], chips: [] };
+  }
+  if (phase === "sheriff_speech" || phase === "sheriff_pk_speech") {
+    return { key, kicker: "警长竞选", title: phase === "sheriff_pk_speech" ? "警长 PK 发言" : "警上发言开始", body: "候选人依次发言，可以在投票前退水。", rows: [], chips: [] };
+  }
+  if (phase === "sheriff_vote" || phase === "sheriff_pk_vote") {
+    return { key, kicker: "警长竞选", title: "警长投票", body: "警下玩家投票决定警长归属。", rows: [], chips: [] };
+  }
+  if (phase === "last_words") {
+    return { key, kicker: "死亡发言", title: "遗言阶段", body: "出局玩家依次发表遗言。", rows: [], chips: [] };
+  }
+  if (phase === "day_speech" || phase === "day_pk_speech") {
+    return { key, kicker: "白天阶段", title: phase === "day_pk_speech" ? "放逐 PK 发言" : "白天发言开始", body: "所有存活玩家按顺序发言，请根据公开信息判断。", rows: [], chips: [] };
+  }
+  if (phase === "day_vote" || phase === "day_pk_vote") {
+    return { key, kicker: "投票阶段", title: phase === "day_pk_vote" ? "PK 投票" : "投票放逐", body: "请根据发言、票型和公开信息投票。", rows: [], chips: [] };
+  }
+  if (phase === "hunter_shot") {
+    return { key, kicker: "猎人开枪", title: "猎人行动", body: "猎人可以选择是否开枪带走一名玩家。", rows: [], chips: [] };
+  }
+  if (phase === "badge_decision") {
+    return { key, kicker: "警徽移交", title: "警长死亡", body: "警长需要选择移交警徽或撕毁警徽。", rows: [], chips: [] };
+  }
+  if (phase === "ended") {
+    return { key, kicker: "游戏结束", title: game.winner === "wolves" ? "狼人胜利" : "好人胜利", body: game.endReason ?? "对局结束。", rows: [], chips: [] };
+  }
+  return undefined;
+}
+
+function phaseNoticeKey(phase: string, day: number, isHumanActor: boolean): string | undefined {
+  if (phase === "death_announcement" || phase === "night_resolve") return undefined;
+  if (phase === "night_hidden") return `phase:night:${day}`;
+  if (phase === "night_guard" || phase === "night_seer" || phase === "night_witch") return isHumanActor ? `phase:${phase}:${day}` : `phase:night:${day}`;
+  if (phase === "night_wolves") return `phase:night:${day}:wolves`;
+  if (phase === "sheriff_speech" || phase === "sheriff_pk_speech") return `phase:${phase}:${day}`;
+  if (phase === "day_speech" || phase === "day_pk_speech") return `phase:${phase}:${day}`;
+  if (phase) return `phase:${phase}:${day}`;
+  return undefined;
 }
 
 function eventSummary(game: GameState, type: string, payload: unknown, seatId?: PlayerId): string {
@@ -2866,17 +3243,21 @@ function eventSummary(game: GameState, type: string, payload: unknown, seatId?: 
   if (type === "WolfKillLockedPrivateReason") return "后台理由已记录，可在导出记录中追溯。";
   if (type === "WolfDiscussionPrivateReason") return "后台理由已记录，可在导出记录中追溯。";
   if (type === "DayVoteResolved" || type === "SheriffVoteResolved") {
-    return `${type === "DayVoteResolved" ? "白天投票" : "警长投票"}结算：${formatTally(game, data.tally as Record<PlayerId, number> | undefined)}`;
+    const votes = formatVoteRows(game, data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined);
+    const tally = formatTally(game, data.tally as Record<PlayerId, number> | undefined);
+    return `${type === "DayVoteResolved" ? "白天投票" : "警长投票"}结算：${votes ? `${votes}；` : ""}票型：${tally}`;
   }
   if (type === "SpeechPublished" || type === "LastWordsPublished") return `${seatName(game, seatId)}：${String(data.text ?? "")}`;
   if (type === "WolfDiscussionMessage") return `${seatName(game, seatId)}：${String(data.messageToWolves ?? "")}`;
-  if (type === "VoteCast") return `${seatName(game, seatId)} 投给 ${seatName(game, data.targetId as PlayerId)}`;
+  if (type === "WolfSelfExploded") return `${seatName(game, seatId)} 自爆为狼人，本回合结束，直接天黑`;
+  if (type === "VoteCast") return `${seatName(game, seatId)} ${data.targetId === "abstain" ? "弃票" : `投给 ${seatName(game, data.targetId as PlayerId)}`}`;
   if (type === "AgentMemoryUpdated") return `${seatName(game, seatId)} 的 AI 记忆已更新`;
   if (type === "NightDeathsAnnounced") {
     const deaths = (data.deaths as PlayerId[] | undefined) ?? [];
     return deaths.length ? `昨夜死亡：${deaths.map((id) => seatName(game, id)).join("、")}` : "昨夜平安夜";
   }
-  if (type === "PlayerKilled" || type === "PlayerExiled") return `${seatName(game, data.targetId as PlayerId)} 出局`;
+  if (type === "PlayerKilled") return `${seatName(game, data.targetId as PlayerId)} 死亡`;
+  if (type === "PlayerExiled") return `${seatName(game, data.targetId as PlayerId)} 被放逐`;
   if (type === "SheriffElected") return `${seatName(game, data.sheriffId as PlayerId)} 当选警长`;
   if (type === "BadgeDecisionPending") return `${seatName(game, data.seatId as PlayerId)} 需要处理警徽`;
   if (type === "BadgePassed") return `${seatName(game, data.fromSeatId as PlayerId)} 将警徽移交给 ${seatName(game, data.toSeatId as PlayerId)}`;
@@ -2907,6 +3288,18 @@ function formatTally(game: GameState, tally: Record<PlayerId, number> | undefine
     .join("，");
 }
 
+function tallyChips(game: GameState, tally: Record<PlayerId, number> | undefined): string[] {
+  if (!tally) return [];
+  return Object.entries(tally).map(([id, count]) => `${seatName(game, id)} ${count}票`);
+}
+
+function formatVoteRows(game: GameState, votes: Record<PlayerId, PlayerId | "abstain"> | undefined): string {
+  if (!votes) return "";
+  return Object.entries(votes)
+    .map(([voterId, targetId]) => `${seatName(game, voterId)}${targetId === "abstain" ? "弃票" : `投给${seatName(game, targetId)}`}`)
+    .join("，");
+}
+
 function seatName(game: GameState, id?: PlayerId): string {
   if (!id) return "系统";
   const player = game.players.find((item) => item.id === id);
@@ -2919,12 +3312,21 @@ function clampNumber(value: number, min: number, max: number): number {
 }
 
 function deathReason(reason: string | undefined): string {
-  if (reason === "wolf") return "夜间死亡";
+  if (reason === "wolf") return "狼刀";
   if (reason === "poison") return "毒杀";
   if (reason === "exile") return "放逐";
   if (reason === "hunter") return "猎枪";
+  if (reason === "self_explosion") return "自爆";
   if (reason === "debug") return "调试";
   return "未知";
+}
+
+function deathReasonForViewer(game: GameState, player: GameState["players"][number], viewerId?: PlayerId): string {
+  if (!player.death) return "出局";
+  if (game.status === "ended" || game.setup.debugMode.revealRoles || game.setup.debugMode.revealNightActions) return deathReason(player.death.reason);
+  if (player.id === viewerId && player.death.reason !== "wolf" && player.death.reason !== "poison") return deathReason(player.death.reason);
+  if (player.death.reason === "exile" || player.death.reason === "hunter" || player.death.reason === "self_explosion" || player.death.reason === "debug") return deathReason(player.death.reason);
+  return "死亡";
 }
 
 function downloadText(filename: string, content: string, type: string): void {
@@ -2963,10 +3365,48 @@ function upsertFetchedModels(
       supportsReasoningEffort: false,
       supportsCachedTokens: false,
       enabled: true,
-      notes: "由测试连接自动拉取，价格需手动确认。"
+      notes: "由测试连接自动拉取。"
     });
   }
   return { ...config, models: nextModels };
+}
+
+function syncHiddenAIProviderConfig(config: AIConfigStore): AIConfigStore {
+  const provider = config.providers.find((item) => item.enabled && isRealProvider(item));
+  const modelName = provider?.defaultModel.trim();
+  if (!provider || !modelName) return config;
+  const personas = config.personas.map((persona) => ({
+    ...persona,
+    defaultProviderId: provider.id,
+    defaultModel: modelName
+  }));
+  return ensureDefaultModelRecord({ ...config, personas }, provider, modelName);
+}
+
+function ensureDefaultModelRecord(config: AIConfigStore, provider: ProviderAccount, modelName: string): AIConfigStore {
+  const hasModel = config.models.some((model) => model.providerId === provider.id && model.name === modelName);
+  if (hasModel) return config;
+  return {
+    ...config,
+    models: [
+      ...config.models,
+      {
+        id: `model-${provider.id}-${modelName}`.replace(/[^a-zA-Z0-9_-]/g, "-"),
+        providerId: provider.id,
+        name: modelName,
+        displayName: modelName,
+        contextWindow: 32000,
+        maxOutputTokens: 1000,
+        inputPricePerMillion: 0,
+        outputPricePerMillion: 0,
+        supportsStructuredOutput: true,
+        supportsReasoningEffort: provider.supportsReasoningEffort,
+        supportsCachedTokens: false,
+        enabled: true,
+        notes: "由 API 接入页默认模型自动创建。"
+      }
+    ]
+  };
 }
 
 function stripProviderSecrets(config: AIConfigStore): AIConfigStore {

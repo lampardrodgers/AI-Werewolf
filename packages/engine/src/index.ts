@@ -45,7 +45,7 @@ export interface PlayerState extends PlayerProfile {
   death?: {
     day: number;
     phase: string;
-    reason: "wolf" | "poison" | "exile" | "hunter" | "debug";
+    reason: "wolf" | "poison" | "exile" | "hunter" | "self_explosion" | "debug";
   };
 }
 
@@ -213,6 +213,7 @@ export type GameCommand =
   | { type: "SubmitVote"; seatId: PlayerId; targetId: PlayerId | "abstain"; privateReason: string; confidence?: number }
   | { type: "SubmitBadgeDecision"; seatId: PlayerId; targetId: PlayerId | "destroy"; privateReason?: string }
   | { type: "SubmitHunterShot"; seatId: PlayerId; targetId: PlayerId | "skip"; privateReason: string }
+  | { type: "SubmitWolfSelfExplosion"; seatId: PlayerId; privateReason?: string }
   | { type: "ResolveTimeout"; seatId?: PlayerId }
   | { type: "DebugForceKill"; seatId: PlayerId; reason: string };
 
@@ -375,6 +376,9 @@ export function applyCommand(input: GameState, command: GameCommand): GameState 
     case "SubmitHunterShot":
       handleHunterShot(state, command);
       break;
+    case "SubmitWolfSelfExplosion":
+      handleWolfSelfExplosion(state, command);
+      break;
     case "ResolveTimeout":
       handleTimeout(state, command.seatId);
       break;
@@ -466,9 +470,9 @@ export function createMockDecision(state: GameState): MockDecision | undefined {
       };
     }
     case "sheriff_candidacy": {
-      const runForSheriff = player.role === "seer" || (player.role === "werewolf" && persona.claimTendency > 45);
+      const runForSheriff = shouldRunForSheriff(state, player.id, persona);
       const publicSpeech = runForSheriff
-        ? `${persona.catchphrase} 我会上警争取警徽，第一天我会重点看发言逻辑和票型站边。`
+        ? `${persona.catchphrase} 我选择上警，后面正式警上发言再给站边和警徽流。`
         : "我先不上警，警下听发言和票型，再决定站边。";
       return {
         command: {
@@ -890,9 +894,19 @@ function isPrivateNightPhase(phase: string): boolean {
   return phase === "night_guard" || phase === "night_wolves" || phase === "night_seer" || phase === "night_witch";
 }
 
+function isNightPhaseType(phase: PhaseType): boolean {
+  return phase === "night_guard" || phase === "night_wolves" || phase === "night_seer" || phase === "night_witch" || phase === "night_resolve";
+}
+
 export function getLegalTargetsForPending(state: GameState, pending: PendingAction): PlayerState[] {
   if (!("legalTargets" in pending)) return [];
   return pending.legalTargets.map((id: PlayerId) => requirePlayer(state, id));
+}
+
+export function canWolfSelfExplode(state: GameState, seatId: PlayerId): boolean {
+  const player = getPlayer(state, seatId);
+  if (state.status !== "running" || !player?.alive || player.role !== "werewolf") return false;
+  return state.phase.type !== "lobby" && !isNightPhaseType(state.phase.type);
 }
 
 function validateSetup(setup: GameSetup, preset: RulePreset): void {
@@ -1001,7 +1015,7 @@ function enterNightStep(state: GameState, step: ConfiguredNightStep): void {
       {
         kind: "wolf_discussion",
         seatId: firstSpeaker,
-        legalTargets: aliveNonWolfIds(state),
+        legalTargets: aliveIds(state),
         round: 1
       }
     ];
@@ -1326,7 +1340,7 @@ function handleSheriffCandidacy(
     .filter((candidate) => state.round.sheriff.candidacy[candidate.id]?.run)
     .map((candidate) => candidate.id);
   state.round.sheriff.candidates = candidates;
-  pushEvent(state, "SheriffCandidatesAnnounced", "public", { candidates });
+  pushEvent(state, "SheriffCandidatesAnnounced", "public", { candidates, speechOrder: orderedSheriffCandidatesForSpeech(state, candidates) });
   if (candidates.length === 0) {
     state.round.sheriff.completed = true;
     pushEvent(state, "SheriffSkipped", "public", { reason: "无人上警" });
@@ -1365,13 +1379,17 @@ function handleSheriffWithdrawal(
     enterDeathAnnouncement(state);
     return;
   }
+  if (state.round.sheriff.speechQueue.length === 0) {
+    enterSheriffVote(state, "sheriff", candidates);
+    return;
+  }
   const current = state.round.sheriff.speechQueue[0];
   setPhase(state, "sheriff_speech", state.day, "警长竞选 · 上警发言", current, `${candidates.length - state.round.sheriff.speechQueue.length + 1}/${candidates.length}`);
   state.pendingActions = [{ kind: "speech", seatId: current, speechType: "sheriff" }];
 }
 
 function enterSheriffSpeech(state: GameState, candidates: PlayerId[]): void {
-  state.round.sheriff.speechQueue = [...candidates];
+  state.round.sheriff.speechQueue = orderedSheriffCandidatesForSpeech(state, candidates);
   const current = state.round.sheriff.speechQueue[0];
   setPhase(state, "sheriff_speech", state.day, "警长竞选 · 上警发言", current, `1/${candidates.length}`);
   state.pendingActions = [{ kind: "speech", seatId: current, speechType: "sheriff" }];
@@ -1590,9 +1608,10 @@ function resolveSheriffVote(state: GameState, voteType: "sheriff" | "sheriff_pk"
   }
   if (voteType === "sheriff") {
     state.round.sheriff.pkCandidates = result.top;
-    state.round.sheriff.speechQueue = [...result.top];
-    setPhase(state, "sheriff_pk_speech", state.day, "警长竞选 · PK 发言", result.top[0]);
-    state.pendingActions = [{ kind: "speech", seatId: result.top[0], speechType: "pk" }];
+    state.round.sheriff.speechQueue = orderedSheriffCandidatesForSpeech(state, result.top);
+    const current = state.round.sheriff.speechQueue[0];
+    setPhase(state, "sheriff_pk_speech", state.day, "警长竞选 · PK 发言", current);
+    state.pendingActions = [{ kind: "speech", seatId: current, speechType: "pk" }];
     return;
   }
   if (state.rulePreset.voteRules.secondTiePolicy === "random") {
@@ -1737,6 +1756,24 @@ function afterDayDeaths(state: GameState): void {
   enterNight(state, state.day + 1);
 }
 
+function handleWolfSelfExplosion(state: GameState, command: Extract<GameCommand, { type: "SubmitWolfSelfExplosion" }>): void {
+  if (!canWolfSelfExplode(state, command.seatId)) return;
+
+  pushEvent(state, "WolfSelfExploded", "public", { seatId: command.seatId }, command.seatId);
+  markDead(state, command.seatId, "self_explosion");
+  pushEvent(state, "WolfSelfExplosionPrivateReason", "admin", { privateReason: command.privateReason ?? "" }, command.seatId);
+
+  const pendingBadgeSeatId = takePendingBadgeSeatId(state, command.seatId);
+  if (pendingBadgeSeatId) {
+    destroyBadge(state, pendingBadgeSeatId, "狼人自爆后直接进入夜晚，警徽自动撕毁。");
+  }
+
+  state.pendingActions = [];
+  state.round.lastDeaths = [command.seatId];
+  if (finishIfWon(state)) return;
+  enterNight(state, state.day + 1);
+}
+
 function handleDebugForceKill(state: GameState, command: Extract<GameCommand, { type: "DebugForceKill" }>): void {
   if (!state.setup.debugMode.allowManualOverride) return;
   markDead(state, command.seatId, "debug");
@@ -1812,7 +1849,14 @@ function markDead(state: GameState, targetId: PlayerId, reason: DeathReason): vo
     state.round.pendingBadgeSeatId = targetId;
     pushEvent(state, "BadgeDecisionPending", "public", { seatId: targetId });
   }
-  pushEvent(state, "PlayerKilled", reason === "debug" ? "admin" : "public", { targetId, reason });
+  if (reason === "debug") {
+    pushEvent(state, "PlayerKilled", "admin", { targetId, reason });
+  } else {
+    if (reason === "wolf" || reason === "poison") {
+      pushEvent(state, "PlayerKilled", "public", { targetId });
+    }
+    pushEvent(state, "PlayerDeathCauseRecorded", "admin", { targetId, reason });
+  }
 }
 
 function takePendingBadgeSeatId(state: GameState, expectedSeatId?: PlayerId): PlayerId | undefined {
@@ -1922,12 +1966,6 @@ function aliveIds(state: GameState): PlayerId[] {
   return alivePlayers(state).map((player) => player.id);
 }
 
-function aliveNonWolfIds(state: GameState): PlayerId[] {
-  return alivePlayers(state)
-    .filter((player) => player.role !== "werewolf")
-    .map((player) => player.id);
-}
-
 function findAliveRole(state: GameState, role: RoleId): PlayerState | undefined {
   return alivePlayers(state).find((player) => player.role === role);
 }
@@ -1936,9 +1974,19 @@ function orderedAliveForSpeech(state: GameState): PlayerId[] {
   const ids = alivePlayers(state)
     .sort((a, b) => a.seatNumber - b.seatNumber)
     .map((player) => player.id);
-  if (!state.sheriffSeatId || !ids.includes(state.sheriffSeatId)) return ids;
-  const index = ids.indexOf(state.sheriffSeatId);
-  return [...ids.slice(index), ...ids.slice(0, index)];
+  if (ids.length <= 1) return ids;
+  if (!state.sheriffSeatId || !ids.includes(state.sheriffSeatId)) {
+    return rotateSeatOrder(state, ids, `day:${state.day}:no-sheriff`);
+  }
+  const sheriffIndex = ids.indexOf(state.sheriffSeatId);
+  const clockwise = chooseSpeechDirection(state, `day:${state.day}:sheriff:${state.sheriffSeatId}`);
+  const ordered: PlayerId[] = [];
+  for (let offset = 1; offset < ids.length; offset += 1) {
+    const index = clockwise ? (sheriffIndex + offset) % ids.length : (sheriffIndex - offset + ids.length) % ids.length;
+    ordered.push(ids[index]);
+  }
+  ordered.push(state.sheriffSeatId);
+  return ordered;
 }
 
 function requireNight(state: GameState): NightState {
@@ -1993,15 +2041,30 @@ function chooseDeterministic<T>(state: GameState, items: T[], salt: string): T {
   return items[Math.floor(rng() * items.length)];
 }
 
+function orderedSheriffCandidatesForSpeech(state: GameState, candidates: PlayerId[]): PlayerId[] {
+  const sorted = [...candidates].sort((left, right) => requirePlayer(state, left).seatNumber - requirePlayer(state, right).seatNumber);
+  return rotateSeatOrder(state, sorted, `sheriff:${state.day}:${state.id}`);
+}
+
+function rotateSeatOrder(state: GameState, ids: PlayerId[], salt: string): PlayerId[] {
+  if (ids.length <= 1) return [...ids];
+  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${salt}`);
+  const clockwise = rng() >= 0.5;
+  const ordered = clockwise ? [...ids] : [...ids].reverse();
+  const startIndex = Math.floor(rng() * ordered.length);
+  return [...ordered.slice(startIndex), ...ordered.slice(0, startIndex)];
+}
+
+function chooseSpeechDirection(state: GameState, salt: string): boolean {
+  return createRng(`${state.setup.seed}:${state.id}:${state.day}:${salt}`)() >= 0.5;
+}
+
 function chooseGuardTarget(state: GameState, legalTargets: PlayerId[]): PlayerId {
-  const seer = getKnownAliveRoleId(state, "seer");
-  if (seer && legalTargets.includes(seer)) return seer;
-  return chooseDeterministic(state, legalTargets, "guard");
+  return choosePublicAttentionTarget(state, legalTargets, "guard") ?? legalTargets[0];
 }
 
 function chooseWolfTarget(state: GameState, legalTargets: PlayerId[]): PlayerId {
-  const priority = legalTargets.find((id) => ["seer", "witch", "guard", "hunter"].includes(requirePlayer(state, id).role));
-  return priority ?? chooseDeterministic(state, legalTargets, "wolf-target");
+  return choosePublicAttentionTarget(state, legalTargets, "wolf-target") ?? legalTargets[0];
 }
 
 function chooseSeerTarget(state: GameState, seerId: PlayerId, legalTargets: PlayerId[]): PlayerId {
@@ -2013,14 +2076,15 @@ function chooseSeerTarget(state: GameState, seerId: PlayerId, legalTargets: Play
 }
 
 function choosePoisonTarget(state: GameState, legalTargets: PlayerId[]): PlayerId | undefined {
-  if (state.day === 0) return undefined;
-  return legalTargets.find((id) => requirePlayer(state, id).role === "werewolf") ?? undefined;
+  if (state.day <= 1) return undefined;
+  return choosePublicSuspicionTarget(state, legalTargets, "witch-poison", 3);
 }
 
 function choosePressureTargets(state: GameState, selfId: PlayerId): PlayerId[] {
   const self = requirePlayer(state, selfId);
   if (self.role === "werewolf") {
-    return aliveIds(state).filter((id) => requirePlayer(state, id).role !== "werewolf");
+    const teammates = knownWolfTeammates(state, selfId);
+    return aliveIds(state).filter((id) => id !== selfId && !teammates.includes(id));
   }
   return aliveIds(state).filter((id) => id !== selfId);
 }
@@ -2030,60 +2094,249 @@ function chooseVoteTarget(state: GameState, voterId: PlayerId, legalTargets: Pla
   const targetPool = legalTargets.filter((id) => id !== voterId);
   if (targetPool.length === 0) return state.rulePreset.voteRules.allowAbstain ? "abstain" : legalTargets[0];
   if (voteType === "sheriff" || voteType === "sheriff_pk") {
-    const seerCandidate = targetPool.find((id) => requirePlayer(state, id).role === "seer");
-    return seerCandidate ?? chooseDeterministic(state, targetPool, `${voterId}:sheriff-vote`);
+    return chooseSheriffVoteTarget(state, voterId, targetPool);
   }
   if (voter.role === "werewolf") {
-    const goodTarget = targetPool.find((id) => requirePlayer(state, id).role !== "werewolf");
-    return goodTarget ?? chooseDeterministic(state, targetPool, `${voterId}:wolf-vote`);
+    const teammates = knownWolfTeammates(state, voterId);
+    const preferred = choosePublicSuspicionTarget(state, targetPool.filter((id) => !teammates.includes(id)), `${voterId}:wolf-vote`, 1);
+    return preferred ?? chooseDeterministic(state, targetPool, `${voterId}:wolf-vote`);
   }
-  const wolfTarget = targetPool.find((id) => requirePlayer(state, id).role === "werewolf");
-  return wolfTarget ?? chooseDeterministic(state, targetPool, `${voterId}:good-vote`);
+  return choosePublicSuspicionTarget(state, targetPool, `${voterId}:good-vote`, 1) ?? chooseDeterministic(state, targetPool, `${voterId}:good-vote`);
 }
 
 function chooseHunterTarget(state: GameState, legalTargets: PlayerId[]): PlayerId | "skip" {
-  return legalTargets.find((id) => requirePlayer(state, id).role === "werewolf") ?? "skip";
+  return choosePublicSuspicionTarget(state, legalTargets, "hunter-shot", 2) ?? "skip";
 }
 
 function chooseBadgeTarget(state: GameState, legalTargets: PlayerId[]): PlayerId | "destroy" {
-  const seer = legalTargets.find((id) => requirePlayer(state, id).role === "seer");
-  if (seer) return seer;
-  const good = legalTargets.find((id) => requirePlayer(state, id).role !== "werewolf");
-  return good ?? legalTargets[0] ?? "destroy";
+  return choosePublicAttentionTarget(state, legalTargets, "badge-pass") ?? legalTargets[0] ?? "destroy";
 }
 
-function getKnownAliveRoleId(state: GameState, role: RoleId): PlayerId | undefined {
-  return alivePlayers(state).find((player) => player.role === role)?.id;
+function shouldRunForSheriff(state: GameState, seatId: PlayerId, persona: (typeof DEFAULT_PERSONAS)[number]): boolean {
+  const player = requirePlayer(state, seatId);
+  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${seatId}:sheriff-candidacy`);
+  if (player.role === "seer") return rng() < 0.9;
+  if (player.role === "werewolf") {
+    const aliveWolves = alivePlayers(state)
+      .filter((item) => item.role === "werewolf")
+      .map((item) => item.id);
+    const designatedBluffer = chooseDeterministic(state, aliveWolves, "wolf-sheriff-bluffer");
+    const pressure = (persona.claimTendency + persona.deceptionSkill + persona.riskTolerance) / 300;
+    return seatId === designatedBluffer || rng() < 0.2 + pressure * 0.45;
+  }
+  const roleBase: Record<RoleId, number> = {
+    werewolf: 0,
+    seer: 0.9,
+    witch: 0.18,
+    hunter: 0.22,
+    guard: 0.12,
+    villager: 0.1
+  };
+  const style = (persona.aggression + persona.voteIndependence - persona.conservatism) / 300;
+  return rng() < Math.max(0.04, roleBase[player.role] + style * 0.18);
+}
+
+function choosePublicAttentionTarget(state: GameState, legalTargets: PlayerId[], salt: string): PlayerId | undefined {
+  if (legalTargets.length === 0) return undefined;
+  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${salt}`);
+  const scored = legalTargets.map((id) => ({
+    id,
+    score: scorePublicAttention(state, id) + scorePublicSuspicion(state, id) * 0.35 + rng() * 0.4
+  }));
+  scored.sort((left, right) => right.score - left.score || requirePlayer(state, left.id).seatNumber - requirePlayer(state, right.id).seatNumber);
+  return scored[0]?.id ?? chooseDeterministic(state, legalTargets, salt);
+}
+
+function choosePublicSuspicionTarget(
+  state: GameState,
+  legalTargets: PlayerId[],
+  salt: string,
+  minimumScore: number
+): PlayerId | undefined {
+  if (legalTargets.length === 0) return undefined;
+  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${salt}`);
+  const scored = legalTargets.map((id) => ({
+    id,
+    baseScore: scorePublicSuspicion(state, id),
+    score: scorePublicSuspicion(state, id) + rng() * 0.35
+  }));
+  scored.sort((left, right) => right.score - left.score || requirePlayer(state, left.id).seatNumber - requirePlayer(state, right.id).seatNumber);
+  const best = scored[0];
+  return best && best.baseScore >= minimumScore ? best.id : undefined;
+}
+
+function chooseSheriffVoteTarget(state: GameState, voterId: PlayerId, targetPool: PlayerId[]): PlayerId | "abstain" {
+  const voter = requirePlayer(state, voterId);
+  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${voterId}:sheriff-vote`);
+  const scored = targetPool.map((id) => ({
+    id,
+    score: scoreSheriffCandidatePublicCase(state, id) + rng() * 0.3
+  }));
+  if (voter.role === "werewolf") {
+    const teammates = knownWolfTeammates(state, voterId);
+    const teammate = scored
+      .filter((item) => teammates.includes(item.id))
+      .sort((left, right) => right.score - left.score)[0];
+    if (teammate && rng() >= 0.25) return teammate.id;
+  }
+  scored.sort((left, right) => right.score - left.score || requirePlayer(state, left.id).seatNumber - requirePlayer(state, right.id).seatNumber);
+  const best = scored[0];
+  if (!best) return state.rulePreset.voteRules.allowAbstain ? "abstain" : targetPool[0];
+  if (best.score < 0.75 && state.rulePreset.voteRules.allowAbstain && rng() < 0.2) return "abstain";
+  return best.id;
+}
+
+function scorePublicAttention(state: GameState, targetId: PlayerId): number {
+  let score = state.sheriffSeatId === targetId ? 2 : 0;
+  for (const event of getPublicEvents(state).slice(-36)) {
+    if (event.type === "SheriffCandidatesAnnounced") {
+      const candidates = (event.payload as { candidates?: PlayerId[] }).candidates ?? [];
+      if (candidates.includes(targetId)) score += 1.2;
+    }
+    if ((event.type === "SpeechPublished" || event.type === "LastWordsPublished") && event.seatId === targetId) score += 0.7;
+    if ((event.type === "DayVoteResolved" || event.type === "SheriffVoteResolved") && isRecord(event.payload)) {
+      const tally = event.payload.tally as Record<PlayerId, number> | undefined;
+      score += (tally?.[targetId] ?? 0) * 0.35;
+    }
+  }
+  return score;
+}
+
+function scorePublicSuspicion(state: GameState, targetId: PlayerId): number {
+  const events = getPublicEvents(state).slice(-40);
+  let score = 0;
+  for (const event of events) {
+    const text = eventText(event);
+    if (!mentionsPlayer(state, text, targetId)) continue;
+    if (/(查杀|狼面|像狼|狼人|出掉|归票|抗推|冲票|倒钩|解释|不认|压力|爆点|匪)/.test(text)) score += 1.4;
+    if (/(金水|好人|认下|可信|保下|偏好|银水)/.test(text)) score -= 1.2;
+  }
+  return score;
+}
+
+function scoreSheriffCandidatePublicCase(state: GameState, candidateId: PlayerId): number {
+  let score = 0;
+  for (const event of getPublicEvents(state).slice(-32)) {
+    const text = eventText(event);
+    if (event.type === "SpeechPublished" && event.seatId === candidateId) {
+      if (/(预言家|查验|警徽流|金水|查杀|验人)/.test(text)) score += 2.6;
+      if (/(警下票型|对跳|退水|站边|归票)/.test(text)) score += 0.9;
+      if (text.length >= 32) score += 0.5;
+    }
+    if (event.type === "SheriffCandidateWithdrawn" && event.seatId === candidateId) score -= 99;
+  }
+  return score;
+}
+
+function knownWolfTeammates(state: GameState, wolfId: PlayerId): PlayerId[] {
+  const actor = getPlayer(state, wolfId);
+  if (actor?.role !== "werewolf") return [];
+  return alivePlayers(state)
+    .filter((player) => player.role === "werewolf")
+    .map((player) => player.id);
+}
+
+function eventText(event: GameEvent): string {
+  if (!isRecord(event.payload)) return "";
+  const payload = event.payload as Record<string, unknown>;
+  return [payload.text, payload.publicSpeech, payload.messageToWolves]
+    .filter((item): item is string => typeof item === "string")
+    .join(" ");
+}
+
+function mentionsPlayer(state: GameState, text: string, playerId: PlayerId): boolean {
+  const player = getPlayer(state, playerId);
+  if (!player || !text) return false;
+  if (text.includes(playerId)) return true;
+  if (new RegExp(`(?:^|[^0-9])${player.seatNumber}\\s*号`).test(text)) return true;
+  return Boolean(player.name.trim() && text.includes(player.name));
 }
 
 function createMockSpeech(state: GameState, seatId: PlayerId, speechType: SpeechAction["speechType"]): string {
   const player = requirePlayer(state, seatId);
-  const pressure = choosePressureTargets(state, seatId)
-    .slice(0, 2)
-    .map((id) => formatSeat(state, id))
-    .join("、");
+  const pressureTargets = choosePublicPressureTargets(state, seatId).slice(0, 2);
+  const pressure = pressureTargets.map((id) => formatSeat(state, id)).join("、");
+  const publicContext = summarizePublicSpeechContext(state);
+  const sheriffCandidateText = publicContext.sheriffCandidates.map((id) => formatSeat(state, id)).join("、");
   if (speechType === "last_words") {
-    return `我的遗言是先看清楚票型，不要只跟最后一票。${pressure ? `我重点怀疑${pressure}。` : ""}`;
+    const review = publicContext.hasDayVote ? "白天票型" : publicContext.hasSheriffVote ? "警长票型" : "已经公开的发言";
+    return `遗言我只留两点：先复盘${review}，不要把死亡当验身份。${pressure ? `我更想让场上继续压${pressure}的发言逻辑。` : "后面按发言断层和投票动机找狼。"}`;
   }
   if (speechType === "sheriff") {
-    return player.role === "seer"
-      ? "我上警是想拿警徽带队。第一天先听对跳和警下票型，后面我会明确给出警徽流。"
-      : "我上警主要想争取发言顺序和归票权，目前先按发言质量找狼。";
+    if (player.role === "seer") {
+      const check = latestSeerCheck(state, seatId);
+      const checkText = check ? `${formatSeat(state, check.targetId)}是${check.result === "werewolf" ? "查杀" : "金水"}` : "昨晚验人结果我会先压住半轮";
+      const flow = pressureTargets
+        .slice(0, 2)
+        .map((id) => formatSeat(state, id))
+        .join("、");
+      return `我竞选警长，身份我先明跳预言家。${checkText}。警徽流先留${flow || "后置发言里逻辑最拧的位置"}，后续投票重点看谁只站边不交理由。`;
+    }
+    if (player.role === "werewolf") {
+      return `我上警不是认预言家，先抢一个发言视角。今天重点看警上谁有验人、警徽流和退水逻辑，警徽不要轻易给只报结论的人。`;
+    }
+    return `我上警是为了争取发言视角。现阶段不拍身份，先听对跳、验人和退水，后面按发言质量决定警徽归属。`;
   }
   if (speechType === "pk") {
-    return `我在 PK 台上先强调一点：我的票型和发言是一致的。${pressure ? `今天优先出${pressure.split("、")[0]}更合理。` : ""}`;
+    return `PK 我先表清楚：我不是靠情绪抗推。${pressure ? `如果要二选一，我认为先压${pressure.split("、")[0]}的发言矛盾。` : "请看我和对方谁的验人、警徽流和投票理由更完整。"}`;
   }
   if (player.role === "werewolf") {
-    return `${pressure ? `我觉得${pressure}里至少要开一张狼。` : "我先听后置位补充。"} 今天不能乱分票，谁的逻辑断层最大就先处理谁。`;
+    const voteCue = publicContext.hasSheriffVote || publicContext.hasDayVote ? "票型里有没有倒钩和冲票。" : "没有票型前先别编票型，主要听发言有没有身份硬贴和逻辑跳步。";
+    return `${pressure ? `我不太认${pressure}这两张牌的发言闭环。` : "我先不硬归票，等后置位补齐逻辑。"} 今天别只跟预言家标签走，重点看${voteCue}`;
   }
   if (player.role === "seer") {
-    const check = state.events.find((event) => event.type === "SeerChecked" && event.seatId === seatId);
-    const payload = check?.payload as { targetId?: string; result?: string } | undefined;
-    if (payload?.targetId) {
-      return `我这里有查验信息：${formatSeat(state, payload.targetId)}是${payload.result === "werewolf" ? "查杀" : "金水"}。今天优先围绕这个信息盘。`;
+    const check = latestSeerCheck(state, seatId);
+    if (check) {
+      const nextFlow = pressureTargets
+        .filter((id) => id !== check.targetId)
+        .slice(0, 2)
+        .map((id) => formatSeat(state, id))
+        .join("、");
+      const cue = publicContext.hasSheriffVote ? "警长票型" : "警上发言";
+      return `我报验人：${formatSeat(state, check.targetId)}是${check.result === "werewolf" ? "查杀" : "金水"}。今天围绕这个信息和${cue}盘，警徽流继续留${nextFlow || "发言最拧巴的位置"}。`;
     }
   }
-  return `${pressure ? `我目前更想听${pressure}解释。` : "我先保持中立。"} 投票不要只看情绪，重点看警上选择、夜里死亡和今天谁在强行带节奏。`;
+  if (pressure) {
+    const voteCue = publicContext.hasSheriffVote || publicContext.hasDayVote ? "票型" : "后续票型";
+    return `我现在更想听${pressure}把具体发言矛盾讲清楚。我的判断只看公开信息，先对齐警上发言，再结合${voteCue}和死亡信息。`;
+  }
+  if (sheriffCandidateText && !publicContext.hasSheriffVote) {
+    return `现在公开焦点主要是上警的${sheriffCandidateText}，没上警的位置先不要被硬拉站边。先听他们报验人、警徽流和退水情况。`;
+  }
+  return "现在公开信息还不够，我先不强行归边。先听后置位补充发言，再结合后续票型和死亡信息判断。";
+}
+
+function latestSeerCheck(state: GameState, seatId: PlayerId): { targetId: PlayerId; result: "werewolf" | "good" } | undefined {
+  const event = [...state.events].reverse().find((item) => item.type === "SeerChecked" && item.seatId === seatId);
+  if (!event || !isRecord(event.payload)) return undefined;
+  const targetId = typeof event.payload.targetId === "string" ? event.payload.targetId : undefined;
+  const result = event.payload.result === "werewolf" || event.payload.result === "good" ? event.payload.result : undefined;
+  return targetId && result ? { targetId, result } : undefined;
+}
+
+function choosePublicPressureTargets(state: GameState, selfId: PlayerId): PlayerId[] {
+  const legalTargets = aliveIds(state).filter((id) => id !== selfId);
+  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${selfId}:pressure`);
+  return legalTargets
+    .map((id) => ({ id, score: scorePublicSuspicion(state, id) }))
+    .filter((item) => item.score >= 1)
+    .map((item) => ({ ...item, score: item.score + rng() * 0.1 }))
+    .sort((left, right) => right.score - left.score || requirePlayer(state, left.id).seatNumber - requirePlayer(state, right.id).seatNumber)
+    .map((item) => item.id);
+}
+
+function summarizePublicSpeechContext(state: GameState): { sheriffCandidates: PlayerId[]; hasSheriffVote: boolean; hasDayVote: boolean } {
+  const publicEvents = getPublicEvents(state);
+  const candidateEvent = [...publicEvents].reverse().find((event) => event.type === "SheriffCandidatesAnnounced" && isRecord(event.payload));
+  const candidates =
+    candidateEvent && isRecord(candidateEvent.payload) && Array.isArray(candidateEvent.payload.candidates)
+      ? candidateEvent.payload.candidates.filter((id): id is PlayerId => typeof id === "string")
+      : [];
+  return {
+    sheriffCandidates: candidates,
+    hasSheriffVote: publicEvents.some((event) => event.type === "SheriffVoteResolved"),
+    hasDayVote: publicEvents.some((event) => event.type === "DayVoteResolved")
+  };
 }
 
 function buildMockRationale(state: GameState, seatId: PlayerId): string {

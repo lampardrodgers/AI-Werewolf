@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.2 - 2026-06-02
+
+- Improved AI prompt boundaries so public reasoning uses visible table information instead of hidden role knowledge.
+- Added wolf self-explosion handling for eligible AI responses.
+- Expanded public record, claim, vote, and memory context used in AI decisions.
+- Refined the web game interface layout and related styling.
+- Expanded engine and AI decision tests for the new reasoning and self-explosion behavior.
+
 ## v0.1.1 - 2026-05-28
 
 - Improved AI decision handling and LLM gateway provider behavior.

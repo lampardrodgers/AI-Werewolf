@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_DEBUG_MODE, STANDARD_PRESET, type RulePreset } from "@langrensha/shared";
-import { applyAgentMemoryUpdate, applyCommand, applyMockStep, createGame, createSnapshotFixture, generateMarkdownLog, getPlayerVisibleEvents, getVisibleEvents, restoreSnapshotFixture, runMockBatch, runUntilBlocked } from "../src/index";
+import { applyAgentMemoryUpdate, applyCommand, applyMockStep, canWolfSelfExplode, createGame, createMockDecision, createSnapshotFixture, generateMarkdownLog, getPlayerVisibleEvents, getVisibleEvents, restoreSnapshotFixture, runMockBatch, runUntilBlocked } from "../src/index";
 
 describe("werewolf engine", () => {
   it("allocates the standard 12-player role table", () => {
@@ -64,6 +64,36 @@ describe("werewolf engine", () => {
     expect(result.seeds[0]).toBe("batch-run:1");
     expect(result.averageEvents).toBeGreaterThan(0);
     expect(result.averageCalls).toBeGreaterThan(0);
+  });
+
+  it("does not invent stand-side pressure targets when public sheriff information is sparse", () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "sparse-sheriff-context",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const candidates = [state.players[0].id, state.players[2].id];
+    const speaker = state.players.find((player) => player.role === "villager" && !candidates.includes(player.id)) ?? state.players[4];
+    state.phase = { type: "day_speech", day: 1, label: "第 1 天 · 白天发言", actingSeatId: speaker.id };
+    state.pendingActions = [{ kind: "speech", seatId: speaker.id, speechType: "day" }];
+    state.events.push({
+      id: "event_sparse_sheriff_candidates",
+      gameId: state.id,
+      seq: state.events.length + 1,
+      type: "SheriffCandidatesAnnounced",
+      visibility: "public",
+      payload: { candidates, speechOrder: candidates },
+      createdAt: new Date().toISOString()
+    });
+
+    const decision = createMockDecision(state);
+
+    expect(decision?.publicSpeech).toContain("上警的");
+    expect(decision?.publicSpeech).not.toContain("把站边理由讲完整");
+    expect(decision?.publicSpeech).not.toContain("警下票");
   });
 
   it("uses wolf discussion before the seer phase", () => {
@@ -140,7 +170,7 @@ describe("werewolf engine", () => {
     ).toThrow("非法目标 player_999");
   });
 
-  it("only allows wolves to propose living non-wolves", () => {
+  it("allows wolves to self-kill or kill teammates", () => {
     let state = createGame({
       totalPlayers: 6,
       humanPlayers: 0,
@@ -152,24 +182,96 @@ describe("werewolf engine", () => {
     const firstPending = state.pendingActions[0];
     if (firstPending.kind !== "wolf_discussion") throw new Error("expected wolf discussion as first pending action");
 
-    const livingNonWolfIds = state.players.filter((player) => player.alive && player.role !== "werewolf").map((player) => player.id);
-    expect(firstPending.legalTargets.sort()).toEqual(livingNonWolfIds.sort());
-    expect(firstPending.legalTargets).not.toContain(firstPending.seatId);
+    const livingIds = state.players.filter((player) => player.alive).map((player) => player.id);
+    expect(firstPending.legalTargets.sort()).toEqual(livingIds.sort());
+    expect(firstPending.legalTargets).toContain(firstPending.seatId);
 
     const teammateId = state.players.find((player) => player.role === "werewolf" && player.id !== firstPending.seatId)?.id;
     if (!teammateId) throw new Error("expected a wolf teammate");
-    expect(firstPending.legalTargets).not.toContain(teammateId);
+    expect(firstPending.legalTargets).toContain(teammateId);
 
-    expect(() =>
-      applyCommand(state, {
-        type: "SubmitWolfDiscussionMessage",
-        seatId: firstPending.seatId,
-        messageToWolves: "我测试自刀非法性。",
-        proposedTargetId: firstPending.seatId,
-        agreeCurrentProposal: true,
-        privateReason: "自刀不应是合法狼刀目标。"
-      })
-    ).toThrow(`非法目标 ${firstPending.seatId}`);
+    state = applyCommand(state, {
+      type: "SubmitWolfDiscussionMessage",
+      seatId: firstPending.seatId,
+      messageToWolves: "我测试自刀可行性。",
+      proposedTargetId: firstPending.seatId,
+      agreeCurrentProposal: true,
+      privateReason: "自刀可以制造银水和身份迷惑。"
+    });
+
+    expect(state.round.night?.wolfDiscussion?.proposals[firstPending.seatId]).toBe(firstPending.seatId);
+  });
+
+  it("lets living wolves self-explode during public rounds and immediately enter night", () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "wolf-self-explosion",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const wolfId = state.players.find((player) => player.role === "werewolf")?.id;
+    const nonWolfId = state.players.find((player) => player.role !== "werewolf")?.id;
+    if (!wolfId || !nonWolfId) throw new Error("expected wolf and non-wolf players");
+
+    expect(canWolfSelfExplode(state, wolfId)).toBe(false);
+
+    state.day = 1;
+    state.phase = { type: "day_speech", day: 1, label: "第 2 天 · 白天发言", actingSeatId: nonWolfId };
+    state.round.day = { speechQueue: [nonWolfId], votes: {}, pkCandidates: [], pkSpeechQueue: [], pkVotes: {} };
+    state.pendingActions = [{ kind: "speech", seatId: nonWolfId, speechType: "day" }];
+
+    expect(canWolfSelfExplode(state, wolfId)).toBe(true);
+    expect(canWolfSelfExplode(state, nonWolfId)).toBe(false);
+
+    const next = applyCommand(state, {
+      type: "SubmitWolfSelfExplosion",
+      seatId: wolfId,
+      privateReason: "测试狼人公开自爆后直接结束当前白天并进入夜晚。"
+    });
+
+    expect(next.players.find((player) => player.id === wolfId)?.alive).toBe(false);
+    expect(next.players.find((player) => player.id === wolfId)?.death?.reason).toBe("self_explosion");
+    expect(next.events.some((event) => event.type === "WolfSelfExploded" && event.visibility === "public" && event.seatId === wolfId)).toBe(true);
+    expect(next.pendingActions.some((action) => action.kind === "speech" || action.kind === "vote")).toBe(false);
+    expect(next.phase.type.startsWith("night_")).toBe(true);
+    expect(next.day).toBe(2);
+  });
+
+  it("ends the game when the last wolf self-explodes", () => {
+    const state = createGame({
+      totalPlayers: 6,
+      humanPlayers: 0,
+      aiPlayers: 6,
+      seed: "last-wolf-self-explosion",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const wolves = state.players.filter((player) => player.role === "werewolf");
+    const lastWolf = wolves[0];
+    const speaker = state.players.find((player) => player.role !== "werewolf");
+    if (!lastWolf || !speaker) throw new Error("expected wolf and speaker");
+
+    for (const wolf of wolves.slice(1)) {
+      wolf.alive = false;
+      wolf.death = { day: 1, phase: "day_vote", reason: "exile" };
+    }
+    state.day = 1;
+    state.phase = { type: "day_speech", day: 1, label: "第 2 天 · 白天发言", actingSeatId: speaker.id };
+    state.round.day = { speechQueue: [speaker.id], votes: {}, pkCandidates: [], pkSpeechQueue: [], pkVotes: {} };
+    state.pendingActions = [{ kind: "speech", seatId: speaker.id, speechType: "day" }];
+
+    const next = applyCommand(state, {
+      type: "SubmitWolfSelfExplosion",
+      seatId: lastWolf.id,
+      privateReason: "测试最后一狼自爆后直接触发好人胜利。"
+    });
+
+    expect(next.status).toBe("ended");
+    expect(next.winner).toBe("good");
+    expect(next.endReason).toBe("所有狼人死亡");
+    expect(next.pendingActions).toEqual([]);
   });
 
   it("honors rule presets that forbid vote abstentions", () => {
@@ -518,6 +620,87 @@ describe("werewolf engine", () => {
     expect(JSON.stringify(guardEvents.map((event) => event.payload))).not.toContain("SECRET_GUARD_REASON");
     expect(JSON.stringify(guardEvents.map((event) => event.payload))).not.toContain("privateReason");
     expect(state.events.some((event) => event.type === "NightActionPrivateReason" && event.visibility === "admin")).toBe(true);
+  });
+
+  it("keeps every private night action invisible to unrelated players", () => {
+    let state = createGame({
+      totalPlayers: 10,
+      humanPlayers: 0,
+      aiPlayers: 10,
+      seed: "private-night-action-isolation",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const guardPending = state.pendingActions.find((action) => action.kind === "guard_protect");
+    if (!guardPending || !("legalTargets" in guardPending)) throw new Error("expected guard pending action");
+
+    state = applyCommand(state, {
+      type: "SubmitNightAction",
+      seatId: guardPending.seatId,
+      action: "guard_protect",
+      targetId: guardPending.legalTargets[0],
+      privateReason: "SECRET_GUARD_REASON"
+    });
+    for (let index = 0; index < 16 && state.phase.type !== "night_seer"; index += 1) {
+      state = applyMockStep(state);
+    }
+    const seerPending = state.pendingActions.find((action) => action.kind === "seer_check");
+    if (!seerPending || !("legalTargets" in seerPending)) throw new Error("expected seer pending action");
+    state = applyCommand(state, {
+      type: "SubmitNightAction",
+      seatId: seerPending.seatId,
+      action: "seer_check",
+      targetId: seerPending.legalTargets[0],
+      privateReason: "SECRET_SEER_REASON"
+    });
+    const witchPending = state.pendingActions.find((action) => action.kind === "witch_action");
+    if (!witchPending) throw new Error("expected witch pending action");
+    state = applyCommand(state, {
+      type: "SubmitWitchAction",
+      seatId: witchPending.seatId,
+      save: false,
+      privateReason: "SECRET_WITCH_REASON"
+    });
+
+    const unrelatedViewer = state.players.find((player) => player.role === "villager")?.id;
+    const wolfViewer = state.players.find((player) => player.role === "werewolf")?.id;
+    if (!unrelatedViewer || !wolfViewer) throw new Error("expected unrelated and wolf viewers");
+
+    const unrelatedEvents = getPlayerVisibleEvents(state, unrelatedViewer);
+    const wolfEvents = getPlayerVisibleEvents(state, wolfViewer);
+
+    expect(unrelatedEvents.some((event) => event.type === "NightActionSubmitted")).toBe(false);
+    expect(unrelatedEvents.some((event) => event.type === "SeerChecked")).toBe(false);
+    expect(unrelatedEvents.some((event) => event.type === "WitchActionSubmitted")).toBe(false);
+    expect(unrelatedEvents.some((event) => event.type === "WolfDiscussionMessage")).toBe(false);
+    expect(unrelatedEvents.some((event) => event.type === "WolfKillLocked")).toBe(false);
+    expect(wolfEvents.some((event) => event.type === "WolfDiscussionMessage")).toBe(true);
+    expect(wolfEvents.some((event) => event.type === "NightActionSubmitted")).toBe(false);
+    expect(wolfEvents.some((event) => event.type === "SeerChecked")).toBe(false);
+    expect(wolfEvents.some((event) => event.type === "WitchActionSubmitted")).toBe(false);
+  });
+
+  it("does not expose night death causes to ordinary viewers", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "night-death-cause-hidden",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+
+    for (let index = 0; index < 120 && !state.events.some((event) => event.type === "PlayerKilled"); index += 1) {
+      state = applyMockStep(state);
+    }
+
+    const viewer = state.players.find((player) => player.alive)?.id;
+    if (!viewer) throw new Error("expected viewer");
+    const publicKill = getPlayerVisibleEvents(state, viewer).find((event) => event.type === "PlayerKilled");
+
+    expect(publicKill).toBeDefined();
+    expect(publicKill?.payload).not.toHaveProperty("reason");
+    expect(state.events.some((event) => event.type === "PlayerDeathCauseRecorded" && event.visibility === "admin")).toBe(true);
   });
 
   it("only allows debug force kill when manual override is enabled", () => {

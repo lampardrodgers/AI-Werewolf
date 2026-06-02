@@ -1,4 +1,4 @@
-import { AgentMemoryUpdate, GameCommand, GameState, PendingAction, createMockDecision, getPlayerVisibleEvents } from "@langrensha/engine";
+import { AgentMemoryUpdate, GameCommand, GameState, PendingAction, canWolfSelfExplode, createMockDecision, getPlayerVisibleEvents } from "@langrensha/engine";
 import { LLMObjectParseError, LLMObjectResponse, LLMProviderAdapter, createProviderAdapter, parseObjectResponse } from "@langrensha/llm-gateway";
 import { OUTPUT_SCHEMAS, SYSTEM_PROMPT_VERSION, buildPromptPreview } from "@langrensha/prompts";
 import {
@@ -450,6 +450,10 @@ function coercePlainTextResponse(
   if (!text) return undefined;
   const privateReason = "模型返回自然语言而非 JSON，但内容明确完成当前阶段动作，服务端按原文抽取结构化字段。";
 
+  if (canWolfSelfExplode(state, pending.seatId) && mentionsWolfSelfExplosion(text)) {
+    return { ...response, text, object: { self_explode: true, public_speech: text, private_reason: privateReason, memory_update: {} } };
+  }
+
   if (pending.kind === "speech") {
     return { ...response, text, object: { public_speech: text, private_reason: privateReason, memory_update: {} } };
   }
@@ -524,7 +528,7 @@ function buildPromptForPending(
     persona,
     phaseTask: buildPhaseTask(state, pending),
     memorySummary: buildMemorySummary(state, pending.seatId),
-    visibleFacts: buildVisibleFacts(state, pending.seatId),
+    visibleFacts: buildVisibleFacts(state, pending),
     schemaName
   });
 }
@@ -532,19 +536,38 @@ function buildPromptForPending(
 function buildPhaseTask(state: GameState, pending: PendingAction): string {
   const legalTargets = "legalTargets" in pending ? pending.legalTargets.map((id) => `${id}=${formatSeat(state, id)}`).join("，") : "无";
   const targetRule = legalTargets && legalTargets !== "无" ? "目标字段必须使用合法目标等号左侧的 player_N ID，不要使用座位号、昵称或等号右侧文本。" : "";
-  const base = `当前阶段：${state.phase.label}。行动座位：${formatSeat(state, pending.seatId)}。合法目标：${legalTargets || "无"}。${targetRule}`;
+  const identityBoundary =
+    "信息边界：公开判断必须基于场上发言、公开票型、警徽流、公开事件和你的合法技能结果；死亡、出局、被投票、遗言和玩家自称不会自动验明真实身份，禁止读取其他玩家后台身份。";
+  const selfExplosionRule = canWolfSelfExplode(state, pending.seatId)
+    ? "狼人自爆：如果你是狼人且公开自爆能明确打断当前白天、保护队友或避免更大损失，可以输出 self_explode=true；自爆后你出局，本回合直接结束并进入夜晚。没有明确收益不要自爆。公开发言里禁止用普通发言泄露自己是狼、狼队友或狼队私聊；要认狼只能用 self_explode=true。"
+    : "";
+  const base = `当前阶段：${state.phase.label}。行动座位：${formatSeat(state, pending.seatId)}。合法目标：${legalTargets || "无"}。${targetRule}${identityBoundary}`;
   if (pending.kind === "guard_protect") return `${base} 请选择一名玩家守护，输出 target_id 和 private_reason。`;
   if (pending.kind === "seer_check") return `${base} 请选择一名玩家查验，输出 target_id 和 private_reason。`;
   if (pending.kind === "witch_action") {
-    return `${base} 狼人刀口：${pending.wolfTarget ? formatSeat(state, pending.wolfTarget) : "无"}。canSave=${pending.canSave}，canPoison=${pending.canPoison}。输出 save、poison_target_id 和 private_reason。`;
+    return `${base} 狼人刀口：${pending.wolfTarget ? formatSeat(state, pending.wolfTarget) : "无"}。canSave=${pending.canSave}，canPoison=${pending.canPoison}。女巫只知道刀口和自己的药，不知道毒药目标的真实身份；毒药必须基于公开发言、票型、查杀/对跳等公开理由，信息不足时应留毒。输出 save、poison_target_id 和 private_reason。`;
   }
   if (pending.kind === "wolf_discussion") {
-    return `${base} 狼人夜间私聊第 ${pending.round}/3 轮。当前提案：${pending.currentProposal ? formatSeat(state, pending.currentProposal) : "暂无"}。输出 message_to_wolves、proposed_target、agree_current_proposal 和 private_reason。`;
+    return `${base} 狼人夜间私聊第 ${pending.round}/3 轮。当前提案：${pending.currentProposal ? formatSeat(state, pending.currentProposal) : "暂无"}。狼刀合法目标包含所有存活玩家，因此可以自刀或刀队友，但必须说明收益；不能假装知道非狼玩家的具体神职身份。输出 message_to_wolves、proposed_target、agree_current_proposal 和 private_reason。`;
   }
-  if (pending.kind === "sheriff_candidacy") return `${base} 请决定是否上警，输出 run_for_sheriff、public_speech 和 private_reason。`;
-  if (pending.kind === "speech") return `${base} 请进行${pending.speechType === "last_words" ? "遗言" : "公开发言"}，输出 public_speech 和 private_reason 等字段。`;
+  if (pending.kind === "sheriff_candidacy") {
+    return `${base}${selfExplosionRule} 请只决定是否报名上警；这不是正式警上发言，public_speech 只写一句简短报名/不上警理由。常见策略：预言家高概率上警争警徽，狼队通常至少一名成员悍跳或搅局，少量强势好人也可能上警；不要机械地只让真预言家上警。输出 run_for_sheriff、public_speech 和 private_reason。`;
+  }
+  if (pending.kind === "speech") {
+    const evidenceRule =
+      "只能引用已经发生且对你可见的公开事实；没有警下票型、PK 票型、死亡信息、对跳或站边时，禁止把这些内容编成依据。若当前只有上警名单，就围绕实际上警名单、已发言内容和退水情况发言，不要要求未参与上警的人解释站边。";
+    const speechRule =
+      pending.speechType === "sheriff"
+        ? `这是正式警上发言；如果跳预言家，需要报验人、警徽流和站边逻辑。非预言家不要无收益乱跳预言家。${evidenceRule}`
+        : `发言必须像狼人杀玩家，围绕已经公开的警上/警下、票型、刀口、对跳、警徽流、站边和发言矛盾展开，不要写泛泛模板。${evidenceRule}`;
+    return `${base}${selfExplosionRule} 请进行${pending.speechType === "last_words" ? "遗言" : "公开发言"}。${speechRule} 输出 public_speech 和 private_reason 等字段。`;
+  }
   if (pending.kind === "vote") {
-    return `${base} 你是${formatSeat(state, pending.seatId)}，不能投给自己，禁止输出 ${pending.seatId}。请投票，可以在允许时弃票 abstain。输出 vote_target、private_reason、confidence。`;
+    const voteRule =
+      pending.voteType === "sheriff" || pending.voteType === "sheriff_pk"
+        ? "警长票只能基于警上发言、退水、对跳质量和警下票型判断；不能因为后台真实身份或狼夜聊支持某位候选人。"
+        : "放逐票只能基于公开发言、票型、公开死亡结果、技能声明和站边矛盾判断；不能使用未公开真实身份或私聊信息。";
+    return `${base}${selfExplosionRule} 你是${formatSeat(state, pending.seatId)}，不能投给自己，禁止输出 ${pending.seatId}。${voteRule} 请投票，可以在允许时弃票 abstain。输出 vote_target、private_reason、confidence。`;
   }
   if (pending.kind === "badge_decision") return `${base} 警长已经死亡，请选择一名存活玩家移交警徽，或输出 destroy 撕毁警徽。输出 target_id 和 private_reason。`;
   return `${base} 你是猎人，请选择开枪目标或 skip，输出 target_id 和 private_reason。`;
@@ -553,21 +576,28 @@ function buildPhaseTask(state: GameState, pending: PendingAction): string {
 function buildMemorySummary(state: GameState, seatId: PlayerId): string {
   const memory = state.memories[seatId];
   if (!memory) return "暂无单局记忆。";
+  const claimedRoles = Object.entries(memory.claimedRoles)
+    .filter(([, claims]) => claims.length > 0)
+    .map(([playerId, claims]) => `${formatSeat(state, playerId)}自称/被声称：${claims.join("、")}`)
+    .join("；");
   return [
-    `公开摘要：${memory.publicTimelineSummary}`,
-    `私有观察：${memory.privateObservations}`,
-    `已知事实：${memory.knownFacts.join("；") || "暂无"}`,
-    `身份事实：${memory.privateRoleFacts.join("；") || "暂无"}`
+    "记忆边界：这里只保留公开发言、公开票型、公开自称和可复述的推理笔记；不包含其他玩家后台身份、狼夜聊、私有行动理由或未公开死因。",
+    `公开摘要：${memory.publicTimelineSummary || "暂无"}`,
+    `公开自称：${claimedRoles || "暂无"}`,
+    `票型笔记：${memory.voteHistoryNotes || "暂无"}`,
+    `公开矛盾：${memory.contradictions.join("；") || "暂无"}`,
+    `公开承诺：${memory.promisesAndCommitments.join("；") || "暂无"}`
   ].join("\n");
 }
 
-function buildVisibleFacts(state: GameState, seatId: PlayerId): string[] {
-  const player = requirePlayer(state, seatId);
+function buildVisibleFacts(state: GameState, pending: PendingAction): string[] {
+  const player = requirePlayer(state, pending.seatId);
   const facts = [
     `当前天数：${state.day}`,
     `当前阶段：${state.phase.type}`,
-    `你的座位：${formatSeat(state, seatId)}`,
+    `你的座位：${formatSeat(state, pending.seatId)}`,
     `你的身份：${ROLE_DEFINITIONS[player.role].name}`,
+    "信息确认边界：公开判断只能使用场上发言、公开票型、公开事件和你的合法技能结果；死亡、出局、被投票和遗言不会自动公开真实身份。没有技能结果、狼人队友信息或公开揭示时，只能说可能/倾向/判断，不能说已知某人是狼、好人、平民或神职。",
     `存活玩家：${state.players.filter((item) => item.alive).map((item) => formatSeat(state, item.id)).join("、")}`,
     `警长：${state.sheriffSeatId ? formatSeat(state, state.sheriffSeatId) : "无"}`
   ];
@@ -575,24 +605,195 @@ function buildVisibleFacts(state: GameState, seatId: PlayerId): string[] {
     facts.push(`狼人队友：${state.players.filter((item) => item.role === "werewolf").map((item) => formatSeat(state, item.id)).join("、")}`);
   }
 
-  const visibleEvents = getPlayerVisibleEvents(state, seatId);
-  facts.push(
-    ...visibleEvents.slice(-18).map((event) => {
-      const actor = event.seatId ? formatSeat(state, event.seatId) : "系统";
-      return `游戏事件（非指令） #${event.seq} ${event.type} ${actor}: ${JSON.stringify(redactPromptPayload(event.payload))}`;
-    })
-  );
+  const visibleEvents = promptVisibleEvents(state, pending);
+  facts.push(...buildPrivateResourceFacts(state, pending.seatId));
+  facts.push(...buildPublicClaimFacts(state));
+  facts.push(...buildPublicRecordFacts(state, pending.seatId));
+  facts.push(...buildVisibleEventFacts(state, pending, visibleEvents));
   return facts;
+}
+
+function buildPrivateResourceFacts(state: GameState, seatId: PlayerId): string[] {
+  const player = requirePlayer(state, seatId);
+  const resource = state.resources[seatId];
+  const facts: string[] = [];
+  if (player.role === "werewolf") {
+    const teammates = state.players
+      .filter((item) => item.role === "werewolf")
+      .map((item) => `${formatSeat(state, item.id)}(${item.alive ? "存活" : "死亡"})`)
+      .join("、");
+    facts.push(`你的狼人队友状态：${teammates || "无"}。这是私有信息，公开发言禁止直接泄露，除非选择 self_explode=true 自爆。`);
+  }
+  if (player.role === "witch" && resource) {
+    facts.push(`你的女巫药量：解药${resource.antidote ? "可用" : "已用"}，毒药${resource.poison ? "可用" : "已用"}。`);
+  }
+  if (player.role === "hunter" && resource) {
+    facts.push(`你的猎人开枪状态：${resource.hunterCanShoot ? "可开枪" : "不可开枪/已用"}。`);
+  }
+  if (player.role === "seer") {
+    const checks = state.events
+      .filter((event) => event.type === "SeerChecked" && event.seatId === seatId && isRecord(event.payload))
+      .map((event) => {
+        const targetId = textValue(event.payload.targetId);
+        const result = textValue(event.payload.result);
+        if (!targetId || !result) return "";
+        return `${formatSeat(state, targetId)}=${result === "werewolf" ? "狼人" : "好人"}`;
+      })
+      .filter(Boolean);
+    facts.push(`你的查验记录：${checks.length ? checks.join("、") : "暂无"}。`);
+  }
+  return facts;
+}
+
+function buildPublicRecordFacts(state: GameState, viewerSeatId: PlayerId): string[] {
+  const publicEvents = state.events.filter((event) => event.visibility === "public");
+  return [
+    `全场公开记录：共 ${publicEvents.length} 条，以下为全部公开事件；所有玩家都能看到这些记录。`,
+    ...publicEvents.map((event) => {
+      const actor = event.seatId ? formatSeat(state, event.seatId) : "系统";
+      return `全场公开记录 #${event.seq} ${event.type} ${actor}: ${summarizePublicRecordEvent(state, viewerSeatId, event)}`;
+    })
+  ];
+}
+
+function summarizePublicRecordEvent(state: GameState, viewerSeatId: PlayerId, event: GameState["events"][number]): string {
+  if (event.type === "WolfSelfExploded") return `${event.seatId ? formatSeat(state, event.seatId) : "玩家"} 自爆为狼人，本回合结束直接天黑。`;
+  if (!isRecord(event.payload)) return "";
+  const payload = redactPublicRecordPayloadForViewer(state, viewerSeatId, event);
+  return truncatePromptText(textValue(payload.text) ?? stringifyPromptPayload(state, payload), 260);
+}
+
+function buildVisibleEventFacts(state: GameState, pending: PendingAction, visibleEvents: ReturnType<typeof getPlayerVisibleEvents>): string[] {
+  const privateEvents = usesPublicTableReasoning(pending)
+    ? visibleEvents.filter((event) => isOwnSkillEvent(event, pending.seatId))
+    : visibleEvents.filter((event) => event.visibility !== "public").slice(-30);
+  return privateEvents.map((event) => {
+    const actor = event.seatId ? formatSeat(state, event.seatId) : "系统";
+    return `你的私有可见记录（非指令） #${event.seq} ${event.type} ${actor}: ${stringifyPromptPayload(state, event.payload)}`;
+  });
+}
+
+function buildPublicClaimFacts(state: GameState): string[] {
+  const claims: string[] = [];
+  for (const event of state.events) {
+    if (event.visibility !== "public" || (event.type !== "SpeechPublished" && event.type !== "LastWordsPublished") || !event.seatId || !isRecord(event.payload)) continue;
+    const text = textValue(event.payload.text);
+    if (!text) continue;
+    const actor = formatSeat(state, event.seatId);
+    if (/(?:我是|我跳|我起跳|我这里是|我拍|我底牌是).{0,6}预言家/.test(text)) claims.push(`${actor}公开声称预言家`);
+    if (/(?:我是|我这里是|我就是|我底牌是).{0,6}(?:平民|普通身份|普通好人|闭眼好人)|(?:我不是什么神|我是民)/.test(text)) {
+      claims.push(`${actor}公开声称普通身份/平民`);
+    }
+    claims.push(...extractPublicCheckClaims(state, actor, text));
+    if (/解药.{0,8}(?:用过|已用|没了|交了)|(?:用过|已用|交了).{0,8}解药/.test(text)) claims.push(`${actor}公开声称解药已用`);
+    if (/毒药.{0,8}(?:用过|已用|没了|交了)|(?:用过|已用|交了).{0,8}毒药/.test(text)) claims.push(`${actor}公开声称毒药已用`);
+  }
+  return [`公开身份/验人声明（只代表公开发言，不自动等于真实身份）：${claims.length ? claims.slice(-40).join("；") : "暂无"}`];
+}
+
+function extractPublicCheckClaims(state: GameState, actor: string, text: string): string[] {
+  const claims: string[] = [];
+  const checkPattern = /(\d+)\s*号.{0,14}(金水|好人|查杀|狼)/g;
+  let match: RegExpExecArray | null;
+  while ((match = checkPattern.exec(text))) {
+    const player = state.players.find((item) => item.seatNumber === Number(match?.[1]));
+    if (!player) continue;
+    const result = match[2] === "金水" || match[2] === "好人" ? "好人/金水" : "查杀/狼";
+    claims.push(`${actor}公开声称${formatSeat(state, player.id)}为${result}`);
+  }
+  return claims;
+}
+
+function promptVisibleEvents(state: GameState, pending: PendingAction): ReturnType<typeof getPlayerVisibleEvents> {
+  const visibleEvents = getPlayerVisibleEvents(state, pending.seatId).filter((event) => event.type !== "AgentMemoryUpdated");
+  if (!usesPublicTableReasoning(pending)) return visibleEvents;
+  return visibleEvents.filter((event) => event.visibility === "public" || isOwnSkillEvent(event, pending.seatId));
+}
+
+function redactPublicRecordPayloadForViewer(state: GameState, viewerSeatId: PlayerId, event: GameState["events"][number]): Record<string, unknown> {
+  const payload = isRecord(event.payload) ? redactPromptPayload(event.payload) : {};
+  if (!isRecord(payload) || event.type !== "PhaseStarted") return isRecord(payload) ? payload : {};
+  const phase = textValue(payload.phase);
+  if (!phase || !isPrivateNightPhase(phase) || canViewPrivateNightPhase(state, viewerSeatId, phase)) return payload;
+  return {
+    ...payload,
+    phase: "night_hidden",
+    label: "夜晚行动",
+    actingSeatId: undefined,
+    progressLabel: "夜晚行动"
+  };
+}
+
+function isPrivateNightPhase(phase: string): boolean {
+  return phase === "night_guard" || phase === "night_wolves" || phase === "night_seer" || phase === "night_witch";
+}
+
+function canViewPrivateNightPhase(state: GameState, viewerSeatId: PlayerId, phase: string): boolean {
+  const viewer = requirePlayer(state, viewerSeatId);
+  if (phase === "night_wolves") return viewer.role === "werewolf";
+  if (phase === "night_guard") return viewer.role === "guard";
+  if (phase === "night_seer") return viewer.role === "seer";
+  if (phase === "night_witch") return viewer.role === "witch";
+  return false;
+}
+
+function usesPublicTableReasoning(pending: PendingAction): boolean {
+  return (
+    pending.kind === "speech" ||
+    pending.kind === "vote" ||
+    pending.kind === "sheriff_candidacy" ||
+    pending.kind === "badge_decision" ||
+    pending.kind === "hunter_shot" ||
+    pending.kind === "witch_action"
+  );
+}
+
+function isOwnSkillEvent(event: ReturnType<typeof getPlayerVisibleEvents>[number], seatId: PlayerId): boolean {
+  return event.visibility === "private" && event.seatId === seatId && ["SeerChecked", "NightActionSubmitted", "WitchActionSubmitted"].includes(event.type);
 }
 
 function redactPromptPayload(payload: unknown): unknown {
   if (Array.isArray(payload)) return payload.map(redactPromptPayload);
   if (!payload || typeof payload !== "object") return payload;
+  const hiddenKeys = new Set([
+    "privateReason",
+    "private_reason",
+    "privateRoleFacts",
+    "private_role_facts",
+    "privateNotes",
+    "private_notes",
+    "privateObservations",
+    "private_observations"
+  ]);
   return Object.fromEntries(
     Object.entries(payload as Record<string, unknown>)
-      .filter(([key]) => key !== "privateReason")
+      .filter(([key]) => !hiddenKeys.has(key))
       .map(([key, value]) => [key, redactPromptPayload(value)])
   );
+}
+
+function stringifyPromptPayload(state: GameState, payload: unknown): string {
+  return JSON.stringify(formatPromptPayload(state, redactPromptPayload(payload)));
+}
+
+function formatPromptPayload(state: GameState, payload: unknown): unknown {
+  if (Array.isArray(payload)) return payload.map((item) => formatPromptPayload(state, item));
+  if (typeof payload === "string") return formatPromptPayloadString(state, payload);
+  if (!payload || typeof payload !== "object") return payload;
+  return Object.fromEntries(
+    Object.entries(payload as Record<string, unknown>).map(([key, value]) => [
+      formatPromptPayloadKey(state, key),
+      formatPromptPayload(state, value)
+    ])
+  );
+}
+
+function formatPromptPayloadString(state: GameState, value: string): string {
+  return state.players.some((player) => player.id === value) ? formatSeat(state, value) : value;
+}
+
+function formatPromptPayloadKey(state: GameState, key: string): string {
+  return state.players.some((player) => player.id === key) ? formatSeat(state, key) : key;
 }
 
 function schemaNameForPending(pending: PendingAction): keyof typeof OUTPUT_SCHEMAS {
@@ -607,6 +808,25 @@ function schemaNameForPending(pending: PendingAction): keyof typeof OUTPUT_SCHEM
 }
 
 function commandFromModelObject(state: GameState, pending: PendingAction, object: Record<string, unknown>): GameCommand {
+  if (
+    canWolfSelfExplode(state, pending.seatId) &&
+    isExplicitTrue(firstValue(object, ["self_explode", "selfExplode", "wolf_self_explode", "wolfSelfExplode", "self_destruct", "selfDestruct"]))
+  ) {
+    return {
+      type: "SubmitWolfSelfExplosion",
+      seatId: pending.seatId,
+      privateReason: requiredPrivateReason(object)
+    };
+  }
+  const publicSpeechIntent = textValue(firstValue(object, ["public_speech", "publicSpeech", "speech"]));
+  if (publicSpeechIntent && canWolfSelfExplode(state, pending.seatId) && mentionsWolfSelfExplosion(publicSpeechIntent)) {
+    return {
+      type: "SubmitWolfSelfExplosion",
+      seatId: pending.seatId,
+      privateReason: requiredPrivateReason(object)
+    };
+  }
+
   if (pending.kind === "guard_protect" || pending.kind === "seer_check") {
     return {
       type: "SubmitNightAction",
@@ -639,8 +859,9 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
     };
   }
   if (pending.kind === "sheriff_candidacy") {
-    const publicSpeech = requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]);
+    const publicSpeech = normalizeUnsupportedPublicRoleCertainty(state, pending.seatId, requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]));
     assertImmersiveOutputText(publicSpeech, "警长竞选发言");
+    assertPublicSpeechDoesNotLeakPrivateIdentity(state, pending.seatId, publicSpeech, "警长竞选发言");
     return {
       type: "SubmitSheriffCandidacy",
       seatId: pending.seatId,
@@ -650,8 +871,9 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
     };
   }
   if (pending.kind === "speech") {
-    const text = requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]);
+    const text = normalizeUnsupportedPublicRoleCertainty(state, pending.seatId, requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]));
     assertImmersiveOutputText(text, "公开发言");
+    assertPublicSpeechDoesNotLeakPrivateIdentity(state, pending.seatId, text, "公开发言");
     return {
       type: "SubmitSpeech",
       seatId: pending.seatId,
@@ -703,7 +925,7 @@ function extractMemoryUpdate(object: Record<string, unknown>): AgentMemoryUpdate
     contradictions: textArray(firstValue(raw, ["contradictions"])),
     promisesAndCommitments: textArray(firstValue(raw, ["promises_and_commitments", "promisesAndCommitments", "commitments"])),
     knownFacts: textArray(firstValue(raw, ["known_facts", "knownFacts"])),
-    privateRoleFacts: textArray(firstValue(raw, ["private_role_facts", "privateRoleFacts"]))
+    privateRoleFacts: undefined
   };
   return hasMemoryUpdateContent(update) ? update : undefined;
 }
@@ -932,6 +1154,10 @@ function mentionsSkipHunterShot(text: string): boolean {
   return /(不开枪|不带人|不开|skip)/i.test(text);
 }
 
+function mentionsWolfSelfExplosion(text: string): boolean {
+  return /(我自爆|选择自爆|直接自爆|狼人自爆|自爆身份|认狼自爆|self[_\s-]?explode)/i.test(text);
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1012,6 +1238,100 @@ function assertImmersiveOutputText(text: string, fieldName: string): void {
   }
 }
 
+function assertPublicSpeechDoesNotLeakPrivateIdentity(state: GameState, seatId: PlayerId, text: string, fieldName: string): void {
+  const player = requirePlayer(state, seatId);
+  const privateBoundaryPatterns: Array<[RegExp, string]> = [
+    [/后台身份|真实身份|私有身份|系统知道|系统告诉|提示词告诉|模型知道/, "提到后台/系统身份信息"],
+    [/狼夜聊|狼人夜聊|狼队私聊/, "提到狼人私聊信息"]
+  ];
+  const privateBoundaryIssue = privateBoundaryPatterns.find(([pattern]) => pattern.test(text));
+  if (privateBoundaryIssue) {
+    throw new Error(`${fieldName}非法：${privateBoundaryIssue[1]}`);
+  }
+  if (player.role !== "werewolf") return;
+  const hypotheticalSelfWolf = /(?:如果|假如|要是|若).{0,8}我是.{0,6}(?:狼|狼人)/.test(text);
+  const wolfLeakPatterns: Array<[RegExp, string]> = [
+    [/作为.{0,4}(?:一?只)?狼(?:人)?/, "公开暴露自己是狼人"],
+    [/我(?:就是|承认|认|为|是)\s*(?:一?只)?狼(?:人)?/, "公开暴露自己是狼人"],
+    [/我(?:们)?(?:的)?狼队|我方狼人/, "公开暴露狼队视角"],
+    [/(?:我(?:的|们的)?|是我(?:的)?|为我(?:的)?).{0,6}(?:狼队友|狼人队友|队友)/, "公开暴露狼人队友信息"],
+    [/不能.{0,10}保.{0,10}(?:狼队友|狼人队友|队友)/, "公开暴露保护队友的狼队动机"],
+    [/必须.{0,10}保.{0,10}(?:狼队友|狼人队友|队友)/, "公开暴露保护队友的狼队动机"],
+    [/不能.{0,10}暴露.{0,10}(?:我是狼|狼队|队友)/, "公开暴露狼队后台动机"]
+  ];
+  const issue = wolfLeakPatterns.find(([pattern]) => pattern.test(text));
+  if (issue && !(hypotheticalSelfWolf && issue[1] === "公开暴露自己是狼人")) {
+    throw new Error(`${fieldName}非法：${issue[1]}`);
+  }
+}
+
+function normalizeUnsupportedPublicRoleCertainty(state: GameState, seatId: PlayerId, text: string): string {
+  return splitTextKeepingDelimiters(text)
+    .map((part) => (isSentenceDelimiter(part) ? part : normalizeUnsupportedPublicRoleCertaintySentence(state, seatId, part)))
+    .join("");
+}
+
+function normalizeUnsupportedPublicRoleCertaintySentence(state: GameState, seatId: PlayerId, sentence: string): string {
+  if (hasUncertaintyMarker(sentence)) return sentence;
+  for (const target of state.players) {
+    if (target.id === seatId) continue;
+    if (!referencesSeatNumber(sentence, target.seatNumber)) continue;
+    const claim = extractCertainRoleClaim(sentence);
+    if (!claim) continue;
+    if (hasConfirmedRoleInfo(state, seatId, target.id, claim)) continue;
+    return softenCertainRoleClaimSentence(sentence);
+  }
+  return sentence;
+}
+
+function splitTextKeepingDelimiters(text: string): string[] {
+  return text.split(/([。！？!?；;\n])/).filter((item) => item.length > 0);
+}
+
+function isSentenceDelimiter(value: string): boolean {
+  return /^[。！？!?；;\n]$/.test(value);
+}
+
+function softenCertainRoleClaimSentence(sentence: string): string {
+  return sentence
+    .replace(/(\d+\s*号)(?:是|为)?(狼|狼人|好人|平民|预言家|女巫|猎人|守卫)(走|出局|已出|被出)(?:的)?/g, "$1出局身份未公开，我倾向其为$2")
+    .replace(/(\d+\s*号)(?:是|为)(狼|狼人|好人|平民|预言家|女巫|猎人|守卫)/g, "$1可能是$2");
+}
+
+type CertainRoleClaim = "wolf" | "good" | "villager" | "seer" | "witch" | "hunter" | "guard";
+
+function hasUncertaintyMarker(sentence: string): boolean {
+  return /可能|倾向|判断|怀疑|像|狼面|如果|假如|若|未证实|不确定|身份未知|暂不定义|不能定义|不完全信|声称|自称|跳|拍|认/.test(sentence);
+}
+
+function referencesSeatNumber(sentence: string, seatNumber: number): boolean {
+  return new RegExp(`(?:^|[^0-9])${seatNumber}\\s*号`).test(sentence);
+}
+
+function extractCertainRoleClaim(sentence: string): CertainRoleClaim | undefined {
+  if (/(?:是|为).{0,4}(?:狼|狼人)|(?:狼|狼人)(?:走|出局|已出|被出)/.test(sentence)) return "wolf";
+  if (/(?:是|为).{0,4}好人|好人(?:走|出局|已出|被出)/.test(sentence)) return "good";
+  if (/(?:是|为).{0,4}平民|平民(?:走|出局|已出|被出)/.test(sentence)) return "villager";
+  if (/(?:是|为).{0,4}预言家|预言家(?:走|出局|已出|被出)/.test(sentence)) return "seer";
+  if (/(?:是|为).{0,4}女巫|女巫(?:走|出局|已出|被出)/.test(sentence)) return "witch";
+  if (/(?:是|为).{0,4}猎人|猎人(?:走|出局|已出|被出)/.test(sentence)) return "hunter";
+  if (/(?:是|为).{0,4}守卫|守卫(?:走|出局|已出|被出)/.test(sentence)) return "guard";
+  return undefined;
+}
+
+function hasConfirmedRoleInfo(state: GameState, actorId: PlayerId, targetId: PlayerId, claim: CertainRoleClaim): boolean {
+  const actor = requirePlayer(state, actorId);
+  if (actorId === targetId) return true;
+  if (actor.role !== "seer") return false;
+  const check = state.events.find(
+    (event) => event.type === "SeerChecked" && event.seatId === actorId && isRecord(event.payload) && event.payload.targetId === targetId
+  );
+  if (!check || !isRecord(check.payload)) return false;
+  if (check.payload.result === "werewolf") return claim === "wolf";
+  if (check.payload.result === "good") return claim === "good";
+  return false;
+}
+
 function firstValue(object: Record<string, unknown>, keys: string[]): unknown {
   for (const key of keys) {
     if (object[key] !== undefined && object[key] !== null) {
@@ -1021,8 +1341,16 @@ function firstValue(object: Record<string, unknown>, keys: string[]): unknown {
   return undefined;
 }
 
+function isExplicitTrue(value: unknown): boolean {
+  return value === true || value === 1 || (typeof value === "string" && /^(true|yes|1)$/i.test(value.trim()));
+}
+
 function textValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function truncatePromptText(text: string, maxLength: number): string {
+  return text.length <= maxLength ? text : `${text.slice(0, maxLength)}...`;
 }
 
 function numberValue(value: unknown): number | undefined {
@@ -1064,7 +1392,7 @@ function buildRepairPrompt(originalPrompt: string, error: string, schema: unknow
 function buildCompactRepairPrompt(state: GameState, pending: PendingAction, persona: AIPersona, error: string): string {
   const player = requirePlayer(state, pending.seatId);
   const role = ROLE_DEFINITIONS[player.role];
-  const visibleFacts = buildVisibleFacts(state, pending.seatId).slice(-8);
+  const visibleFacts = buildVisibleFacts(state, pending).slice(-8);
   const memoryLines = buildMemorySummary(state, pending.seatId)
     .split("\n")
     .map((line) => line.trim())
@@ -1100,13 +1428,13 @@ function formatLegalTargetList(state: GameState, pending: PendingAction): string
 
 function compactOutputShape(pending: PendingAction): string {
   if (pending.kind === "guard_protect" || pending.kind === "seer_check") {
-    return '{"target_id":"player_N","private_reason":"结合本局夜间信息和存活格局选择该目标的具体原因"}';
+    return '{"target_id":"player_N","private_reason":"结合公开发言、公开票型、存活格局和自己的合法技能信息选择该目标"}';
   }
   if (pending.kind === "witch_action") {
-    return '{"save":false,"poison_target_id":null,"private_reason":"结合刀口、药量和场上身份收益说明用药原因"}';
+    return '{"save":false,"poison_target_id":null,"private_reason":"结合刀口、药量、公开发言和票型说明用药原因"}';
   }
   if (pending.kind === "wolf_discussion") {
-    return '{"message_to_wolves":"给狼队友的1句夜聊意见","proposed_target":"player_N","agree_current_proposal":false,"private_reason":"结合神职威胁、发言和刀口收益说明选择原因"}';
+    return '{"message_to_wolves":"给狼队友的1句夜聊意见","proposed_target":"player_N","agree_current_proposal":false,"private_reason":"结合公开发言、票型和刀口收益说明选择原因"}';
   }
   if (pending.kind === "sheriff_candidacy") {
     return '{"run_for_sheriff":false,"public_speech":"1-3句公开竞选或退水发言","private_reason":"结合身份、发言收益和风险说明是否上警"}';
@@ -1118,7 +1446,7 @@ function compactOutputShape(pending: PendingAction): string {
     return '{"vote_target":"player_N","private_reason":"必须点名目标玩家并引用发言、票型、查验或站边等本局事实","confidence":0.65}';
   }
   if (pending.kind === "badge_decision") {
-    return '{"target_id":"player_N","private_reason":"结合警徽流、身份可信度和场上收益说明移交或撕毁原因"}';
+    return '{"target_id":"player_N","private_reason":"结合公开警徽流、发言可信度和场上收益说明移交或撕毁原因"}';
   }
   return '{"target_id":"player_N","private_reason":"结合猎人身份、死亡信息和目标狼面说明开枪或不开枪原因"}';
 }
