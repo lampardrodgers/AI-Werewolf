@@ -114,6 +114,63 @@ describe("werewolf engine", () => {
     expect(state.events.some((event) => event.type === "WolfKillLocked")).toBe(true);
   });
 
+  it("reveals night actions to dead viewers without exposing them to living bystanders", () => {
+    const hiddenDebugMode = {
+      ...DEFAULT_DEBUG_MODE,
+      revealRoles: false,
+      revealPrompts: false,
+      revealPrivateRationales: false,
+      revealWolfChat: false,
+      revealNightActions: false
+    };
+    const state = createGame({
+      totalPlayers: 6,
+      humanPlayers: 0,
+      aiPlayers: 6,
+      seed: "dead-viewer-night-actions",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: hiddenDebugMode
+    });
+    const deadViewer = state.players.find((player) => player.role === "hunter" || player.role === "villager") ?? state.players[0];
+    const livingViewer = state.players.find((player) => player.id !== deadViewer.id && player.role === "villager") ?? state.players.find((player) => player.id !== deadViewer.id && player.role !== "werewolf" && player.role !== "seer") ?? state.players[1];
+    const wolf = state.players.find((player) => player.role === "werewolf");
+    const seer = state.players.find((player) => player.role === "seer");
+    if (!wolf || !seer) throw new Error("expected wolf and seer");
+    deadViewer.alive = false;
+    deadViewer.death = { day: 1, phase: "day_vote", reason: "exile" };
+    const createdAt = new Date().toISOString();
+    state.events.push(
+      {
+        id: "event_dead_viewer_wolf_chat",
+        gameId: state.id,
+        seq: state.events.length + 1,
+        type: "WolfDiscussionMessage",
+        visibility: "private",
+        seatId: wolf.id,
+        payload: { messageToWolves: "今晚先统一刀口。" },
+        createdAt
+      },
+      {
+        id: "event_dead_viewer_seer_check",
+        gameId: state.id,
+        seq: state.events.length + 2,
+        type: "SeerChecked",
+        visibility: "private",
+        seatId: seer.id,
+        payload: { targetId: wolf.id, result: "werewolf" },
+        createdAt
+      }
+    );
+
+    const deadEvents = getPlayerVisibleEvents(state, deadViewer.id);
+    const livingEvents = getPlayerVisibleEvents(state, livingViewer.id);
+
+    expect(deadEvents.some((event) => event.type === "WolfDiscussionMessage")).toBe(true);
+    expect(deadEvents.some((event) => event.type === "SeerChecked")).toBe(true);
+    expect(livingEvents.some((event) => event.type === "WolfDiscussionMessage")).toBe(false);
+    expect(livingEvents.some((event) => event.type === "SeerChecked")).toBe(false);
+  });
+
   it("follows custom night order from the rule preset", () => {
     const seerFirstPreset: RulePreset = {
       ...STANDARD_PRESET,
@@ -510,7 +567,7 @@ describe("werewolf engine", () => {
       state = applyMockStep(state);
     }
 
-    const wolfViewer = state.players.find((player) => player.role === "werewolf")?.id;
+    const wolfViewer = state.players.find((player) => player.role === "werewolf" && player.alive)?.id;
     const nonWolfViewer = state.players.find((player) => player.role !== "werewolf")?.id;
     if (!wolfViewer || !nonWolfViewer) throw new Error("expected wolf and non-wolf viewers");
 
@@ -623,13 +680,21 @@ describe("werewolf engine", () => {
   });
 
   it("keeps every private night action invisible to unrelated players", () => {
+    const hiddenDebugMode = {
+      ...DEFAULT_DEBUG_MODE,
+      revealRoles: false,
+      revealPrompts: false,
+      revealPrivateRationales: false,
+      revealWolfChat: false,
+      revealNightActions: false
+    };
     let state = createGame({
       totalPlayers: 10,
       humanPlayers: 0,
       aiPlayers: 10,
       seed: "private-night-action-isolation",
       rulePresetId: STANDARD_PRESET.id,
-      debugMode: DEFAULT_DEBUG_MODE
+      debugMode: hiddenDebugMode
     });
     const guardPending = state.pendingActions.find((action) => action.kind === "guard_protect");
     if (!guardPending || !("legalTargets" in guardPending)) throw new Error("expected guard pending action");
@@ -662,8 +727,8 @@ describe("werewolf engine", () => {
       privateReason: "SECRET_WITCH_REASON"
     });
 
-    const unrelatedViewer = state.players.find((player) => player.role === "villager")?.id;
-    const wolfViewer = state.players.find((player) => player.role === "werewolf")?.id;
+    const unrelatedViewer = state.players.find((player) => player.role === "villager" && player.alive)?.id;
+    const wolfViewer = state.players.find((player) => player.role === "werewolf" && player.alive)?.id;
     if (!unrelatedViewer || !wolfViewer) throw new Error("expected unrelated and wolf viewers");
 
     const unrelatedEvents = getPlayerVisibleEvents(state, unrelatedViewer);
@@ -675,7 +740,7 @@ describe("werewolf engine", () => {
     expect(unrelatedEvents.some((event) => event.type === "WolfDiscussionMessage")).toBe(false);
     expect(unrelatedEvents.some((event) => event.type === "WolfKillLocked")).toBe(false);
     expect(wolfEvents.some((event) => event.type === "WolfDiscussionMessage")).toBe(true);
-    expect(wolfEvents.some((event) => event.type === "NightActionSubmitted")).toBe(false);
+    expect(wolfEvents.some((event) => event.type === "NightActionSubmitted" && event.seatId !== wolfViewer)).toBe(false);
     expect(wolfEvents.some((event) => event.type === "SeerChecked")).toBe(false);
     expect(wolfEvents.some((event) => event.type === "WitchActionSubmitted")).toBe(false);
   });
@@ -800,7 +865,10 @@ describe("werewolf engine", () => {
     expect(state.badgeDestroyed).toBe(false);
     expect(state.events.some((event) => event.type === "BadgePassed" && (event.payload as { toSeatId?: string }).toSeatId === recipientId)).toBe(true);
     expect(state.events.some((event) => event.type === "BadgeDecisionPrivateReason" && event.visibility === "admin")).toBe(true);
-    expect(state.phase.type).toBe("night_wolves");
+    expect(state.phase.type).toBe("last_words");
+    expect(state.pendingActions[0]).toMatchObject({ kind: "speech", seatId: sheriffId, speechType: "last_words" });
+    state = applyCommand(state, { type: "SubmitSpeech", seatId: sheriffId, text: "移交完警徽，我留完遗言。", privateReason: "测试警长遗言。" });
+    expect(state.phase.type.startsWith("night_")).toBe(true);
   });
 
   it("applies structured AI memory updates to one seat", () => {

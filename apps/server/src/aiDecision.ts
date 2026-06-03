@@ -4,16 +4,16 @@ import { OUTPUT_SCHEMAS, SYSTEM_PROMPT_VERSION, buildPromptPreview } from "@lang
 import {
   AIConfigStore,
   AIPersona,
+  ContextCompressionConfig,
   CostControls,
+  DEFAULT_CONTEXT_COMPRESSION,
   DEFAULT_COST_CONTROLS,
   DEFAULT_PERSONAS,
   LLMCallLog,
   ModelConfig,
   PlayerId,
-  PlayerProfile,
   ProviderAccount,
   ROLE_DEFINITIONS,
-  RoleId,
   createPromptHash
 } from "@langrensha/shared";
 
@@ -22,6 +22,7 @@ export interface AIDecisionRequest {
   seatId?: PlayerId;
   requestId?: string;
   providerApiKeys?: Record<string, string | undefined>;
+  contextCompression?: ContextCompressionConfig;
 }
 
 export interface AIDecisionResponse {
@@ -49,6 +50,20 @@ export interface AIDecisionProgress {
 
 export type AIDecisionProgressCallback = (progress: AIDecisionProgress) => void;
 
+type PromptCompressionLevel = "FULL" | "COMPACT" | "OVERFLOW_FALLBACK";
+
+interface PromptPackage {
+  prompt: string;
+  compressionLevel: PromptCompressionLevel;
+  estimatedInputTokens: number;
+  promptBudgetTokens: number;
+  promptPreviewTruncated: boolean;
+}
+
+const PROMPT_CONTEXT_SAFETY_TOKENS = 1000;
+const PROMPT_BUDGET_RATIO = 0.9;
+const PROMPT_PREVIEW_MAX_LENGTH = 8000;
+
 export async function buildAIDecision(
   request: AIDecisionRequest,
   config: AIConfigStore,
@@ -70,6 +85,7 @@ export async function buildAIDecision(
 
   const player = requirePlayer(request.state, pending.seatId);
   const persona = resolvePersona(config, player.personaId);
+
   const provider = config.providers.find((item) => item.id === persona.defaultProviderId && item.enabled);
   const model = persona.defaultModel || provider?.defaultModel;
   onProgress?.({
@@ -111,7 +127,22 @@ export async function buildAIDecision(
     model,
     message: "服务端正在整理该玩家可见信息、记忆和本阶段合法动作。"
   });
-  const prompt = buildPromptForPending(request.state, pending, persona, schemaName);
+  const promptPackage = buildPromptPackageForPending(request.state, pending, persona, schemaName, config, provider.id, model, request.contextCompression);
+  if (promptPackage.compressionLevel === "OVERFLOW_FALLBACK") {
+    const reason = `context_overflow：预计输入 ${promptPackage.estimatedInputTokens} tokens，预算 ${promptPackage.promptBudgetTokens} tokens，已使用规则兜底。`;
+    onProgress?.({
+      requestId,
+      status: "fallback",
+      seatId: pending.seatId,
+      phase: request.state.phase.label,
+      provider: provider.name,
+      model,
+      message: "公开记录超过当前模型上下文预算，已触发规则兜底。",
+      error: reason
+    });
+    return fallbackDecision(request.state, reason, 0, promptPackage);
+  }
+  const prompt = promptPackage.prompt;
   const started = Date.now();
   let lastError = "";
   const maxAttempts = Math.max(6, provider.retryCount + 4);
@@ -172,7 +203,7 @@ export async function buildAIDecision(
       return {
         ok: true,
         command,
-        llmCall: createCallLog(request.state, config, pending, persona, provider.id, provider.name, model, currentPrompt, result, command, Date.now() - started, attempt),
+        llmCall: createCallLog(request.state, config, pending, persona, provider.id, provider.name, model, currentPrompt, result, command, Date.now() - started, attempt, promptPackage),
         memoryUpdate,
         fallback: false
       };
@@ -206,7 +237,8 @@ export async function buildAIDecision(
             recovered.result,
             recovered.command,
             Date.now() - started,
-            attempt
+            attempt,
+            promptPackage
           ),
           memoryUpdate: recovered.memoryUpdate,
           fallback: false
@@ -254,7 +286,8 @@ export async function buildAIDecision(
               textRecovered.result,
               textRecovered.command,
               Date.now() - started,
-              attempt + 1
+              attempt + 1,
+              promptMetadataForPrompt(textRecovered.prompt, promptPackage.promptBudgetTokens, "COMPACT")
             ),
             memoryUpdate: textRecovered.memoryUpdate,
             fallback: false
@@ -291,7 +324,7 @@ export async function buildAIDecision(
     message: "真实模型没有产出可用动作，已触发规则兜底以免整局卡死。",
     error: reason
   });
-  return fallbackDecision(request.state, reason, maxAttempts - 1);
+  return fallbackDecision(request.state, reason, maxAttempts - 1, promptPackage);
 }
 
 function resolveBrowserApiKey(provider: ProviderAccount, request: AIDecisionRequest): string | undefined {
@@ -348,7 +381,7 @@ function selectPendingAction(state: GameState, seatId?: PlayerId): PendingAction
   });
 }
 
-function fallbackDecision(state: GameState, reason: string, retryCount = 0): AIDecisionResponse {
+function fallbackDecision(state: GameState, reason: string, retryCount = 0, promptPackage?: PromptPackage): AIDecisionResponse {
   const decision = createMockDecision(state);
   if (!decision) {
     return { ok: false, fallback: true, error: reason };
@@ -356,7 +389,7 @@ function fallbackDecision(state: GameState, reason: string, retryCount = 0): AID
   return {
     ok: true,
     command: decision.command,
-    llmCall: createFallbackCallLog(state, decision.command, decision.parsedJson, decision.privateRationale, reason, retryCount),
+    llmCall: createFallbackCallLog(state, decision.command, decision.parsedJson, decision.privateRationale, reason, retryCount, promptPackage),
     fallback: true,
     error: reason
   };
@@ -460,6 +493,9 @@ function coercePlainTextResponse(
   if (pending.kind === "sheriff_candidacy") {
     return { ...response, text, object: { run_for_sheriff: inferSheriffRun(text), public_speech: text, private_reason: privateReason } };
   }
+  if (pending.kind === "sheriff_withdrawal") {
+    return { ...response, text, object: { run_for_sheriff: !mentionsSheriffWithdrawal(text), public_speech: text, private_reason: privateReason } };
+  }
   if (pending.kind === "wolf_discussion") {
     const target = extractMentionedTarget(state, text, pending.legalTargets) ?? pending.currentProposal;
     if (!target) return undefined;
@@ -515,11 +551,42 @@ function resolvePersona(config: AIConfigStore, personaId: string | undefined): A
   return config.personas.find((item) => item.id === personaId) ?? DEFAULT_PERSONAS.find((item) => item.id === personaId) ?? config.personas[0] ?? DEFAULT_PERSONAS[0];
 }
 
+function buildPromptPackageForPending(
+  state: GameState,
+  pending: PendingAction,
+  persona: AIPersona,
+  schemaName: keyof typeof OUTPUT_SCHEMAS,
+  config: AIConfigStore,
+  providerId: string,
+  modelName: string,
+  override?: ContextCompressionConfig
+): PromptPackage {
+  const contextCompression = override ?? config.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION;
+  const budget = buildPromptBudget(config, providerId, modelName, persona);
+  const fullPrompt = buildPromptForPending(state, pending, persona, schemaName, "full");
+  const fullMeta = promptMetadataForPrompt(fullPrompt, budget.inputBudgetTokens, "FULL");
+  if (fullMeta.estimatedInputTokens <= budget.inputBudgetTokens) return fullMeta;
+  if (!contextCompression.enabled || contextCompression.mode === "full_only") {
+    return {
+      ...fullMeta,
+      compressionLevel: "OVERFLOW_FALLBACK"
+    };
+  }
+  const compactPrompt = buildPromptForPending(state, pending, persona, schemaName, "compact");
+  const compactMeta = promptMetadataForPrompt(compactPrompt, budget.inputBudgetTokens, "COMPACT");
+  if (compactMeta.estimatedInputTokens <= budget.inputBudgetTokens) return compactMeta;
+  return {
+    ...compactMeta,
+    compressionLevel: "OVERFLOW_FALLBACK"
+  };
+}
+
 function buildPromptForPending(
   state: GameState,
   pending: PendingAction,
   persona: AIPersona,
-  schemaName: keyof typeof OUTPUT_SCHEMAS
+  schemaName: keyof typeof OUTPUT_SCHEMAS,
+  contextMode: "full" | "compact" = "full"
 ): string {
   const player = requirePlayer(state, pending.seatId);
   return buildPromptPreview({
@@ -528,9 +595,44 @@ function buildPromptForPending(
     persona,
     phaseTask: buildPhaseTask(state, pending),
     memorySummary: buildMemorySummary(state, pending.seatId),
-    visibleFacts: buildVisibleFacts(state, pending),
+    visibleFacts: buildVisibleFacts(state, pending, contextMode),
     schemaName
   });
+}
+
+function buildPromptBudget(config: AIConfigStore, providerId: string, modelName: string, persona: AIPersona): { inputBudgetTokens: number; contextCapTokens: number; outputBudgetTokens: number } {
+  const model = findModelConfig(config.models, providerId, modelName);
+  const contextCapTokens = Math.max(2048, Math.min(model?.contextWindow ?? persona.contextLimit, persona.contextLimit));
+  const outputBudgetTokens = Math.max(128, Math.min(model?.maxOutputTokens ?? persona.maxOutputTokens, limitMaxOutputTokens(persona.maxOutputTokens, config.costControls)));
+  const rawInputBudget = (contextCapTokens - outputBudgetTokens - PROMPT_CONTEXT_SAFETY_TOKENS) * PROMPT_BUDGET_RATIO;
+  return {
+    inputBudgetTokens: Math.max(512, Math.floor(rawInputBudget)),
+    contextCapTokens,
+    outputBudgetTokens
+  };
+}
+
+function promptMetadataForPrompt(prompt: string, promptBudgetTokens: number, compressionLevel: PromptCompressionLevel): PromptPackage {
+  return {
+    prompt,
+    compressionLevel,
+    estimatedInputTokens: estimatePromptTokens(prompt),
+    promptBudgetTokens,
+    promptPreviewTruncated: prompt.length > PROMPT_PREVIEW_MAX_LENGTH
+  };
+}
+
+function estimatePromptTokens(text: string): number {
+  let asciiChars = 0;
+  let nonAsciiTokens = 0;
+  for (const char of text) {
+    if (char.charCodeAt(0) < 128) {
+      asciiChars += 1;
+    } else {
+      nonAsciiTokens += 1;
+    }
+  }
+  return Math.ceil(asciiChars / 4) + nonAsciiTokens;
 }
 
 function buildPhaseTask(state: GameState, pending: PendingAction): string {
@@ -545,29 +647,36 @@ function buildPhaseTask(state: GameState, pending: PendingAction): string {
   if (pending.kind === "guard_protect") return `${base} 请选择一名玩家守护，输出 target_id 和 private_reason。`;
   if (pending.kind === "seer_check") return `${base} 请选择一名玩家查验，输出 target_id 和 private_reason。`;
   if (pending.kind === "witch_action") {
-    return `${base} 狼人刀口：${pending.wolfTarget ? formatSeat(state, pending.wolfTarget) : "无"}。canSave=${pending.canSave}，canPoison=${pending.canPoison}。女巫只知道刀口和自己的药，不知道毒药目标的真实身份；毒药必须基于公开发言、票型、查杀/对跳等公开理由，信息不足时应留毒。输出 save、poison_target_id 和 private_reason。`;
+    return `${base} 狼人刀口：${pending.wolfTarget ? formatSeat(state, pending.wolfTarget) : "无"}。canSave=${pending.canSave}，canPoison=${pending.canPoison}。女巫只知道刀口和自己的药，不知道毒药目标的真实身份。策略：首夜通常偏向使用解药保轮次，但要遵守当前是否可自救、是否守救同死；银水不是金水，之后仍要听发言判断。毒药必须谨慎，优先给明确悍跳狼、强查杀逻辑位或身份矛盾无法自证的位置；公开信息不足时应留毒。输出 save、poison_target_id 和 private_reason。`;
   }
   if (pending.kind === "wolf_discussion") {
-    return `${base} 狼人夜间私聊第 ${pending.round}/3 轮。当前提案：${pending.currentProposal ? formatSeat(state, pending.currentProposal) : "暂无"}。狼刀合法目标包含所有存活玩家，因此可以自刀或刀队友，但必须说明收益；不能假装知道非狼玩家的具体神职身份。输出 message_to_wolves、proposed_target、agree_current_proposal 和 private_reason。`;
+    return `${base} 狼人夜间私聊第 ${pending.round}/3 轮。当前提案：${pending.currentProposal ? formatSeat(state, pending.currentProposal) : "暂无"}。狼刀合法目标包含所有存活玩家，因此可以自刀或刀队友，但必须说明收益；不能假装知道非狼玩家的具体神职身份。除刀口外，还要在狼队内讨论明天警上安排：推荐至少一名狼人上警、悍跳、倒钩或警下配合，并说明谁适合冲、谁适合倒钩、谁适合警下投票。输出 message_to_wolves、proposed_target、agree_current_proposal 和 private_reason。`;
   }
   if (pending.kind === "sheriff_candidacy") {
-    return `${base}${selfExplosionRule} 请只决定是否报名上警；这不是正式警上发言，public_speech 只写一句简短报名/不上警理由。常见策略：预言家高概率上警争警徽，狼队通常至少一名成员悍跳或搅局，少量强势好人也可能上警；不要机械地只让真预言家上警。输出 run_for_sheriff、public_speech 和 private_reason。`;
+    return `${base}${selfExplosionRule} 请只决定是否报名上警；这不是正式警上发言，public_speech 只写一句简短报名/不上警理由。策略倾向：真预言家通常应上警争警徽；狼队通常需要至少一名成员上警悍跳、搅局或抢发言视角，尤其当前还没有狼人报名时，全员警下会让真预言家单边坐实；平民、猎人、守卫、女巫等好人也可为了炸身份、挡刀、混淆真预言家或阻止警徽落狼手而上警。上警后可在正式警上发言阶段退水；你可以不上警，但 private_reason 必须说明不上警收益，不要机械地只让真预言家上警。输出 run_for_sheriff、public_speech 和 private_reason。`;
+  }
+  if (pending.kind === "sheriff_withdrawal") {
+    return `${base}${selfExplosionRule} 这是警长投票前的退水确认。你已经听完警上发言，可以选择继续留警或退水：run_for_sheriff=true 表示留警，run_for_sheriff=false 表示退水。真预言家通常不要退水；好人挡刀/炸身份目的达成、发言质量不足、继续竞选会干扰真预言家时应考虑退水；狼人要根据狼队收益决定留警悍跳、倒钩退水或制造票型混乱。public_speech 只写一句游戏内退水/留警声明，输出 run_for_sheriff、public_speech 和 private_reason。`;
   }
   if (pending.kind === "speech") {
     const evidenceRule =
       "只能引用已经发生且对你可见的公开事实；没有警下票型、PK 票型、死亡信息、对跳或站边时，禁止把这些内容编成依据。若当前只有上警名单，就围绕实际上警名单、已发言内容和退水情况发言，不要要求未参与上警的人解释站边。";
     const speechRule =
       pending.speechType === "sheriff"
-        ? `这是正式警上发言；如果跳预言家，需要报验人、警徽流和站边逻辑。非预言家不要无收益乱跳预言家。${evidenceRule}`
+        ? `这是正式警上发言；如果跳预言家，需要报验人、警徽流和站边逻辑。非预言家不要无收益乱跳预言家；如果你上警只是为了炸身份、挡刀、抢发言视角或搅局，目的达到、继续竞选收益低、发言质量不足或会干扰好人时，可以输出 withdraw_sheriff=true 主动退水。${evidenceRule}`
         : `发言必须像狼人杀玩家，围绕已经公开的警上/警下、票型、刀口、对跳、警徽流、站边和发言矛盾展开，不要写泛泛模板。${evidenceRule}`;
-    return `${base}${selfExplosionRule} 请进行${pending.speechType === "last_words" ? "遗言" : "公开发言"}。${speechRule} 输出 public_speech 和 private_reason 等字段。`;
+    const wolfTeamRule =
+      requirePlayer(state, pending.seatId).role === "werewolf"
+        ? "狼人团队约束：你知道狼队友。可以倒钩或切割，但必须有明确收益；如果局面只是五五开、队友仍可救、或你没有更好的抗推目标，不要主动把队友打成主要出局焦点，也不要公开发言和夜聊安排完全矛盾。"
+        : "";
+    return `${base}${selfExplosionRule} 请进行${pending.speechType === "last_words" ? "遗言" : "公开发言"}。${speechRule}${wolfTeamRule} 发言前先确定你的个人路线：你当前最信谁、最怀疑谁、下一票/下一验/下一刀希望怎么走；public_speech 必须体现你的独立判断，至少引用一个具体玩家发言或公开事件，不要只是复述上一位观点或空泛说“看后面发言”。输出 public_speech 和 private_reason 等字段。`;
   }
   if (pending.kind === "vote") {
     const voteRule =
       pending.voteType === "sheriff" || pending.voteType === "sheriff_pk"
-        ? "警长票只能基于警上发言、退水、对跳质量和警下票型判断；不能因为后台真实身份或狼夜聊支持某位候选人。"
+        ? "警长票只能基于警上发言、退水、对跳质量和警下票型判断；不能因为后台真实身份或狼夜聊支持某位候选人。若某候选人公开查杀你、强打你或把你作为主要狼坑，通常不要把票投给他，除非你在 private_reason 中明确说明这是狼人倒钩/战术弃防且符合已公开立场。"
         : "放逐票只能基于公开发言、票型、公开死亡结果、技能声明和站边矛盾判断；不能使用未公开真实身份或私聊信息。";
-    return `${base}${selfExplosionRule} 你是${formatSeat(state, pending.seatId)}，不能投给自己，禁止输出 ${pending.seatId}。${voteRule} 请投票，可以在允许时弃票 abstain。输出 vote_target、private_reason、confidence。`;
+    return `${base}${selfExplosionRule} 你是${formatSeat(state, pending.seatId)}，不能投给自己，禁止输出 ${pending.seatId}。${voteRule} 请投票；如果允许弃票且当前没有足够可信目标、票型信息不足或强行投票会暴露身份，可以输出 abstain，弃票不是错误。输出 vote_target、private_reason、confidence。`;
   }
   if (pending.kind === "badge_decision") return `${base} 警长已经死亡，请选择一名存活玩家移交警徽，或输出 destroy 撕毁警徽。输出 target_id 和 private_reason。`;
   return `${base} 你是猎人，请选择开枪目标或 skip，输出 target_id 和 private_reason。`;
@@ -590,7 +699,7 @@ function buildMemorySummary(state: GameState, seatId: PlayerId): string {
   ].join("\n");
 }
 
-function buildVisibleFacts(state: GameState, pending: PendingAction): string[] {
+function buildVisibleFacts(state: GameState, pending: PendingAction, contextMode: "full" | "compact" = "full"): string[] {
   const player = requirePlayer(state, pending.seatId);
   const facts = [
     `当前天数：${state.day}`,
@@ -608,7 +717,7 @@ function buildVisibleFacts(state: GameState, pending: PendingAction): string[] {
   const visibleEvents = promptVisibleEvents(state, pending);
   facts.push(...buildPrivateResourceFacts(state, pending.seatId));
   facts.push(...buildPublicClaimFacts(state));
-  facts.push(...buildPublicRecordFacts(state, pending.seatId));
+  facts.push(...(contextMode === "compact" ? buildCompactPublicContextFacts(state, pending.seatId) : buildPublicRecordFacts(state, pending.seatId)));
   facts.push(...buildVisibleEventFacts(state, pending, visibleEvents));
   return facts;
 }
@@ -653,6 +762,114 @@ function buildPublicRecordFacts(state: GameState, viewerSeatId: PlayerId): strin
       const actor = event.seatId ? formatSeat(state, event.seatId) : "系统";
       return `全场公开记录 #${event.seq} ${event.type} ${actor}: ${summarizePublicRecordEvent(state, viewerSeatId, event)}`;
     })
+  ];
+}
+
+function buildCompactPublicContextFacts(state: GameState, viewerSeatId: PlayerId): string[] {
+  const publicEvents = state.events.filter((event) => event.visibility === "public");
+  return [
+    `上下文压缩：COMPACT。以下为全场公开事件索引、关键事实账本、玩家账本和最近公开原文；公开原文仍可通过事件 seq 追溯。`,
+    ...buildCompactPublicEventIndex(state, viewerSeatId, publicEvents),
+    ...buildPublicKeyFactLedger(state, viewerSeatId, publicEvents),
+    ...buildPublicPlayerLedger(state, viewerSeatId, publicEvents),
+    ...buildRecentPublicOriginals(state, viewerSeatId, publicEvents)
+  ];
+}
+
+function buildCompactPublicEventIndex(state: GameState, viewerSeatId: PlayerId, publicEvents: GameState["events"]): string[] {
+  return [
+    `全场公开事件索引：共 ${publicEvents.length} 条，以下 seq/type/actor 不可丢。`,
+    ...publicEvents.map((event) => {
+      const actor = event.seatId ? formatSeat(state, event.seatId) : "系统";
+      if (event.type === "SpeechPublished" || event.type === "LastWordsPublished") {
+        return `公开索引 #${event.seq} ${event.type} ${actor}`;
+      }
+      return `公开索引 #${event.seq} ${event.type} ${actor}: ${truncatePromptText(summarizePublicRecordEvent(state, viewerSeatId, event), 48)}`;
+    })
+  ];
+}
+
+function buildPublicKeyFactLedger(state: GameState, viewerSeatId: PlayerId, publicEvents: GameState["events"]): string[] {
+  const seen = new Set<string>();
+  const facts = publicEvents.flatMap((event) => compactKeyFactsForEvent(state, viewerSeatId, event)).filter((fact) => {
+    if (seen.has(fact)) return false;
+    seen.add(fact);
+    return true;
+  });
+  return [`关键事实账本：${facts.length ? facts.slice(-48).join("；") : "暂无明确公开关键事实"}`];
+}
+
+function compactKeyFactsForEvent(state: GameState, viewerSeatId: PlayerId, event: GameState["events"][number]): string[] {
+  const actor = event.seatId ? formatSeat(state, event.seatId) : "系统";
+  const payload = isRecord(event.payload) ? redactPublicRecordPayloadForViewer(state, viewerSeatId, event) : {};
+  const text = textValue(payload.text) ?? "";
+  const facts: string[] = [];
+  if (event.type === "SpeechPublished" || event.type === "LastWordsPublished") {
+    facts.push(...extractPublicClaimsFromText(state, actor, text));
+    if (/警徽流|警徽/.test(text)) facts.push(`${actor}公开提到警徽/警徽流：${truncatePromptText(text, 80)}`);
+    if (/归票|投.{0,6}\d+\s*号|出.{0,6}\d+\s*号|打.{0,6}\d+\s*号|保.{0,6}\d+\s*号/.test(text)) {
+      facts.push(`${actor}公开表达站边/归票/攻防：${truncatePromptText(text, 80)}`);
+    }
+  }
+  if (event.type === "SheriffCandidatesAnnounced" && Array.isArray(payload.candidates)) {
+    facts.push(`上警名单：${payload.candidates.map((id) => (typeof id === "string" ? formatSeat(state, id) : String(id))).join("、")}`);
+  }
+  if (event.type === "SheriffCandidateWithdrawn") facts.push(`${actor}退水`);
+  if (event.type === "SheriffElected" && typeof payload.sheriffId === "string") facts.push(`警长当选：${formatSeat(state, payload.sheriffId)}`);
+  if (event.type === "SheriffSkipped") facts.push(`本局无警长：${stringifyPromptPayload(state, payload)}`);
+  if (event.type === "VoteCast") facts.push(`${actor}投票：${stringifyPromptPayload(state, payload)}`);
+  if (event.type === "SheriffVoteResolved" || event.type === "DayVoteResolved") facts.push(`${event.type} 票型结算：${stringifyPromptPayload(state, payload)}`);
+  if (event.type === "PlayerExiled" && typeof payload.targetId === "string") facts.push(`放逐出局：${formatSeat(state, payload.targetId)}`);
+  if (event.type === "NoExile") facts.push(`无人出局：${stringifyPromptPayload(state, payload)}`);
+  if (event.type === "NightDeathsAnnounced" && Array.isArray(payload.deaths)) {
+    facts.push(`夜间死亡公告：${payload.deaths.map((id) => (typeof id === "string" ? formatSeat(state, id) : String(id))).join("、") || "平安夜"}`);
+  }
+  if (event.type === "WolfSelfExploded") facts.push(`${actor}公开自爆为狼人`);
+  if (event.type === "BadgePassed" || event.type === "BadgeDestroyed") facts.push(`警徽事件 ${event.type}: ${stringifyPromptPayload(state, payload)}`);
+  return facts;
+}
+
+function extractPublicClaimsFromText(state: GameState, actor: string, text: string): string[] {
+  const facts: string[] = [];
+  if (!text) return facts;
+  if (/(?:我是|我跳|我起跳|我这里是|我拍|我底牌是).{0,6}预言家/.test(text)) facts.push(`${actor}公开声称预言家`);
+  if (/(?:我是|我这里是|我就是|我底牌是).{0,6}(?:平民|普通身份|普通好人|闭眼好人)|(?:我不是什么神|我是民)/.test(text)) facts.push(`${actor}公开声称普通身份/平民`);
+  facts.push(...extractPublicCheckClaims(state, actor, text));
+  if (/解药.{0,8}(?:用过|已用|没了|交了)|(?:用过|已用|交了).{0,8}解药/.test(text)) facts.push(`${actor}公开声称解药已用`);
+  if (/毒药.{0,8}(?:用过|已用|没了|交了)|(?:用过|已用|交了).{0,8}毒药/.test(text)) facts.push(`${actor}公开声称毒药已用`);
+  return facts;
+}
+
+function buildPublicPlayerLedger(state: GameState, viewerSeatId: PlayerId, publicEvents: GameState["events"]): string[] {
+  return [
+    "玩家账本：",
+    ...state.players.map((player) => {
+      const playerEvents = publicEvents.filter((event) => event.seatId === player.id);
+      const speeches = playerEvents
+        .filter((event) => (event.type === "SpeechPublished" || event.type === "LastWordsPublished") && isRecord(event.payload))
+        .map((event) => `#${event.seq}`)
+        .slice(-4);
+      const votes = playerEvents
+        .filter((event) => event.type === "VoteCast")
+        .map((event) => `#${event.seq}:${truncatePromptText(summarizePublicRecordEvent(state, viewerSeatId, event), 64)}`)
+        .slice(-2);
+      return `${formatSeat(state, player.id)}：${player.alive ? "存活" : "死亡"}；发言=${speeches.join(" / ") || "暂无"}；投票=${votes.join(" / ") || "暂无"}`;
+    })
+  ];
+}
+
+function buildRecentPublicOriginals(state: GameState, viewerSeatId: PlayerId, publicEvents: GameState["events"]): string[] {
+  const recent = publicEvents
+    .filter((event) => event.type === "SpeechPublished" || event.type === "LastWordsPublished" || event.type === "WolfSelfExploded")
+    .slice(-6);
+  return [
+    "最近公开原文：",
+    ...(recent.length
+      ? recent.map((event) => {
+          const actor = event.seatId ? formatSeat(state, event.seatId) : "系统";
+          return `最近公开 #${event.seq} ${event.type} ${actor}: ${truncatePromptText(summarizePublicRecordEvent(state, viewerSeatId, event), 140)}`;
+        })
+      : ["暂无"])
   ];
 }
 
@@ -742,6 +959,7 @@ function usesPublicTableReasoning(pending: PendingAction): boolean {
     pending.kind === "speech" ||
     pending.kind === "vote" ||
     pending.kind === "sheriff_candidacy" ||
+    pending.kind === "sheriff_withdrawal" ||
     pending.kind === "badge_decision" ||
     pending.kind === "hunter_shot" ||
     pending.kind === "witch_action"
@@ -801,6 +1019,7 @@ function schemaNameForPending(pending: PendingAction): keyof typeof OUTPUT_SCHEM
   if (pending.kind === "speech") return "speech";
   if (pending.kind === "wolf_discussion") return "wolfDiscussion";
   if (pending.kind === "sheriff_candidacy") return "sheriff";
+  if (pending.kind === "sheriff_withdrawal") return "sheriff";
   if (pending.kind === "witch_action") return "witchAction";
   if (pending.kind === "hunter_shot") return "hunterShot";
   if (pending.kind === "badge_decision") return "badgeDecision";
@@ -862,18 +1081,39 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
     const publicSpeech = normalizeUnsupportedPublicRoleCertainty(state, pending.seatId, requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]));
     assertImmersiveOutputText(publicSpeech, "警长竞选发言");
     assertPublicSpeechDoesNotLeakPrivateIdentity(state, pending.seatId, publicSpeech, "警长竞选发言");
+    const decision = normalizeSheriffCandidacyDecision(object, publicSpeech, requiredPrivateReason(object));
     return {
       type: "SubmitSheriffCandidacy",
       seatId: pending.seatId,
-      runForSheriff: Boolean(firstValue(object, ["run_for_sheriff", "runForSheriff"])),
-      publicSpeech,
-      privateReason: requiredPrivateReason(object)
+      runForSheriff: decision.runForSheriff,
+      publicSpeech: decision.publicSpeech,
+      privateReason: decision.privateReason
+    };
+  }
+  if (pending.kind === "sheriff_withdrawal") {
+    const publicSpeech = normalizeUnsupportedPublicRoleCertainty(state, pending.seatId, requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]));
+    assertImmersiveOutputText(publicSpeech, "退水确认发言");
+    assertPublicSpeechDoesNotLeakPrivateIdentity(state, pending.seatId, publicSpeech, "退水确认发言");
+    const decision = normalizeSheriffCandidacyDecision(object, publicSpeech, requiredPrivateReason(object));
+    const explicitWithdraw = optionalBooleanFromModel(firstValue(object, ["withdraw_sheriff", "withdrawSheriff", "withdraw", "drop_out"]));
+    return {
+      type: "SubmitSheriffWithdrawalDecision",
+      seatId: pending.seatId,
+      withdraw: explicitWithdraw ?? (!decision.runForSheriff || mentionsSheriffWithdrawal(publicSpeech)),
+      privateReason: decision.privateReason
     };
   }
   if (pending.kind === "speech") {
     const text = normalizeUnsupportedPublicRoleCertainty(state, pending.seatId, requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]));
     assertImmersiveOutputText(text, "公开发言");
     assertPublicSpeechDoesNotLeakPrivateIdentity(state, pending.seatId, text, "公开发言");
+    if (shouldWithdrawSheriffFromSpeech(state, pending, object, text)) {
+      return {
+        type: "WithdrawSheriffCandidacy",
+        seatId: pending.seatId,
+        privateReason: requiredPrivateReason(object)
+      };
+    }
     return {
       type: "SubmitSpeech",
       seatId: pending.seatId,
@@ -986,8 +1226,10 @@ function createCallLog(
   result: LLMObjectResponse<Record<string, unknown>>,
   command: GameCommand,
   latencyMs: number,
-  retryCount: number
+  retryCount: number,
+  promptPackage?: PromptPackage
 ): LLMCallLog {
+  const promptMeta = promptPackage ?? promptMetadataForPrompt(prompt, 0, "FULL");
   return {
     id: `call_${state.llmCalls.length + 1}`,
     gameId: state.id,
@@ -998,7 +1240,7 @@ function createCallLog(
     model,
     promptVersion: SYSTEM_PROMPT_VERSION,
     promptHash: createPromptHash(prompt),
-    promptTextRedacted: prompt,
+    promptTextRedacted: truncatePromptPreview(prompt),
     rawResponse: typeof result.raw === "string" ? result.raw : JSON.stringify(result.raw),
     parsedJson: result.object,
     publicSpeech: "text" in command ? command.text : "publicSpeech" in command ? command.publicSpeech : "messageToWolves" in command ? command.messageToWolves : undefined,
@@ -1009,7 +1251,11 @@ function createCallLog(
     cachedTokens: result.usage.cachedTokens ?? 0,
     estimatedCost: estimateCost(config, providerId, model, result.usage.inputTokens, result.usage.outputTokens),
     latencyMs,
-    retryCount
+    retryCount,
+    promptCompressionLevel: promptMeta.compressionLevel,
+    estimatedInputTokens: promptMeta.estimatedInputTokens,
+    promptBudgetTokens: promptMeta.promptBudgetTokens,
+    promptPreviewTruncated: promptMeta.promptPreviewTruncated
   };
 }
 
@@ -1029,9 +1275,11 @@ function createFallbackCallLog(
   parsedJson: unknown,
   rationale: string,
   reason: string,
-  retryCount: number
+  retryCount: number,
+  promptPackage?: PromptPackage
 ): LLMCallLog {
   const seatId = "seatId" in command ? command.seatId : undefined;
+  const fallbackPromptText = `真实 AI 决策不可用，已使用 Mock 兜底。原因：${reason}`;
   return {
     id: `call_${state.llmCalls.length + 1}`,
     gameId: state.id,
@@ -1042,7 +1290,7 @@ function createFallbackCallLog(
     model: "deterministic-mock",
     promptVersion: SYSTEM_PROMPT_VERSION,
     promptHash: createPromptHash(`fallback:${reason}`),
-    promptTextRedacted: `真实 AI 决策不可用，已使用 Mock 兜底。原因：${reason}`,
+    promptTextRedacted: truncatePromptPreview(promptPackage?.prompt ?? fallbackPromptText),
     rawResponse: JSON.stringify(parsedJson),
     parsedJson,
     publicSpeech: "text" in command ? command.text : "publicSpeech" in command ? command.publicSpeech : "messageToWolves" in command ? command.messageToWolves : undefined,
@@ -1054,8 +1302,17 @@ function createFallbackCallLog(
     estimatedCost: 0,
     latencyMs: 0,
     retryCount,
+    promptCompressionLevel: promptPackage?.compressionLevel,
+    estimatedInputTokens: promptPackage?.estimatedInputTokens,
+    promptBudgetTokens: promptPackage?.promptBudgetTokens,
+    promptPreviewTruncated: promptPackage?.promptPreviewTruncated,
     error: reason
   };
+}
+
+function truncatePromptPreview(prompt: string): string {
+  if (prompt.length <= PROMPT_PREVIEW_MAX_LENGTH) return prompt;
+  return `${prompt.slice(0, PROMPT_PREVIEW_MAX_LENGTH)}...`;
 }
 
 function requireLegalTarget(state: GameState, rawValue: unknown, legalTargets: PlayerId[]): PlayerId {
@@ -1128,6 +1385,40 @@ function inferSheriffRun(text: string): boolean {
   if (/(不上警|不竞选|不参选|不上|警下听|先警下|退水)/.test(text)) return false;
   if (/(上警|竞选|警徽|拿警徽|争警徽)/.test(text)) return true;
   return true;
+}
+
+function normalizeSheriffCandidacyDecision(
+  object: Record<string, unknown>,
+  publicSpeech: string,
+  privateReason: string
+): { runForSheriff: boolean; publicSpeech: string; privateReason: string } {
+  const explicit = optionalBooleanFromModel(firstValue(object, ["run_for_sheriff", "runForSheriff"]));
+  const inferred = inferSheriffRun(publicSpeech);
+  return { runForSheriff: explicit ?? inferred, publicSpeech, privateReason };
+}
+
+function optionalBooleanFromModel(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (/(false|no|0|不上警|不竞选|不参选|警下|退水)/i.test(normalized)) return false;
+  if (/(true|yes|1|上警|竞选|警徽|拿警徽|争警徽)/i.test(normalized)) return true;
+  return undefined;
+}
+
+function shouldWithdrawSheriffFromSpeech(state: GameState, pending: PendingAction, object: Record<string, unknown>, text: string): boolean {
+  if (pending.kind !== "speech" || pending.speechType !== "sheriff" || state.phase.type !== "sheriff_speech") return false;
+  const player = requirePlayer(state, pending.seatId);
+  if (!player.isSheriffCandidate || player.hasWithdrawnSheriff) return false;
+  const explicit = optionalBooleanFromModel(firstValue(object, ["withdraw_sheriff", "withdrawSheriff", "withdraw", "drop_out"]));
+  return explicit ?? mentionsSheriffWithdrawal(text);
+}
+
+function mentionsSheriffWithdrawal(text: string): boolean {
+  if (/(不退水|不可能退水|不会退水|绝不退水)/.test(text)) return false;
+  return /(我退水|选择退水|直接退水|这里退水|警上退水|放弃竞选|不争警徽|不拿警徽)/.test(text);
 }
 
 function mentionsSave(text: string): boolean {
@@ -1363,7 +1654,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function requirePlayer(state: GameState, seatId: PlayerId): PlayerProfile & { role: RoleId } {
+function requirePlayer(state: GameState, seatId: PlayerId): GameState["players"][number] {
   const player = state.players.find((item) => item.id === seatId);
   if (!player) throw new Error(`找不到玩家 ${seatId}`);
   return player;
@@ -1440,6 +1731,9 @@ function compactOutputShape(pending: PendingAction): string {
     return '{"run_for_sheriff":false,"public_speech":"1-3句公开竞选或退水发言","private_reason":"结合身份、发言收益和风险说明是否上警"}';
   }
   if (pending.kind === "speech") {
+    if (pending.speechType === "sheriff") {
+      return '{"public_speech":"1-3句警上发言；如退水则明确说退水","withdraw_sheriff":false,"private_reason":"结合身份、竞选收益、退水收益和最近事实说明发言意图"}';
+    }
     return '{"public_speech":"1-3句公开发言，只谈本局逻辑和站边","private_reason":"结合你的身份、阵营目标和最近事实说明这段发言意图"}';
   }
   if (pending.kind === "vote") {

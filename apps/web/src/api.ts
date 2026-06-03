@@ -1,5 +1,5 @@
 import { AgentMemoryUpdate, GameCommand, GameState } from "@langrensha/engine";
-import { AIConfigStore, LLMCallLog, PlayerId } from "@langrensha/shared";
+import { AIConfigStore, ContextCompressionConfig, LLMCallLog, PlayerId } from "@langrensha/shared";
 
 export interface AIDecisionStatus {
   requestId: string;
@@ -43,7 +43,13 @@ export async function testProvider(providerId: string, apiKey?: string): Promise
   return (await response.json()) as { ok: boolean; error?: string; models?: Array<{ id: string; name: string }> };
 }
 
-export async function requestAIDecision(state: GameState, seatId?: PlayerId, requestId?: string, providerApiKeys?: Record<string, string>): Promise<{
+export async function requestAIDecision(
+  state: GameState,
+  seatId?: PlayerId,
+  requestId?: string,
+  providerApiKeys?: Record<string, string>,
+  contextCompression?: ContextCompressionConfig
+): Promise<{
   ok: boolean;
   command?: GameCommand;
   llmCall?: LLMCallLog;
@@ -54,7 +60,13 @@ export async function requestAIDecision(state: GameState, seatId?: PlayerId, req
   const response = await fetch("/api/ai/decision", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ state: compactStateForAIDecision(state), seatId, requestId, providerApiKeys: sanitizeProviderApiKeys(providerApiKeys) })
+    body: JSON.stringify({
+      state: compactStateForAIDecision(state),
+      seatId,
+      requestId,
+      providerApiKeys: sanitizeProviderApiKeys(providerApiKeys),
+      contextCompression
+    })
   });
   if (!response.ok) throw new Error("AI 决策请求失败");
   return (await response.json()) as {

@@ -239,6 +239,10 @@ export interface LLMCallLog {
   estimatedCost: number;
   latencyMs: number;
   retryCount: number;
+  promptCompressionLevel?: "FULL" | "COMPACT" | "OVERFLOW_FALLBACK";
+  estimatedInputTokens?: number;
+  promptBudgetTokens?: number;
+  promptPreviewTruncated?: boolean;
   error?: string;
 }
 
@@ -328,11 +332,17 @@ export interface CostControls {
   maxOutputTokensPerCall: number;
 }
 
+export interface ContextCompressionConfig {
+  enabled: boolean;
+  mode: "auto" | "full_only";
+}
+
 export interface AIConfigStore {
   providers: ProviderAccount[];
   models: ModelConfig[];
   personas: AIPersona[];
   costControls?: CostControls;
+  contextCompression?: ContextCompressionConfig;
 }
 
 export interface AIReadinessItem {
@@ -447,6 +457,11 @@ export const DEFAULT_COST_CONTROLS: CostControls = {
   maxOutputTokensPerCall: 1200
 };
 
+export const DEFAULT_CONTEXT_COMPRESSION: ContextCompressionConfig = {
+  enabled: true,
+  mode: "auto"
+};
+
 export const DEFAULT_AI_CONFIG: AIConfigStore = {
   providers: [
     {
@@ -485,7 +500,8 @@ export const DEFAULT_AI_CONFIG: AIConfigStore = {
     }
   ],
   personas: DEFAULT_PERSONAS,
-  costControls: DEFAULT_COST_CONTROLS
+  costControls: DEFAULT_COST_CONTROLS,
+  contextCompression: DEFAULT_CONTEXT_COMPRESSION
 };
 
 export function buildAIReadiness(config: AIConfigStore): AIReadinessReport {

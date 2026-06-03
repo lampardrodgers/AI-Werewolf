@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.3 - 2026-06-03
+
+- Added configurable AI context compression defaults and request plumbing.
+- Improved AI decision prompt compaction, public reasoning boundaries, and related tests.
+- Refined web controls and styling for the AI configuration/game flow.
+- Updated engine behavior and tests for the revised AI decision context.
+- Upgraded Vitest dependency metadata.
+
 ## v0.1.2 - 2026-06-02
 
 - Improved AI prompt boundaries so public reasoning uses visible table information instead of hidden role knowledge.

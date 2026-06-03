@@ -21,6 +21,7 @@ export type PhaseType =
   | "night_resolve"
   | "sheriff_candidacy"
   | "sheriff_speech"
+  | "sheriff_withdrawal"
   | "sheriff_vote"
   | "sheriff_pk_speech"
   | "sheriff_pk_vote"
@@ -70,6 +71,7 @@ export type PendingAction =
       legalTargets: PlayerId[];
     }
   | { kind: "sheriff_candidacy"; seatId: PlayerId }
+  | { kind: "sheriff_withdrawal"; seatId: PlayerId; voteType: "sheriff" | "sheriff_pk" }
   | { kind: "speech"; seatId: PlayerId; speechType: "sheriff" | "last_words" | "day" | "pk" }
   | { kind: "vote"; seatId: PlayerId; voteType: "sheriff" | "sheriff_pk" | "day" | "day_pk"; legalTargets: PlayerId[] }
   | { kind: "badge_decision"; seatId: PlayerId; legalTargets: PlayerId[]; canDestroy: boolean; returnTo: BadgeReturnTo; deathIds: PlayerId[] }
@@ -184,6 +186,7 @@ export interface GameState {
     sheriff: SheriffState;
     day?: DayState;
     lastWordsQueue: PlayerId[];
+    lastWordsReturn?: "day_speech" | "night";
     lastDeaths: PlayerId[];
     hunterReturn?: "last_words" | "after_day";
     pendingBadgeSeatId?: PlayerId;
@@ -208,6 +211,7 @@ export type GameCommand =
       privateReason: string;
     }
   | { type: "SubmitSheriffCandidacy"; seatId: PlayerId; runForSheriff: boolean; publicSpeech: string; privateReason: string }
+  | { type: "SubmitSheriffWithdrawalDecision"; seatId: PlayerId; withdraw: boolean; privateReason: string }
   | { type: "WithdrawSheriffCandidacy"; seatId: PlayerId; privateReason?: string }
   | { type: "SubmitSpeech"; seatId: PlayerId; text: string; privateReason?: string }
   | { type: "SubmitVote"; seatId: PlayerId; targetId: PlayerId | "abstain"; privateReason: string; confidence?: number }
@@ -361,6 +365,9 @@ export function applyCommand(input: GameState, command: GameCommand): GameState 
     case "SubmitSheriffCandidacy":
       handleSheriffCandidacy(state, command);
       break;
+    case "SubmitSheriffWithdrawalDecision":
+      handleSheriffWithdrawalDecision(state, command);
+      break;
     case "WithdrawSheriffCandidacy":
       handleSheriffWithdrawal(state, command);
       break;
@@ -484,6 +491,24 @@ export function createMockDecision(state: GameState): MockDecision | undefined {
         },
         parsedJson: { run_for_sheriff: runForSheriff, public_speech: publicSpeech, private_reason: privateRationale },
         publicSpeech,
+        privateRationale
+      };
+    }
+    case "sheriff_withdrawal": {
+      const withdraw = shouldWithdrawBeforeSheriffVote(state, player.id, action.voteType, persona);
+      return {
+        command: {
+          type: "SubmitSheriffWithdrawalDecision",
+          seatId: player.id,
+          withdraw,
+          privateReason: withdraw ? "听完警上发言后继续竞选收益不足，退水保留警下票型空间。" : "听完警上发言后仍需要保留竞选资格参与警徽归属。"
+        },
+        parsedJson: {
+          run_for_sheriff: !withdraw,
+          public_speech: withdraw ? "我退水，警下看票型。" : "我不退水，警徽票继续看发言质量。",
+          private_reason: privateRationale
+        },
+        publicSpeech: withdraw ? "我退水，警下看票型。" : "我不退水，警徽票继续看发言质量。",
         privateRationale
       };
     }
@@ -857,12 +882,14 @@ export function getVisibleEvents(state: GameState, viewerId?: PlayerId): GameEve
 
 export function getPlayerVisibleEvents(state: GameState, viewerId?: PlayerId): GameEvent[] {
   const viewer = viewerId ? state.players.find((player) => player.id === viewerId) : undefined;
-  const canSeeWolfChat = viewer?.role === "werewolf";
+  const isDeadViewer = Boolean(viewer && !viewer.alive);
+  const canSeeWolfChat = viewer?.role === "werewolf" || isDeadViewer;
   return state.events.flatMap((event) => {
     const visible =
       event.visibility === "public" ||
       (event.visibility === "private" && viewerId && event.seatId === viewerId) ||
-      (canSeeWolfChat && (event.type === "WolfDiscussionMessage" || event.type === "WolfKillLocked"));
+      (canSeeWolfChat && (event.type === "WolfDiscussionMessage" || event.type === "WolfKillLocked")) ||
+      (isDeadViewer && isDeadViewerObservableNightEvent(event));
     return visible ? [redactVisibleEventForViewer(event, viewer)] : [];
   });
 }
@@ -882,12 +909,24 @@ function redactVisibleEventForViewer(event: GameEvent, viewer: PlayerState | und
 }
 
 function shouldRedactPhaseStartedPayload(payload: Record<string, unknown>, viewer: PlayerState | undefined): boolean {
+  if (viewer && !viewer.alive) return false;
   const phase = String(payload.phase ?? "");
   if (!isPrivateNightPhase(phase)) return false;
   const actingSeatId = typeof payload.actingSeatId === "string" ? payload.actingSeatId : undefined;
   if (phase === "night_wolves" && viewer?.role === "werewolf") return false;
   if (viewer && actingSeatId === viewer.id) return false;
   return true;
+}
+
+function isDeadViewerObservableNightEvent(event: GameEvent): boolean {
+  return [
+    "NightActionSubmitted",
+    "SeerChecked",
+    "WitchActionSubmitted",
+    "WolfDiscussionMessage",
+    "WolfKillLocked",
+    "NightDeathsResolved"
+  ].includes(event.type);
 }
 
 function isPrivateNightPhase(phase: string): boolean {
@@ -1380,7 +1419,7 @@ function handleSheriffWithdrawal(
     return;
   }
   if (state.round.sheriff.speechQueue.length === 0) {
-    enterSheriffVote(state, "sheriff", candidates);
+    enterSheriffWithdrawalRound(state, "sheriff", candidates);
     return;
   }
   const current = state.round.sheriff.speechQueue[0];
@@ -1388,11 +1427,76 @@ function handleSheriffWithdrawal(
   state.pendingActions = [{ kind: "speech", seatId: current, speechType: "sheriff" }];
 }
 
+function handleSheriffWithdrawalDecision(
+  state: GameState,
+  command: Extract<GameCommand, { type: "SubmitSheriffWithdrawalDecision" }>
+): void {
+  const pending = findPending(state, command.seatId, "sheriff_withdrawal");
+  if (!pending) return;
+  const player = requirePlayer(state, command.seatId);
+  if (command.withdraw && player.isSheriffCandidate && !player.hasWithdrawnSheriff) {
+    withdrawSheriffCandidate(state, command.seatId);
+  }
+  state.pendingActions = state.pendingActions.filter((action) => action.seatId !== command.seatId);
+  if (state.pendingActions.length > 0) return;
+  resolveSheriffWithdrawalRound(state, pending.voteType);
+}
+
+function withdrawSheriffCandidate(state: GameState, seatId: PlayerId): void {
+  const player = requirePlayer(state, seatId);
+  player.hasWithdrawnSheriff = true;
+  player.isSheriffCandidate = false;
+  state.round.sheriff.candidates = state.round.sheriff.candidates.filter((id) => id !== seatId);
+  state.round.sheriff.pkCandidates = state.round.sheriff.pkCandidates.filter((id) => id !== seatId);
+  state.round.sheriff.speechQueue = state.round.sheriff.speechQueue.filter((id) => id !== seatId);
+  pushEvent(state, "SheriffCandidateWithdrawn", "public", {}, seatId);
+}
+
 function enterSheriffSpeech(state: GameState, candidates: PlayerId[]): void {
   state.round.sheriff.speechQueue = orderedSheriffCandidatesForSpeech(state, candidates);
   const current = state.round.sheriff.speechQueue[0];
   setPhase(state, "sheriff_speech", state.day, "警长竞选 · 上警发言", current, `1/${candidates.length}`);
   state.pendingActions = [{ kind: "speech", seatId: current, speechType: "sheriff" }];
+}
+
+function enterSheriffWithdrawalRound(state: GameState, voteType: "sheriff" | "sheriff_pk", candidates: PlayerId[]): void {
+  const activeCandidates = candidates.filter((id) => {
+    const player = getPlayer(state, id);
+    return Boolean(player?.alive && player.isSheriffCandidate && !player.hasWithdrawnSheriff);
+  });
+  if (activeCandidates.length <= 1) {
+    resolveSheriffWithdrawalRound(state, voteType);
+    return;
+  }
+  setPhase(
+    state,
+    "sheriff_withdrawal",
+    state.day,
+    voteType === "sheriff" ? "警长竞选 · 退水确认" : "警长竞选 · PK 退水确认"
+  );
+  state.pendingActions = activeCandidates.map((seatId) => ({ kind: "sheriff_withdrawal", seatId, voteType }));
+}
+
+function resolveSheriffWithdrawalRound(state: GameState, voteType: "sheriff" | "sheriff_pk"): void {
+  const source = voteType === "sheriff" ? state.round.sheriff.candidates : state.round.sheriff.pkCandidates;
+  const candidates = source.filter((id) => {
+    const player = getPlayer(state, id);
+    return Boolean(player?.alive && player.isSheriffCandidate && !player.hasWithdrawnSheriff);
+  });
+  if (voteType === "sheriff") state.round.sheriff.candidates = candidates;
+  if (voteType === "sheriff_pk") state.round.sheriff.pkCandidates = candidates;
+  if (candidates.length === 0) {
+    state.round.sheriff.completed = true;
+    pushEvent(state, "SheriffSkipped", "public", { reason: "全部候选人退水" });
+    enterDeathAnnouncement(state);
+    return;
+  }
+  if (candidates.length === 1) {
+    electSheriff(state, candidates[0], "其他候选人退水");
+    enterDeathAnnouncement(state);
+    return;
+  }
+  enterSheriffVote(state, voteType, candidates);
 }
 
 function enterSheriffVote(state: GameState, voteType: "sheriff" | "sheriff_pk", candidates: PlayerId[]): void {
@@ -1436,12 +1540,28 @@ function enterDeathAnnouncement(state: GameState): void {
 }
 
 function enterLastWordsOrDaySpeech(state: GameState): void {
+  state.round.lastWordsReturn = "day_speech";
   state.round.lastWordsQueue = state.round.lastDeaths.filter((id) => {
     const player = getPlayer(state, id);
     return Boolean(player?.death && player.death.day === state.day);
   });
   if (state.round.lastWordsQueue.length === 0) {
     enterDaySpeech(state);
+    return;
+  }
+  const current = state.round.lastWordsQueue[0];
+  setPhase(state, "last_words", state.day, "遗言阶段", current, `1/${state.round.lastWordsQueue.length}`);
+  state.pendingActions = [{ kind: "speech", seatId: current, speechType: "last_words" }];
+}
+
+function enterDayLastWordsOrNight(state: GameState, deathIds: PlayerId[]): void {
+  state.round.lastWordsReturn = "night";
+  state.round.lastWordsQueue = deathIds.filter((id) => {
+    const player = getPlayer(state, id);
+    return Boolean(player?.death && player.death.day === state.day);
+  });
+  if (state.round.lastWordsQueue.length === 0) {
+    afterDayDeaths(state);
     return;
   }
   const current = state.round.lastWordsQueue[0];
@@ -1499,7 +1619,7 @@ function handleSpeech(state: GameState, command: Extract<GameCommand, { type: "S
         electSheriff(state, candidates[0], "其他候选人退水");
         enterDeathAnnouncement(state);
       } else {
-        enterSheriffVote(state, "sheriff", candidates);
+        enterSheriffWithdrawalRound(state, "sheriff", candidates);
       }
       return;
     }
@@ -1514,7 +1634,7 @@ function handleSpeech(state: GameState, command: Extract<GameCommand, { type: "S
     state.round.sheriff.speechQueue.shift();
     const queue = state.round.sheriff.speechQueue;
     if (queue.length === 0) {
-      enterSheriffVote(state, "sheriff_pk", state.round.sheriff.pkCandidates);
+      enterSheriffWithdrawalRound(state, "sheriff_pk", state.round.sheriff.pkCandidates);
       return;
     }
     setPhase(state, "sheriff_pk_speech", state.day, "警长竞选 · PK 发言", queue[0]);
@@ -1525,7 +1645,13 @@ function handleSpeech(state: GameState, command: Extract<GameCommand, { type: "S
   if (state.phase.type === "last_words") {
     state.round.lastWordsQueue.shift();
     if (state.round.lastWordsQueue.length === 0) {
-      enterDaySpeech(state);
+      const returnTo = state.round.lastWordsReturn ?? "day_speech";
+      state.round.lastWordsReturn = undefined;
+      if (returnTo === "night") {
+        afterDayDeaths(state);
+      } else {
+        enterDaySpeech(state);
+      }
       return;
     }
     const current = state.round.lastWordsQueue[0];
@@ -1655,6 +1781,7 @@ function exilePlayer(state: GameState, targetId: PlayerId): void {
   markDead(state, targetId, "exile");
   state.round.lastDeaths = [targetId];
   pushEvent(state, "PlayerExiled", "public", { targetId });
+  if (finishIfWon(state)) return;
   const pendingBadgeSeatId = takePendingBadgeSeatId(state, targetId);
   if (pendingBadgeSeatId) {
     enterBadgeDecision(state, pendingBadgeSeatId, "after_day_exile", [targetId]);
@@ -1665,7 +1792,7 @@ function exilePlayer(state: GameState, targetId: PlayerId): void {
     enterHunterShot(state, hunter, "after_day");
     return;
   }
-  afterDayDeaths(state);
+  enterDayLastWordsOrNight(state, [targetId]);
 }
 
 function enterHunterShot(state: GameState, hunterId: PlayerId, returnTo: "last_words" | "after_day"): void {
@@ -1747,7 +1874,7 @@ function handleHunterShot(state: GameState, command: Extract<GameCommand, { type
   if (state.round.hunterReturn === "last_words") {
     enterLastWordsOrDaySpeech(state);
   } else {
-    afterDayDeaths(state);
+    enterDayLastWordsOrNight(state, [command.seatId]);
   }
 }
 
@@ -1807,6 +1934,15 @@ function handleTimeout(state: GameState, seatId?: PlayerId): void {
   }
   if (pending.kind === "badge_decision") {
     handleBadgeDecision(state, { type: "SubmitBadgeDecision", seatId: pending.seatId, targetId: "destroy", privateReason: "超时自动撕毁警徽。" });
+    return;
+  }
+  if (pending.kind === "sheriff_withdrawal") {
+    handleSheriffWithdrawalDecision(state, {
+      type: "SubmitSheriffWithdrawalDecision",
+      seatId: pending.seatId,
+      withdraw: false,
+      privateReason: "超时默认继续留警。"
+    });
     return;
   }
   const decision = createMockDecision(state);
@@ -1894,7 +2030,7 @@ function resumeAfterBadgeDecision(
       enterHunterShot(state, hunter, "after_day");
       return;
     }
-    afterDayDeaths(state);
+    enterDayLastWordsOrNight(state, pending.deathIds);
     return;
   }
   if (pending.returnTo === "after_hunter_last_words") {
@@ -1902,7 +2038,7 @@ function resumeAfterBadgeDecision(
     return;
   }
   if (pending.returnTo === "after_hunter_day") {
-    afterDayDeaths(state);
+    enterDayLastWordsOrNight(state, pending.deathIds);
   }
 }
 
@@ -2136,6 +2272,30 @@ function shouldRunForSheriff(state: GameState, seatId: PlayerId, persona: (typeo
   return rng() < Math.max(0.04, roleBase[player.role] + style * 0.18);
 }
 
+function shouldWithdrawBeforeSheriffVote(
+  state: GameState,
+  seatId: PlayerId,
+  voteType: "sheriff" | "sheriff_pk",
+  persona: (typeof DEFAULT_PERSONAS)[number]
+): boolean {
+  const player = requirePlayer(state, seatId);
+  const candidates = (voteType === "sheriff" ? state.round.sheriff.candidates : state.round.sheriff.pkCandidates).filter((id) => {
+    const candidate = getPlayer(state, id);
+    return Boolean(candidate?.alive && candidate.isSheriffCandidate && !candidate.hasWithdrawnSheriff);
+  });
+  if (candidates.length <= 2 || player.role === "seer") return false;
+
+  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${seatId}:sheriff-withdraw`);
+  const publicCase = scoreSheriffCandidatePublicCase(state, seatId);
+  if (player.role === "werewolf") {
+    const teammateStillOnPolice = knownWolfTeammates(state, seatId).some((id) => id !== seatId && candidates.includes(id));
+    const pressure = (persona.deceptionSkill + persona.riskTolerance + persona.bussingTendency) / 300;
+    return teammateStillOnPolice && publicCase < 2.2 && rng() < 0.25 + pressure * 0.35;
+  }
+  const caution = (persona.conservatism + 100 - persona.aggression) / 200;
+  return publicCase < 1.8 && rng() < Math.min(0.7, 0.25 + caution * 0.35);
+}
+
 function choosePublicAttentionTarget(state: GameState, legalTargets: PlayerId[], salt: string): PlayerId | undefined {
   if (legalTargets.length === 0) return undefined;
   const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${salt}`);
@@ -2170,7 +2330,7 @@ function chooseSheriffVoteTarget(state: GameState, voterId: PlayerId, targetPool
   const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${voterId}:sheriff-vote`);
   const scored = targetPool.map((id) => ({
     id,
-    score: scoreSheriffCandidatePublicCase(state, id) + rng() * 0.3
+    score: scoreSheriffCandidatePublicCase(state, id) + scoreSheriffCandidateRelationToVoter(state, id, voterId) + rng() * 0.3
   }));
   if (voter.role === "werewolf") {
     const teammates = knownWolfTeammates(state, voterId);
@@ -2182,7 +2342,7 @@ function chooseSheriffVoteTarget(state: GameState, voterId: PlayerId, targetPool
   scored.sort((left, right) => right.score - left.score || requirePlayer(state, left.id).seatNumber - requirePlayer(state, right.id).seatNumber);
   const best = scored[0];
   if (!best) return state.rulePreset.voteRules.allowAbstain ? "abstain" : targetPool[0];
-  if (best.score < 0.75 && state.rulePreset.voteRules.allowAbstain && rng() < 0.2) return "abstain";
+  if (best.score < 1.1 && state.rulePreset.voteRules.allowAbstain && rng() < 0.45) return "abstain";
   return best.id;
 }
 
@@ -2224,6 +2384,18 @@ function scoreSheriffCandidatePublicCase(state: GameState, candidateId: PlayerId
       if (text.length >= 32) score += 0.5;
     }
     if (event.type === "SheriffCandidateWithdrawn" && event.seatId === candidateId) score -= 99;
+  }
+  return score;
+}
+
+function scoreSheriffCandidateRelationToVoter(state: GameState, candidateId: PlayerId, voterId: PlayerId): number {
+  let score = 0;
+  for (const event of getPublicEvents(state).slice(-32)) {
+    if (event.type !== "SpeechPublished" || event.seatId !== candidateId) continue;
+    const text = eventText(event);
+    if (!mentionsPlayer(state, text, voterId)) continue;
+    if (/(查杀|狼|狼人|狼面|出掉|归票|抗推|不认|打死)/.test(text)) score -= 4;
+    if (/(金水|好人|认下|保下|偏好|银水)/.test(text)) score += 1.6;
   }
   return score;
 }

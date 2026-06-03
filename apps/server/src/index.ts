@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProviderAdapter } from "@langrensha/llm-gateway";
-import { AIConfigStore, DEFAULT_AI_CONFIG, DEFAULT_COST_CONTROLS } from "@langrensha/shared";
+import { AIConfigStore, DEFAULT_AI_CONFIG, DEFAULT_CONTEXT_COMPRESSION, DEFAULT_COST_CONTROLS } from "@langrensha/shared";
 import { AIDecisionProgress, AIDecisionRequest, buildAIDecision } from "./aiDecision";
 import { buildAllowedOrigins, isAllowedCorsOrigin } from "./cors";
 
@@ -136,6 +136,7 @@ function normalizeIncomingConfig(next: AIConfigStore): AIConfigStore {
   return {
     ...next,
     costControls: next.costControls ?? DEFAULT_COST_CONTROLS,
+    contextCompression: next.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION,
     providers: next.providers.map((provider) => ({ ...provider, apiKeyEncrypted: undefined }))
   };
 }
@@ -143,7 +144,8 @@ function normalizeIncomingConfig(next: AIConfigStore): AIConfigStore {
 function withConfigDefaults(config: AIConfigStore): AIConfigStore {
   return normalizeIncomingConfig({
     ...config,
-    costControls: config.costControls ?? DEFAULT_COST_CONTROLS
+    costControls: config.costControls ?? DEFAULT_COST_CONTROLS,
+    contextCompression: config.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION
   });
 }
 

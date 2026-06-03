@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { createGame } from "@langrensha/engine";
+import { applyCommand, applyMockStep, createGame } from "@langrensha/engine";
 import { buildAIDecision } from "../src/aiDecision";
 import { LLMObjectParseError, LLMProviderAdapter } from "@langrensha/llm-gateway";
-import { DEFAULT_AI_CONFIG, DEFAULT_DEBUG_MODE, ProviderAccount, STANDARD_PRESET } from "@langrensha/shared";
+import { DEFAULT_AI_CONFIG, DEFAULT_CONTEXT_COMPRESSION, DEFAULT_DEBUG_MODE, ProviderAccount, STANDARD_PRESET } from "@langrensha/shared";
 
 describe("AI decision service", () => {
+  it("defaults context compression to automatic mode", () => {
+    expect(DEFAULT_AI_CONFIG.contextCompression).toEqual(DEFAULT_CONTEXT_COMPRESSION);
+    expect(DEFAULT_AI_CONFIG.contextCompression).toMatchObject({ enabled: true, mode: "auto" });
+  });
+
   it("returns a legal fallback command when no real provider is configured", async () => {
     const state = createGame({
       totalPlayers: 8,
@@ -112,6 +117,281 @@ describe("AI decision service", () => {
 
     expect(response.ok).toBe(true);
     expect(receivedApiKey).toBe("browser-only-key");
+  });
+
+  it("honors an explicit model decision to skip sheriff candidacy", async () => {
+    const state = advanceToSheriffCandidacy("ai-decision-sheriff-explicit-pass");
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        run_for_sheriff: false,
+        public_speech: "我先不上警，警下听发言和票型，再决定站边。",
+        private_reason: "当前身份和位置没有必要抢警徽，警下保留投票信息更利于观察上警玩家发言。"
+      },
+      raw: {},
+      usage: { inputTokens: 100, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({ type: "SubmitSheriffCandidacy", runForSheriff: false });
+  });
+
+  it("infers sheriff candidacy intent from public speech when the boolean field is omitted", async () => {
+    const state = advanceToSheriffCandidacy("ai-decision-sheriff-infer-run");
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        public_speech: "我选择上警，警上正式发言再给站边和警徽流。",
+        private_reason: "我需要争取警徽发言视角，后续根据警上信息建立站边并给出清晰警徽流。"
+      },
+      raw: {},
+      usage: { inputTokens: 100, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({ type: "SubmitSheriffCandidacy", runForSheriff: true });
+  });
+
+  it("lets AI withdraw during sheriff speech when the model chooses to back out", async () => {
+    const state = advanceToSheriffSpeech("ai-decision-sheriff-withdraw");
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        public_speech: "我这里退水，不继续争警徽，警下看对跳发言和票型。",
+        withdraw_sheriff: true,
+        private_reason: "我上警目的已经达到，继续留在警上会稀释好人对预言家和悍跳狼的判断。"
+      },
+      raw: {},
+      usage: { inputTokens: 100, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({ type: "WithdrawSheriffCandidacy" });
+  });
+
+  it("uses model withdrawal decisions and leaves sheriff withdrawal confirmation", async () => {
+    let state = advanceToSheriffSpeech("ai-decision-sheriff-withdrawal-model");
+    for (let guard = 0; guard < 8 && state.phase.type === "sheriff_speech"; guard += 1) {
+      const pending = state.pendingActions[0];
+      if (!pending || pending.kind !== "speech") throw new Error("expected sheriff speech pending action");
+      state = applyCommand(state, {
+        type: "SubmitSpeech",
+        seatId: pending.seatId,
+        text: "我继续留警，听完全部发言后再进警下投票。",
+        privateReason: "测试进入退水确认阶段。"
+      });
+    }
+    if (state.phase.type !== "sheriff_withdrawal") {
+      throw new Error(`expected sheriff withdrawal phase, got ${state.phase.type}`);
+    }
+
+    const config = withRealProvider();
+    let calls = 0;
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      return {
+        text: "{}",
+        object:
+          calls === 1
+            ? {
+                run_for_sheriff: false,
+                withdraw_sheriff: true,
+                public_speech: "我退水，警下看票型。",
+                private_reason: "听完警上发言后继续竞选收益不足，退水可以减少对真预言家视角的干扰。"
+              }
+            : {
+                run_for_sheriff: true,
+                withdraw_sheriff: false,
+                public_speech: "我不退水，继续留警进入投票。",
+                private_reason: "前一名候选人退水后我继续留警，能让警徽归属顺利进入后续流程。"
+              },
+        raw: { calls },
+        usage: { inputTokens: 100, outputTokens: 20 },
+        latencyMs: 3
+      };
+    });
+
+    for (let guard = 0; guard < 8 && state.phase.type === "sheriff_withdrawal"; guard += 1) {
+      const pending = state.pendingActions.find((action) => state.players.find((player) => player.id === action.seatId)?.controller !== "human");
+      if (!pending) break;
+      const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+      expect(response.ok).toBe(true);
+      expect(response.fallback).toBe(false);
+      expect(response.llmCall).toBeDefined();
+      expect(response.command).toMatchObject({ type: "SubmitSheriffWithdrawalDecision", seatId: pending.seatId });
+      state = applyCommand(state, response.command);
+    }
+
+    expect(calls).toBe(2);
+    expect(state.events.some((event) => event.type === "SheriffCandidateWithdrawn")).toBe(true);
+    expect(state.phase.type).not.toBe("sheriff_withdrawal");
+  });
+
+  it("uses the full public record prompt while the prompt stays under budget", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-context-full",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions[0];
+    if (!("legalTargets" in pending)) throw new Error("expected target action");
+    const legalTarget = pending.legalTargets[0];
+    const config = withRealProvider();
+    let capturedPrompt = "";
+    const adapter = fakeAdapter(async (request) => {
+      capturedPrompt = request.prompt;
+      return {
+        text: "{}",
+        object: {
+          message_to_wolves: "首夜信息还少，先统一一个非狼目标，白天再找发言理由带节奏。",
+          proposed_target: legalTarget,
+          agree_current_proposal: true,
+          private_reason: "首夜狼人需要先统一合法刀口，当前公开信息很少，选择这个目标能推进夜间流程并方便白天伪装发言。"
+        },
+        raw: {},
+        usage: { inputTokens: 100, outputTokens: 20 },
+        latencyMs: 3
+      };
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.llmCall?.promptCompressionLevel).toBe("FULL");
+    expect(response.llmCall?.estimatedInputTokens).toBeLessThanOrEqual(response.llmCall?.promptBudgetTokens ?? 0);
+    expect(capturedPrompt).toContain("全场公开记录：共");
+    expect(capturedPrompt).not.toContain("上下文压缩：COMPACT");
+  });
+
+  it("uses compact public context when automatic compression exceeds the prompt budget", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-context-compact",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions[0];
+    if (!("legalTargets" in pending)) throw new Error("expected target action");
+    const legalTarget = pending.legalTargets[0];
+    appendPublicSpeechFlood(state, 72);
+    const config = withRealProvider();
+    config.models[0].contextWindow = 13000;
+    config.models[0].maxOutputTokens = 400;
+    config.personas = config.personas.map((persona) => ({ ...persona, contextLimit: 13000, maxOutputTokens: 400 }));
+    let capturedPrompt = "";
+    const adapter = fakeAdapter(async (request) => {
+      capturedPrompt = request.prompt;
+      return {
+        text: "{}",
+        object: {
+          message_to_wolves: "前面发言已经很多，先按公开站边和验人声明统一目标，白天继续顺着票型做身份。",
+          proposed_target: legalTarget,
+          agree_current_proposal: true,
+          private_reason: "全场公开发言已经出现多轮站边、验人声明和归票压力，狼人夜间选择这个合法目标能减少好人信息位影响。"
+        },
+        raw: {},
+        usage: { inputTokens: 800, outputTokens: 40 },
+        latencyMs: 3
+      };
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.llmCall?.promptCompressionLevel).toBe("COMPACT");
+    expect(response.llmCall?.estimatedInputTokens).toBeLessThanOrEqual(response.llmCall?.promptBudgetTokens ?? 0);
+    expect(capturedPrompt).toContain("上下文压缩：COMPACT");
+    expect(capturedPrompt).toContain("全场公开事件索引");
+    expect(capturedPrompt).toContain("关键事实账本");
+    expect(capturedPrompt).toContain("公开索引 #");
+  });
+
+  it("falls back without calling the adapter when compression is disabled and full prompt overflows", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-context-overflow",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    appendPublicSpeechFlood(state, 18);
+    const config = withRealProvider();
+    config.contextCompression = { enabled: false, mode: "full_only" };
+    config.models[0].contextWindow = 2048;
+    config.models[0].maxOutputTokens = 800;
+    config.personas = config.personas.map((persona) => ({ ...persona, contextLimit: 2048, maxOutputTokens: 800 }));
+    let calls = 0;
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      throw new Error("adapter should not be called on context overflow");
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(true);
+    expect(response.error).toContain("context_overflow");
+    expect(response.llmCall?.promptCompressionLevel).toBe("OVERFLOW_FALLBACK");
+    expect(calls).toBe(0);
+  });
+
+  it("honors a per-request full-only context override without changing global config", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-context-request-override",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    appendPublicSpeechFlood(state, 18);
+    const config = withRealProvider();
+    config.contextCompression = DEFAULT_CONTEXT_COMPRESSION;
+    config.models[0].contextWindow = 2048;
+    config.models[0].maxOutputTokens = 800;
+    config.personas = config.personas.map((persona) => ({ ...persona, contextLimit: 2048, maxOutputTokens: 800 }));
+    let calls = 0;
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      throw new Error("adapter should not be called when request override disables compression");
+    });
+
+    const response = await buildAIDecision(
+      { ...requestWithKey(state), contextCompression: { enabled: false, mode: "full_only" } },
+      config,
+      undefined,
+      () => adapter
+    );
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(true);
+    expect(response.error).toContain("context_overflow");
+    expect(response.llmCall?.promptCompressionLevel).toBe("OVERFLOW_FALLBACK");
+    expect(config.contextCompression).toEqual(DEFAULT_CONTEXT_COMPRESSION);
+    expect(calls).toBe(0);
   });
 
   it("fails without fallback when a real provider is missing the browser-supplied key", async () => {
@@ -1219,7 +1499,7 @@ describe("AI decision service", () => {
     const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
 
     expect(response.ok).toBe(true);
-    expect(response.llmCall?.promptVersion).toBe("werewolf-system-v8");
+    expect(response.llmCall?.promptVersion).toBe("werewolf-system-v10");
     expect(capturedPrompt).toContain("信息确认边界");
     expect(capturedPrompt).toContain("死亡、出局、被投票和遗言不会自动公开真实身份");
     expect(capturedPrompt).toContain("没有警下票型、PK 票型、死亡信息、对跳或站边时，禁止把这些内容编成依据");
@@ -1458,8 +1738,68 @@ function withRealProvider() {
   };
 }
 
+function advanceToSheriffCandidacy(seed: string) {
+  let state = createGame({
+    totalPlayers: 8,
+    humanPlayers: 0,
+    aiPlayers: 8,
+    seed,
+    rulePresetId: STANDARD_PRESET.id,
+    debugMode: DEFAULT_DEBUG_MODE
+  });
+  for (let step = 0; step < 80 && state.phase.type !== "sheriff_candidacy"; step += 1) {
+    state = applyMockStep(state);
+  }
+  if (state.phase.type !== "sheriff_candidacy") {
+    throw new Error(`expected sheriff candidacy phase, got ${state.phase.type}`);
+  }
+  return state;
+}
+
+function advanceToSheriffSpeech(seed: string) {
+  let state = advanceToSheriffCandidacy(seed);
+  const candidates = state.players.filter((player) => player.alive).slice(0, 2).map((player) => player.id);
+  for (const action of [...state.pendingActions]) {
+    if (action.kind !== "sheriff_candidacy") continue;
+    const runForSheriff = candidates.includes(action.seatId);
+    state = applyCommand(state, {
+      type: "SubmitSheriffCandidacy",
+      seatId: action.seatId,
+      runForSheriff,
+      publicSpeech: runForSheriff ? "我选择上警，警上正式发言再展开。" : "我不上警，警下听发言。",
+      privateReason: runForSheriff ? "测试固定进入警上发言阶段。" : "测试固定保留警下投票。"
+    });
+  }
+  if (state.phase.type !== "sheriff_speech") {
+    throw new Error(`expected sheriff speech phase, got ${state.phase.type}`);
+  }
+  return state;
+}
+
 function requestWithKey(state: ReturnType<typeof createGame>) {
   return { state, providerApiKeys: { "real-provider": "test-key" } };
+}
+
+function appendPublicSpeechFlood(state: ReturnType<typeof createGame>, count: number): void {
+  const createdAt = new Date().toISOString();
+  let seq = Math.max(...state.events.map((event) => event.seq), 0) + 1;
+  for (let index = 0; index < count; index += 1) {
+    const speaker = state.players[index % state.players.length];
+    state.events.push({
+      id: `event_public_context_${index}`,
+      gameId: state.id,
+      seq,
+      type: "SpeechPublished",
+      visibility: "public",
+      seatId: speaker.id,
+      payload: {
+        speechType: "day",
+        text: `${speaker.seatNumber}号第${index + 1}轮公开发言：我是普通身份，重点记录警徽流、验人声明、投票站边和谁在保谁。上一轮有人提到2号金水、3号查杀、4号退水、5号归票，我会继续对照全场公开记录，不把死亡或出局直接当成身份翻牌。`
+      },
+      createdAt
+    });
+    seq += 1;
+  }
 }
 
 function fakeAdapter(generateObject: LLMProviderAdapter["generateObject"]): LLMProviderAdapter {

@@ -248,6 +248,30 @@ input[type="range"] {
   text-align: center;
 }
 
+.seed-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 44px;
+  gap: 10px;
+  align-items: center;
+}
+
+.icon-button {
+  width: 44px;
+  min-height: 42px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: #111315;
+}
+
+.icon-button:hover {
+  border-color: rgba(215, 168, 75, 0.72);
+  color: var(--accent);
+  background: rgba(215, 168, 75, 0.1);
+}
+
 .file-button input {
   display: none;
 }
@@ -1228,6 +1252,15 @@ textarea {
   display: flex;
   gap: 12px;
   align-items: center;
+  width: 100%;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.record-shortcut:hover {
+  border-color: rgba(215, 168, 75, 0.54);
+  background: rgba(215, 168, 75, 0.08);
 }
 
 .table-panel {
@@ -1350,6 +1383,8 @@ textarea {
   transform: translate(-50%, -50%);
   width: min(360px, 46%);
   min-height: 210px;
+  max-height: min(72vh, 680px);
+  min-width: 0;
   display: grid;
   place-items: center;
   gap: 10px;
@@ -1384,6 +1419,12 @@ textarea {
 .speech-stream p {
   color: var(--text);
   line-height: 1.55;
+}
+
+.table-speech p {
+  max-height: min(35vh, 360px);
+  overflow-y: auto;
+  padding-right: 6px;
 }
 
 .speech-stream {
@@ -1677,6 +1718,11 @@ textarea {
 .split-field {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 8px;
+}
+
+.model-field {
+  display: grid;
   gap: 8px;
 }
 

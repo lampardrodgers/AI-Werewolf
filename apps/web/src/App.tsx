@@ -1,6 +1,7 @@
 import {
   Award,
   Bot,
+  Dices,
   Download,
   Eye,
   FileJson,
@@ -38,12 +39,15 @@ import {
 import {
   AIConfigStore,
   AIPersona,
+  ContextCompressionConfig,
   DEFAULT_AI_CONFIG,
+  DEFAULT_CONTEXT_COMPRESSION,
   DEFAULT_COST_CONTROLS,
   DEFAULT_DEBUG_MODE,
   DEFAULT_PERSONAS,
   GameSetup,
   LLMCallLog,
+  ModelConfig,
   PlayerId,
   ProviderAccount,
   ProviderType,
@@ -59,6 +63,11 @@ type GameSideTab = "chat" | "votes" | "exposure" | "records" | "rules";
 type LocalProviderApiKeys = Record<string, string>;
 type ProviderTestState = "testing" | "success" | "failed";
 type ProviderTestResults = Record<string, ProviderTestState>;
+type ReadableOutputPause = {
+  seatId: PlayerId;
+  phaseLabel: string;
+  publicText: string;
+};
 
 const AUTO_STEP_DELAY_MS = 700;
 const LOCAL_PROVIDER_KEYS_STORAGE_KEY = "langrensha.localProviderApiKeys.v1";
@@ -66,21 +75,64 @@ const LOCAL_SECRET_SENTINEL = "__local_browser__";
 const PRIVATE_NIGHT_PHASES = new Set<GameState["phase"]["type"]>(["night_guard", "night_wolves", "night_seer", "night_witch"]);
 const PRIVATE_NIGHT_ACTIONS = new Set<PendingAction["kind"]>(["guard_protect", "seer_check", "witch_action", "wolf_discussion"]);
 
-const DEFAULT_SETUP: GameSetup = {
-  totalPlayers: 8,
-  humanPlayers: 1,
-  aiPlayers: 7,
-  seed: "langrensha-001",
-  rulePresetId: STANDARD_PRESET.id,
-  debugMode: {
-    ...DEFAULT_DEBUG_MODE,
-    revealRoles: false,
-    revealPrompts: false,
-    revealPrivateRationales: false,
-    revealWolfChat: false,
-    revealNightActions: false
+function contextCompressionFromToggle(checked: boolean): ContextCompressionConfig {
+  return checked ? { ...DEFAULT_CONTEXT_COMPRESSION } : { enabled: false, mode: "full_only" };
+}
+
+function isContextCompressionAuto(config?: ContextCompressionConfig): boolean {
+  const current = config ?? DEFAULT_CONTEXT_COMPRESSION;
+  return current.enabled && current.mode === "auto";
+}
+
+const SEED_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const RANDOM_SEED_LENGTH = 16;
+
+function createRandomSeed(): string {
+  const alphabetSize = SEED_ALPHABET.length;
+  const unbiasedLimit = Math.floor(256 / alphabetSize) * alphabetSize;
+  let value = "";
+
+  while (value.length < RANDOM_SEED_LENGTH) {
+    const bytes = new Uint8Array(RANDOM_SEED_LENGTH - value.length);
+    if (globalThis.crypto?.getRandomValues) {
+      globalThis.crypto.getRandomValues(bytes);
+    } else {
+      for (let index = 0; index < bytes.length; index += 1) {
+        bytes[index] = Math.floor(Math.random() * 256);
+      }
+    }
+
+    for (const byte of bytes) {
+      if (byte >= unbiasedLimit) {
+        continue;
+      }
+      value += SEED_ALPHABET[byte % alphabetSize];
+      if (value.length >= RANDOM_SEED_LENGTH) {
+        break;
+      }
+    }
   }
-};
+
+  return `langrensha-${value}`;
+}
+
+function createDefaultSetup(): GameSetup {
+  return {
+    totalPlayers: 8,
+    humanPlayers: 1,
+    aiPlayers: 7,
+    seed: createRandomSeed(),
+    rulePresetId: STANDARD_PRESET.id,
+    debugMode: {
+      ...DEFAULT_DEBUG_MODE,
+      revealRoles: false,
+      revealPrompts: false,
+      revealPrivateRationales: false,
+      revealWolfChat: false,
+      revealNightActions: false
+    }
+  };
+}
 
 const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKeyEncrypted">> = {
   openai: {
@@ -182,7 +234,7 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
 };
 
 export function App(): JSX.Element {
-  const [setup, setSetup] = useState<GameSetup>(DEFAULT_SETUP);
+  const [setup, setSetup] = useState<GameSetup>(() => createDefaultSetup());
   const [game, setGame] = useState<GameState | null>(null);
   const [autoRun, setAutoRun] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -194,17 +246,19 @@ export function App(): JSX.Element {
   const [wolfAgree, setWolfAgree] = useState(true);
   const [sheriffRun, setSheriffRun] = useState(false);
   const [config, setConfig] = useState<AIConfigStore>(DEFAULT_AI_CONFIG);
+  const [gameContextCompression, setGameContextCompression] = useState<ContextCompressionConfig | undefined>();
   const [configStatus, setConfigStatus] = useState("配置尚未保存");
   const [providerTestStatus, setProviderTestStatus] = useState("");
   const [providerTestResults, setProviderTestResults] = useState<ProviderTestResults>({});
   const [providerApiKeys, setProviderApiKeys] = useState<LocalProviderApiKeys>(() => loadLocalProviderApiKeys());
-  const [aiMode, setAiMode] = useState<"mock" | "llm">("mock");
+  const [aiMode, setAiMode] = useState<"mock" | "llm">("llm");
   const [aiBusy, setAiBusy] = useState(false);
   const [aiElapsedSeconds, setAiElapsedSeconds] = useState(0);
   const [aiProgress, setAiProgress] = useState<AIDecisionStatus | null>(null);
   const [aiStepStatus, setAiStepStatus] = useState("等待玩家行动。");
   const [streamingSpeech, setStreamingSpeech] = useState("");
   const [streamingSpeechSeatId, setStreamingSpeechSeatId] = useState<PlayerId | undefined>();
+  const [readableOutputPause, setReadableOutputPause] = useState<ReadableOutputPause | null>(null);
   const [batchResult, setBatchResult] = useState<MockBatchRunResult | null>(null);
   const [debugStatus, setDebugStatus] = useState("");
   const streamingTimerRef = useRef<number | undefined>();
@@ -222,11 +276,18 @@ export function App(): JSX.Element {
   }, [game]);
   const canHumanSelfExplode = useMemo(() => Boolean(game && humanPlayerId && canWolfSelfExplode(game, humanPlayerId)), [game, humanPlayerId]);
   const configWithLocalSecretStatus = useMemo(() => markLocalProviderSecretStatus(config, providerApiKeys), [config, providerApiKeys]);
+  const effectiveContextCompression = gameContextCompression ?? config.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION;
 
   useEffect(() => {
     loadAIConfig()
       .then((loaded) => {
-        setConfig(stripProviderSecrets({ ...loaded, costControls: loaded.costControls ?? DEFAULT_COST_CONTROLS }));
+        setConfig(
+          stripProviderSecrets({
+            ...loaded,
+            costControls: loaded.costControls ?? DEFAULT_COST_CONTROLS,
+            contextCompression: loaded.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION
+          })
+        );
         setConfigStatus("已从后端读取配置");
       })
       .catch((error) => setConfigStatus(error instanceof Error ? error.message : "读取配置失败"));
@@ -268,7 +329,7 @@ export function App(): JSX.Element {
     const legal = legalTargetsFor(humanPending);
     setSelectedTarget(defaultTargetFor(humanPending, legal, game?.rulePreset.voteRules.allowAbstain ?? true));
     setSpeechText(defaultSpeechFor(humanPending));
-    setSheriffRun(false);
+    setSheriffRun(humanPending.kind === "sheriff_withdrawal");
     setWolfAgree(true);
   }, [game?.rulePreset.voteRules.allowAbstain, humanPending?.kind, humanPending?.seatId, humanPending && "round" in humanPending ? humanPending.round : undefined]);
 
@@ -276,7 +337,7 @@ export function App(): JSX.Element {
     const normalized: GameSetup = {
       ...setup,
       aiPlayers: setup.totalPlayers - setup.humanPlayers,
-      seed: setup.seed.trim() || `seed-${Date.now()}`
+      seed: setup.seed.trim() || createRandomSeed()
     };
     setSetup(normalized);
     setGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
@@ -284,7 +345,9 @@ export function App(): JSX.Element {
     setIsPaused(false);
     setAutoRun(true);
     clearStreamingOutput();
+    setReadableOutputPause(null);
     setAiProgress(null);
+    setGameContextCompression(undefined);
     setTab("chat");
     setScreen("game");
   }
@@ -295,11 +358,13 @@ export function App(): JSX.Element {
     const normalized: GameSetup = {
       ...setup,
       aiPlayers: setup.totalPlayers - setup.humanPlayers,
-      seed: setup.seed.trim() || `seed-${Date.now()}`
+      seed: setup.seed.trim() || createRandomSeed()
     };
     setGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
     clearStreamingOutput();
+    setReadableOutputPause(null);
     setAiProgress(null);
+    setGameContextCompression(undefined);
     setBatchResult(null);
     setTab("chat");
     setScreen("game");
@@ -319,7 +384,7 @@ export function App(): JSX.Element {
       clearStreamingOutput();
       const publicText = officialOutputForPending(next, pending, humanPlayerId);
       if (publicText) streamOfficialOutput(publicText, pending.seatId);
-      pauseAfterReadableAIOutput(pending, publicText, next);
+      pauseAfterReadableAIOutput(pending, publicText, next, game.phase.label);
       return;
     }
 
@@ -355,7 +420,7 @@ export function App(): JSX.Element {
         .catch(() => undefined);
     }, 1000);
     try {
-      const result = await requestAIDecision(game, pending.seatId, requestId, providerApiKeys);
+      const result = await requestAIDecision(game, pending.seatId, requestId, providerApiKeys, effectiveContextCompression);
       if (!result.ok || !result.command) {
         setAiStepStatus(result.error ? `自动处理失败：${result.error}` : "自动处理失败，请稍后重试。");
         return;
@@ -379,7 +444,7 @@ export function App(): JSX.Element {
       setAiStepStatus(result.fallback ? "真实模型未返回可用动作，已用规则兜底继续。" : `${seatName(game, pending.seatId)} 已完成 ${pendingLabel(pending)}。`);
       if (result.command) {
         const nextState = applyCommand(game, result.command as GameCommand);
-        pauseAfterReadableAIOutput(pending, publicText, nextState);
+        pauseAfterReadableAIOutput(pending, publicText, nextState, game.phase.label);
       }
     } catch (error) {
       setAiStepStatus(error instanceof Error ? `自动处理失败：${error.message}` : "自动处理失败，请稍后重试。");
@@ -389,10 +454,13 @@ export function App(): JSX.Element {
     }
   }
 
-  function pauseAfterReadableAIOutput(pending: PendingAction, publicText: string, nextState: GameState): void {
+  function pauseAfterReadableAIOutput(pending: PendingAction, publicText: string, nextState: GameState, phaseLabel: string): void {
     if (!humanPlayerId) return;
+    const human = nextState.players.find((player) => player.id === humanPlayerId);
+    if (human && !human.alive) return;
     const hasReadableSpeech = Boolean(publicText) && (pending.kind === "speech" || pending.kind === "wolf_discussion");
     if (!hasReadableSpeech) return;
+    setReadableOutputPause({ seatId: pending.seatId, phaseLabel, publicText });
     setAutoRun(false);
     setIsPaused(true);
     setAiStepStatus(`${seatName(nextState, pending.seatId)} 发言结束，点击继续进入下一位。`);
@@ -402,11 +470,26 @@ export function App(): JSX.Element {
     if (!game || !humanPending) return;
     const command = buildHumanCommand(game, humanPending, selectedTarget, speechText, wolfAgree, sheriffRun);
     if (!command) return;
-    setGame(applyCommand(game, command));
+    const next = applyCommand(game, command);
+    setGame(next);
+    const publicText = officialOutputForCommand(game, humanPending, command, humanPlayerId);
+    if (publicText && (humanPending.kind === "speech" || humanPending.kind === "wolf_discussion")) {
+      setReadableOutputPause({ seatId: humanPending.seatId, phaseLabel: game.phase.label, publicText });
+      setAutoRun(false);
+      setIsPaused(true);
+      setAiStepStatus(`${seatName(game, humanPending.seatId)} 发言结束，点击继续进入下一位。`);
+    } else {
+      setReadableOutputPause(null);
+    }
   }
 
   function withdrawSheriffCandidacy(): void {
     if (!game || !humanPlayerId || !canWithdrawSheriff(game, humanPlayerId)) return;
+    const pending = game.pendingActions.find((action) => action.seatId === humanPlayerId);
+    if (pending?.kind === "sheriff_withdrawal") {
+      setGame(applyCommand(game, { type: "SubmitSheriffWithdrawalDecision", seatId: humanPlayerId, withdraw: true, privateReason: "真人投票前退水。" }));
+      return;
+    }
     setGame(applyCommand(game, { type: "WithdrawSheriffCandidacy", seatId: humanPlayerId, privateReason: "真人警上退水。" }));
   }
 
@@ -421,6 +504,7 @@ export function App(): JSX.Element {
     setAutoRun(true);
     setIsPaused(false);
     clearStreamingOutput();
+    setReadableOutputPause(null);
     setAiProgress(null);
     setAiStepStatus(`${seatName(game, humanPlayerId)} 自爆，当前回合结束，直接进入夜晚。`);
     setTab("chat");
@@ -455,7 +539,9 @@ export function App(): JSX.Element {
       setAutoRun(true);
       setBatchResult(null);
       clearStreamingOutput();
+      setReadableOutputPause(null);
       setAiProgress(null);
+      setGameContextCompression(undefined);
       setIsPaused(false);
       setTab("exposure");
       setScreen("game");
@@ -522,7 +608,13 @@ export function App(): JSX.Element {
     try {
       const synced = syncHiddenAIProviderConfig(config);
       const saved = await saveAIConfig(stripProviderSecrets(synced));
-      setConfig(stripProviderSecrets(saved));
+      setConfig(
+        stripProviderSecrets({
+          ...saved,
+          costControls: saved.costControls ?? DEFAULT_COST_CONTROLS,
+          contextCompression: saved.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION
+        })
+      );
       setConfigStatus("配置已保存到后端，密钥仅保留在当前浏览器");
     } catch (error) {
       setConfigStatus(error instanceof Error ? error.message : "保存失败");
@@ -537,7 +629,7 @@ export function App(): JSX.Element {
       if (result.ok) {
         const incoming = result.models ?? [];
         if (incoming.length > 0) {
-          setConfig((current) => upsertFetchedModels(current, provider.id, incoming));
+          setConfig((current) => selectFetchedDefaultModel(upsertFetchedModels(current, provider.id, incoming), provider.id, incoming));
         }
         setProviderTestResults((current) => ({ ...current, [provider.id]: "success" }));
         setProviderTestStatus(`${provider.name} 连接成功，返回 ${incoming.length} 个模型`);
@@ -635,8 +727,11 @@ export function App(): JSX.Element {
           aiElapsedSeconds={aiElapsedSeconds}
           aiProgress={aiProgress}
           aiStepStatus={aiStepStatus}
+          contextCompression={effectiveContextCompression}
+          onContextCompressionChange={setGameContextCompression}
           streamingSpeech={streamingSpeech}
           streamingSpeechSeatId={streamingSpeechSeatId}
+          readableOutputPause={readableOutputPause}
           humanPlayerId={humanPlayerId}
           humanPending={humanPending}
           selectedTarget={selectedTarget}
@@ -664,6 +759,10 @@ export function App(): JSX.Element {
             setAutoRun(true);
           }}
           onTogglePause={() => {
+            if (isPaused) {
+              clearStreamingOutput();
+              setReadableOutputPause(null);
+            }
             setIsPaused((current) => {
               const next = !current;
               setAutoRun(!next);
@@ -676,6 +775,9 @@ export function App(): JSX.Element {
             setAutoRun(false);
             setIsPaused(false);
             setGame(null);
+            setSetup((current) => ({ ...current, seed: createRandomSeed() }));
+            setGameContextCompression(undefined);
+            setReadableOutputPause(null);
             setScreen("setup");
             setTab("chat");
           }}
@@ -961,6 +1063,16 @@ function providerTestClass(state: ProviderTestState | undefined): string {
   return "neutral";
 }
 
+function preferredProviderId(providers: ProviderAccount[]): string {
+  return providers.find((provider) => provider.enabled && isRealProvider(provider))?.id ?? providers.find(isRealProvider)?.id ?? providers[0]?.id ?? "";
+}
+
+function providerModelOptions(config: AIConfigStore, providerId: string): ModelConfig[] {
+  return config.models
+    .filter((model) => model.providerId === providerId && model.enabled)
+    .sort((left, right) => left.displayName.localeCompare(right.displayName) || left.name.localeCompare(right.name));
+}
+
 function GameRoom({
   game,
   visibleEvents,
@@ -972,8 +1084,11 @@ function GameRoom({
   aiElapsedSeconds,
   aiProgress,
   aiStepStatus,
+  contextCompression,
+  onContextCompressionChange,
   streamingSpeech,
   streamingSpeechSeatId,
+  readableOutputPause,
   humanPlayerId,
   humanPending,
   selectedTarget,
@@ -1015,8 +1130,11 @@ function GameRoom({
   aiElapsedSeconds: number;
   aiProgress: AIDecisionStatus | null;
   aiStepStatus: string;
+  contextCompression: ContextCompressionConfig;
+  onContextCompressionChange: (config: ContextCompressionConfig) => void;
   streamingSpeech: string;
   streamingSpeechSeatId?: PlayerId;
+  readableOutputPause: ReadableOutputPause | null;
   humanPlayerId?: PlayerId;
   humanPending?: PendingAction;
   selectedTarget: PlayerId | "abstain" | "skip" | "destroy";
@@ -1050,11 +1168,16 @@ function GameRoom({
 }): JSX.Element {
   const [dismissedNoticeSeq, setDismissedNoticeSeq] = useState(0);
   const [dismissedFlowNoticeKeys, setDismissedFlowNoticeKeys] = useState<string[]>([]);
+  const humanPlayer = humanPlayerId ? game.players.find((player) => player.id === humanPlayerId) : undefined;
+  const shouldShowFlowNotices = Boolean(humanPlayer?.alive);
+  const isWaitingReadableOutputAck = Boolean(readableOutputPause && isPaused);
+  const displayPhaseLabel = readableOutputPause && isPaused ? readableOutputPause.phaseLabel : visiblePhaseLabel(game, humanPlayerId);
+  const displayPhaseProgress = readableOutputPause && isPaused ? `${seatName(game, readableOutputPause.seatId)} 已发言` : visiblePhaseProgress(game, humanPlayerId);
   const sheriffNotice = useMemo(() => buildSheriffElectionNotice(game), [game.events.length, game.id]);
-  const showSheriffNotice = Boolean(sheriffNotice && sheriffNotice.seq > dismissedNoticeSeq);
+  const showSheriffNotice = shouldShowFlowNotices && !isWaitingReadableOutputAck && Boolean(sheriffNotice && sheriffNotice.seq > dismissedNoticeSeq);
   const flowNotice = useMemo(
-    () => buildFlowNotice(game, visibleEvents, humanPlayerId, dismissedFlowNoticeKeys),
-    [dismissedFlowNoticeKeys, game.events.length, game.id, humanPlayerId, visibleEvents]
+    () => (shouldShowFlowNotices && !isWaitingReadableOutputAck ? buildFlowNotice(game, visibleEvents, humanPlayerId, dismissedFlowNoticeKeys) : undefined),
+    [dismissedFlowNoticeKeys, game.events.length, game.id, humanPlayerId, isWaitingReadableOutputAck, shouldShowFlowNotices, visibleEvents]
   );
   const activeNotice = showSheriffNotice && sheriffNotice ? sheriffNoticeToFlowNotice(sheriffNotice) : flowNotice;
 
@@ -1088,8 +1211,8 @@ function GameRoom({
           </div>
         </div>
         <div className="room-phase-head">
-          <span>{visiblePhaseLabel(game, humanPlayerId)}</span>
-          <strong>{visiblePhaseProgress(game, humanPlayerId)}</strong>
+          <span>{displayPhaseLabel}</span>
+          <strong>{displayPhaseProgress}</strong>
         </div>
         <div className="room-actions">
           {canSelfExplode && (
@@ -1116,7 +1239,7 @@ function GameRoom({
         </div>
       </header>
       <div className="room-layout">
-        <SeatPanel game={game} humanPlayerId={humanPlayerId} />
+        <SeatPanel game={game} humanPlayerId={humanPlayerId} readableOutputPause={readableOutputPause} onOpenRecords={() => setSideTab("records")} />
         <CenterPanel
           game={game}
           visibleEvents={visibleEvents}
@@ -1126,6 +1249,7 @@ function GameRoom({
           aiStepStatus={aiStepStatus}
           streamingSpeech={streamingSpeech}
           streamingSpeechSeatId={streamingSpeechSeatId}
+          readableOutputPause={readableOutputPause}
           isPaused={isPaused}
           autoRun={autoRun}
           humanPlayerId={humanPlayerId}
@@ -1159,6 +1283,8 @@ function GameRoom({
               batchResult={batchResult}
               debugStatus={debugStatus}
               aiBusy={aiBusy}
+              contextCompression={contextCompression}
+              onContextCompressionChange={onContextCompressionChange}
               onExportMarkdown={onExportMarkdown}
               onExportJson={onExportJson}
               onExportSnapshot={onExportSnapshot}
@@ -1280,7 +1406,12 @@ function SetupScreen({
         </label>
         <label>
           随机种子
-          <input value={setup.seed} onChange={(event) => patch({ seed: event.target.value })} />
+          <div className="seed-field">
+            <input value={setup.seed} onChange={(event) => patch({ seed: event.target.value })} />
+            <button type="button" className="icon-button" aria-label="随机生成种子" title="随机生成种子" onClick={() => patch({ seed: createRandomSeed() })}>
+              <Dices size={18} />
+            </button>
+          </div>
         </label>
         <div className="setup-visibility-note">
           <strong>普通视角</strong>
@@ -1296,15 +1427,25 @@ function SetupScreen({
   );
 }
 
-function SeatPanel({ game, humanPlayerId }: { game: GameState; humanPlayerId?: PlayerId }): JSX.Element {
+function SeatPanel({
+  game,
+  humanPlayerId,
+  readableOutputPause,
+  onOpenRecords
+}: {
+  game: GameState;
+  humanPlayerId?: PlayerId;
+  readableOutputPause: ReadableOutputPause | null;
+  onOpenRecords: () => void;
+}): JSX.Element {
   const human = humanPlayerId ? game.players.find((player) => player.id === humanPlayerId) : undefined;
   const role = human ? ROLE_DEFINITIONS[human.role] : undefined;
   const wolfTeammates =
     human?.role === "werewolf" ? game.players.filter((player) => player.role === "werewolf" && player.id !== human.id) : [];
   const steps = ["夜晚行动", "警长竞选", "白天发言", "投票放逐", "游戏结束"];
   const activeStep = game.status === "ended" ? 4 : game.phase.type.startsWith("night") ? 0 : game.phase.type.startsWith("sheriff") ? 1 : game.phase.type.includes("vote") ? 3 : 2;
-  const phaseLabel = visiblePhaseLabel(game, humanPlayerId);
-  const phaseProgress = visiblePhaseProgress(game, humanPlayerId);
+  const phaseLabel = readableOutputPause ? readableOutputPause.phaseLabel : visiblePhaseLabel(game, humanPlayerId);
+  const phaseProgress = readableOutputPause ? `${seatName(game, readableOutputPause.seatId)} 已发言` : visiblePhaseProgress(game, humanPlayerId);
   return (
     <aside className="seat-panel room-left">
       <section className="identity-card hero-identity">
@@ -1365,13 +1506,13 @@ function SeatPanel({ game, humanPlayerId }: { game: GameState; humanPlayerId?: P
           ))}
         </div>
       </section>
-      <section className="record-shortcut">
+      <button className="record-shortcut" type="button" onClick={onOpenRecords}>
         <FileText size={18} />
         <div>
           <strong>游戏记录</strong>
           <p>公开发言、投票和死亡记录会实时写入复盘。</p>
         </div>
-      </section>
+      </button>
     </aside>
   );
 }
@@ -1385,6 +1526,7 @@ function CenterPanel({
   aiStepStatus,
   streamingSpeech,
   streamingSpeechSeatId,
+  readableOutputPause,
   isPaused,
   autoRun,
   humanPlayerId,
@@ -1399,6 +1541,7 @@ function CenterPanel({
   aiStepStatus: string;
   streamingSpeech: string;
   streamingSpeechSeatId?: PlayerId;
+  readableOutputPause: ReadableOutputPause | null;
   isPaused: boolean;
   autoRun: boolean;
   humanPlayerId?: PlayerId;
@@ -1407,32 +1550,45 @@ function CenterPanel({
 }): JSX.Element {
   const aiPending = game.pendingActions.find((action) => game.players.find((player) => player.id === action.seatId)?.controller !== "human");
   const visibleActingSeat = visibleActingSeatId(game, humanPlayerId);
-  const actingPlayer = visibleActingSeat ? game.players.find((player) => player.id === visibleActingSeat) : undefined;
-  const activePending = visibleActingSeat ? game.pendingActions.find((action) => action.seatId === visibleActingSeat) : undefined;
+  const displayActingSeat = readableOutputPause && isPaused ? readableOutputPause.seatId : visibleActingSeat;
+  const actingPlayer = displayActingSeat ? game.players.find((player) => player.id === displayActingSeat) : undefined;
+  const activePending = displayActingSeat ? game.pendingActions.find((action) => action.seatId === displayActingSeat) : undefined;
   const activePendingExpectsSpeech =
     activePending?.kind === "speech" || activePending?.kind === "wolf_discussion" || activePending?.kind === "sheriff_candidacy";
-  const activeStreamingSpeech = visibleActingSeat && streamingSpeechSeatId === visibleActingSeat ? streamingSpeech : "";
+  const activeStreamingSpeech = streamingSpeech;
+  const streamingSpeakerName = streamingSpeechSeatId ? seatName(game, streamingSpeechSeatId) : "";
   const latestActingSpeech =
-    visibleActingSeat === undefined || activePendingExpectsSpeech
+    displayActingSeat === undefined || readableOutputPause || activePendingExpectsSpeech
       ? undefined
       : [...visibleEvents]
           .reverse()
           .find(
             (event) =>
-              event.seatId === visibleActingSeat &&
+              event.seatId === displayActingSeat &&
               (event.type === "SpeechPublished" || event.type === "LastWordsPublished" || event.type === "WolfDiscussionMessage")
           );
-  const statusText = buildActionStatusText(game, humanPlayerId, humanPending, aiPending, aiBusy, aiElapsedSeconds, aiProgress, isPaused, autoRun, aiStepStatus);
-  const speechLabel = aiBusy ? thinkingLabel(aiProgress, aiElapsedSeconds) : activeStreamingSpeech ? "流式输出" : latestActingSpeech ? "最近发言" : "当前玩家发言";
-  const phaseLabel = visiblePhaseLabel(game, humanPlayerId);
-  const phaseProgress = visiblePhaseProgress(game, humanPlayerId);
+  const statusText =
+    readableOutputPause && isPaused
+      ? aiStepStatus
+      : buildActionStatusText(game, humanPlayerId, humanPending, aiPending, aiBusy, aiElapsedSeconds, aiProgress, isPaused, autoRun, aiStepStatus);
+  const speechLabel = aiBusy
+    ? thinkingLabel(aiProgress, aiElapsedSeconds)
+    : activeStreamingSpeech
+      ? `${streamingSpeakerName || "玩家"}流式输出`
+      : readableOutputPause
+        ? "刚刚发言"
+      : latestActingSpeech
+        ? "最近发言"
+        : "当前玩家发言";
+  const phaseLabel = readableOutputPause && isPaused ? readableOutputPause.phaseLabel : visiblePhaseLabel(game, humanPlayerId);
+  const phaseProgress = readableOutputPause && isPaused ? `${seatName(game, readableOutputPause.seatId)} 已发言` : visiblePhaseProgress(game, humanPlayerId);
   return (
     <section className="center-panel table-panel">
       <div className="table-scene">
         <div className="moonlit-table">
           {game.players.map((player, index) => {
             const angle = -90 + (360 / game.players.length) * index;
-            const active = visibleActingSeat === player.id;
+            const active = displayActingSeat === player.id;
             return (
               <div
                 className={`table-seat ${active ? "active" : ""} ${!player.alive ? "dead" : ""}`}
@@ -1442,7 +1598,7 @@ function CenterPanel({
                 <div className="seat-orbit-card">
                   <span className="seat-number">{player.seatNumber}</span>
                   <div className="avatar portrait">{publicPlayerAvatar(player)}</div>
-                  {player.id === visibleActingSeat && (
+                  {player.id === displayActingSeat && (
                     <span className={`thinking-dot ${aiBusy ? "thinking" : ""}`}>
                       {seatActivityLabel(player, humanPending, aiBusy, isPaused, autoRun)}
                     </span>
@@ -1466,6 +1622,7 @@ function CenterPanel({
               <span>{speechLabel}</span>
               <p>
                 {activeStreamingSpeech ||
+                  readableOutputPause?.publicText ||
                   (latestActingSpeech ? eventSummary(game, latestActingSpeech.type, latestActingSpeech.payload, latestActingSpeech.seatId) : "等待当前玩家发言。")}
               </p>
             </div>
@@ -1585,6 +1742,7 @@ function canViewerSeeNightPhase(
   if (game.setup.debugMode.revealRoles || game.setup.debugMode.revealNightActions || game.setup.debugMode.revealWolfChat) return true;
   const human = humanPlayerId ? game.players.find((player) => player.id === humanPlayerId) : undefined;
   if (!human) return false;
+  if (!human.alive) return true;
   if ((phaseType === "night_wolves" || pendingKind === "wolf_discussion") && human.role === "werewolf") return true;
   return actingSeatId === human.id;
 }
@@ -1737,9 +1895,8 @@ function ActionPanel({
             {humanPending.kind === "wolf_discussion" && (
               <Toggle label="同意当前提案" checked={wolfAgree} onChange={setWolfAgree} />
             )}
-            {humanPending.kind === "sheriff_candidacy" && (
-              <Toggle label="上警竞选" checked={sheriffRun} onChange={setSheriffRun} />
-            )}
+            {humanPending.kind === "sheriff_candidacy" && <Toggle label="上警竞选" checked={sheriffRun} onChange={setSheriffRun} />}
+            {humanPending.kind === "sheriff_withdrawal" && <Toggle label="继续竞选" checked={sheriffRun} onChange={setSheriffRun} />}
             <div className="button-row">
               <button className="primary-button" onClick={onSubmitHuman}>
                 <Save size={16} />
@@ -1970,14 +2127,14 @@ function ApiAccessPanel({
   setAiMode: (value: "mock" | "llm") => void;
   onOpenRules: () => void;
 }): JSX.Element {
-  const [selectedProviderId, setSelectedProviderId] = useState(config.providers[0]?.id ?? "");
+  const [selectedProviderId, setSelectedProviderId] = useState(() => preferredProviderId(config.providers));
   const selectedProvider = config.providers.find((provider) => provider.id === selectedProviderId) ?? config.providers[0];
   const apiSummary = buildApiAccessSummary(readinessConfig, providerApiKeys, providerTestResults);
   const testedProviders = config.providers.filter((provider) => providerTestResults[provider.id]);
 
   useEffect(() => {
     if (!selectedProvider || !config.providers.some((provider) => provider.id === selectedProviderId)) {
-      setSelectedProviderId(config.providers[0]?.id ?? "");
+      setSelectedProviderId(preferredProviderId(config.providers));
     }
   }, [config.providers, selectedProvider, selectedProviderId]);
 
@@ -2011,6 +2168,9 @@ function ApiAccessPanel({
     });
     setSelectedProviderId(id);
   }
+
+  const selectedProviderModels = selectedProvider ? providerModelOptions(config, selectedProvider.id) : [];
+  const selectedModelInList = Boolean(selectedProvider && selectedProviderModels.some((model) => model.name === selectedProvider.defaultModel));
 
   return (
     <div className="api-access-layout">
@@ -2091,7 +2251,26 @@ function ApiAccessPanel({
                 </label>
                 <label>
                   默认模型
-                  <input value={selectedProvider.defaultModel} onChange={(event) => updateProvider(selectedProvider.id, { defaultModel: event.target.value })} />
+                  <div className="model-field">
+                    <select
+                      value={selectedModelInList ? selectedProvider.defaultModel : "__custom__"}
+                      onChange={(event) => {
+                        if (event.target.value !== "__custom__") updateProvider(selectedProvider.id, { defaultModel: event.target.value });
+                      }}
+                    >
+                      <option value="__custom__">手动输入模型名</option>
+                      {selectedProviderModels.map((model) => (
+                        <option value={model.name} key={model.id}>
+                          {model.displayName || model.name}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      value={selectedProvider.defaultModel}
+                      placeholder={selectedProviderModels.length ? "也可以手动输入其他模型名" : "测试连接后可选择，或直接手动填写"}
+                      onChange={(event) => updateProvider(selectedProvider.id, { defaultModel: event.target.value })}
+                    />
+                  </div>
                 </label>
               </div>
               <div className="api-action-row">
@@ -2175,6 +2354,18 @@ function ApiAccessPanel({
             ))}
           </div>
         </section>
+        <section className="api-panel">
+          <div className="panel-title">
+            <FileText size={17} />
+            上下文策略
+          </div>
+          <Toggle
+            label="长局自动压缩"
+            checked={isContextCompressionAuto(config.contextCompression)}
+            onChange={(checked) => setConfig({ ...config, contextCompression: contextCompressionFromToggle(checked) })}
+          />
+          <p className="muted">公开记录优先全文；超过模型上下文时自动压缩为关键事实。</p>
+        </section>
         <section className="api-panel help-panel">
           <h3>如何填写</h3>
           <div className="help-row">
@@ -2240,12 +2431,16 @@ function DebugPanel({
   onForceKill,
   onRunMockBatch,
   onStepAI,
-  aiBusy
+  aiBusy,
+  contextCompression,
+  onContextCompressionChange
 }: {
   game: GameState;
   batchResult: MockBatchRunResult | null;
   debugStatus: string;
   aiBusy: boolean;
+  contextCompression: ContextCompressionConfig;
+  onContextCompressionChange: (config: ContextCompressionConfig) => void;
   onExportMarkdown: () => void;
   onExportJson: () => void;
   onExportSnapshot: () => void;
@@ -2340,6 +2535,8 @@ function DebugPanel({
                 <span>费用 {call.estimatedCost.toFixed(6)}</span>
                 <span>耗时 {call.latencyMs}ms</span>
                 <span>重试 {call.retryCount}</span>
+                {call.promptCompressionLevel && <span>上下文 {call.promptCompressionLevel}</span>}
+                {call.estimatedInputTokens !== undefined && <span>估算 {call.estimatedInputTokens}/{call.promptBudgetTokens ?? "-"}</span>}
                 <span>Prompt {call.promptHash}</span>
               </div>
               {call.error && <p className="call-error">{call.error}</p>}
@@ -2419,6 +2616,12 @@ function DebugPanel({
       </section>
       <section className="control-group">
         <h3>手动调试</h3>
+        <Toggle
+          label="本局上下文压缩"
+          checked={isContextCompressionAuto(contextCompression)}
+          onChange={(checked) => onContextCompressionChange(contextCompressionFromToggle(checked))}
+        />
+        <p className="muted">只影响本局后续 AI 请求，不保存到管理控制台。</p>
         <button className="ghost-button" onClick={onStepAI} disabled={game.status === "ended" || aiBusy}>
           <StepForward size={16} />
           {aiBusy ? "AI 思考中" : "调试推进 1 个 AI 动作"}
@@ -2683,7 +2886,8 @@ function latestEventText(state: GameState, types: string[]): string {
 
 function canViewerSeeWolfChat(state: GameState, viewerId?: PlayerId): boolean {
   if (state.setup.debugMode.revealRoles || state.setup.debugMode.revealWolfChat || state.setup.debugMode.revealNightActions) return true;
-  return state.players.find((player) => player.id === viewerId)?.role === "werewolf";
+  const viewer = state.players.find((player) => player.id === viewerId);
+  return Boolean(viewer && (viewer.role === "werewolf" || !viewer.alive));
 }
 
 function StatusBadge({ game }: { game: GameState }): JSX.Element {
@@ -2819,6 +3023,14 @@ function buildHumanCommand(
       privateReason: sheriffRun ? "真人选择上警。" : "真人选择不上警。"
     };
   }
+  if (pending.kind === "sheriff_withdrawal") {
+    return {
+      type: "SubmitSheriffWithdrawalDecision",
+      seatId: pending.seatId,
+      withdraw: !sheriffRun,
+      privateReason: sheriffRun ? "真人选择继续留警。" : "真人选择在投票前退水。"
+    };
+  }
   if (pending.kind === "speech") {
     return { type: "SubmitSpeech", seatId: pending.seatId, text: speechText, privateReason: "真人公开发言。" };
   }
@@ -2848,7 +3060,7 @@ function legalTargetsFor(pending: PendingAction): PlayerId[] {
 
 function canWithdrawSheriff(game: GameState, seatId: PlayerId): boolean {
   const player = game.players.find((item) => item.id === seatId);
-  return Boolean(player?.isSheriffCandidate && !player.hasWithdrawnSheriff && game.phase.type === "sheriff_speech");
+  return Boolean(player?.isSheriffCandidate && !player.hasWithdrawnSheriff && (game.phase.type === "sheriff_speech" || game.phase.type === "sheriff_withdrawal"));
 }
 
 function defaultTargetFor(
@@ -2878,6 +3090,7 @@ function pendingLabel(pending: PendingAction): string {
     seer_check: "预言家查验",
     witch_action: "女巫行动",
     sheriff_candidacy: "警长竞选",
+    sheriff_withdrawal: "退水确认",
     speech: "公开发言",
     vote: "投票",
     badge_decision: "移交警徽",
@@ -3112,6 +3325,26 @@ function flowNoticeForEvent(
       chips: ["直接天黑"]
     };
   }
+  if (event.type === "BadgePassed") {
+    return {
+      key: event.id,
+      kicker: "警徽移交",
+      title: "警徽已移交",
+      body: `${seatName(game, data.fromSeatId as PlayerId)} 将警徽移交给 ${seatName(game, data.toSeatId as PlayerId)}。`,
+      rows: [],
+      chips: [seatName(game, data.toSeatId as PlayerId)]
+    };
+  }
+  if (event.type === "BadgeDestroyed") {
+    return {
+      key: event.id,
+      kicker: "警徽撕毁",
+      title: "警徽已撕毁",
+      body: `${seatName(game, data.seatId as PlayerId)} 选择撕毁警徽。`,
+      rows: [],
+      chips: []
+    };
+  }
   if (event.type === "HunterShotResolved") {
     return {
       key: event.id,
@@ -3176,6 +3409,9 @@ function phaseNotice(
   }
   if (phase === "sheriff_speech" || phase === "sheriff_pk_speech") {
     return { key, kicker: "警长竞选", title: phase === "sheriff_pk_speech" ? "警长 PK 发言" : "警上发言开始", body: "候选人依次发言，可以在投票前退水。", rows: [], chips: [] };
+  }
+  if (phase === "sheriff_withdrawal") {
+    return { key, kicker: "警长竞选", title: "投票前退水确认", body: "上警玩家听完发言后可选择留警或退水。", rows: [], chips: [] };
   }
   if (phase === "sheriff_vote" || phase === "sheriff_pk_vote") {
     return { key, kicker: "警长竞选", title: "警长投票", body: "警下玩家投票决定警长归属。", rows: [], chips: [] };
@@ -3369,6 +3605,20 @@ function upsertFetchedModels(
     });
   }
   return { ...config, models: nextModels };
+}
+
+function selectFetchedDefaultModel(config: AIConfigStore, providerId: string, models: Array<{ id: string; name: string }>): AIConfigStore {
+  const firstModel = models.map((model) => model.id || model.name).find(Boolean);
+  if (!firstModel) return config;
+  return {
+    ...config,
+    providers: config.providers.map((provider) => {
+      if (provider.id !== providerId) return provider;
+      const current = provider.defaultModel.trim();
+      if (current && current !== "model-name") return provider;
+      return { ...provider, defaultModel: firstModel };
+    })
+  };
 }
 
 function syncHiddenAIProviderConfig(config: AIConfigStore): AIConfigStore {
