@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.4 - 2026-06-08
+
+- Changed real AI failures, cost limits, and context overflow handling to pause with explicit errors instead of silently falling back to mock decisions.
+- Added DeepSeek thinking/reasoning controls, larger DeepSeek model context defaults, richer token usage accounting, and clearer LLM HTTP error details.
+- Improved guard night actions with optional skip support and standard guard/witch same-target death behavior.
+- Refined werewolf sheriff-planning behavior, wolf target selection, and role prompts for stronger public reasoning.
+- Updated the web game flow for parallel AI actions, provider reasoning/thinking controls, and expanded human action controls.
+- Expanded server, engine, gateway, and AI decision tests for the new AI/runtime behavior.
+
 ## v0.1.3 - 2026-06-03
 
 - Added configurable AI context compression defaults and request plumbing.

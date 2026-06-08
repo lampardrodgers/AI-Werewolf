@@ -57,6 +57,8 @@ interface PromptPackage {
   compressionLevel: PromptCompressionLevel;
   estimatedInputTokens: number;
   promptBudgetTokens: number;
+  contextCapTokens: number;
+  outputBudgetTokens: number;
   promptPreviewTruncated: boolean;
 }
 
@@ -113,8 +115,8 @@ export async function buildAIDecision(
 
   const costLimitReason = checkCostLimit(request.state, pending.seatId, config.costControls);
   if (costLimitReason) {
-    onProgress?.({ requestId, status: "fallback", seatId: pending.seatId, phase: request.state.phase.label, provider: provider.name, model, message: costLimitReason, error: costLimitReason });
-    return fallbackDecision(request.state, costLimitReason);
+    onProgress?.({ requestId, status: "failed", seatId: pending.seatId, phase: request.state.phase.label, provider: provider.name, model, message: costLimitReason, error: costLimitReason });
+    return { ok: false, fallback: false, error: costLimitReason };
   }
 
   const schemaName = schemaNameForPending(pending);
@@ -129,29 +131,31 @@ export async function buildAIDecision(
   });
   const promptPackage = buildPromptPackageForPending(request.state, pending, persona, schemaName, config, provider.id, model, request.contextCompression);
   if (promptPackage.compressionLevel === "OVERFLOW_FALLBACK") {
-    const reason = `context_overflow：预计输入 ${promptPackage.estimatedInputTokens} tokens，预算 ${promptPackage.promptBudgetTokens} tokens，已使用规则兜底。`;
+    const reason = `context_overflow：预计输入 ${promptPackage.estimatedInputTokens} tokens，预算 ${promptPackage.promptBudgetTokens} tokens。${promptOverflowModeText(
+      request.contextCompression ?? config.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION
+    )}${promptOverflowDiagnostic(provider, model, promptPackage, request.contextCompression ?? config.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION)}`;
     onProgress?.({
       requestId,
-      status: "fallback",
+      status: "failed",
       seatId: pending.seatId,
       phase: request.state.phase.label,
       provider: provider.name,
       model,
-      message: "公开记录超过当前模型上下文预算，已触发规则兜底。",
+      message: "公开记录超过当前模型上下文预算，已暂停以避免静默兜底。",
       error: reason
     });
-    return fallbackDecision(request.state, reason, 0, promptPackage);
+    return { ok: false, fallback: false, error: reason };
   }
   const prompt = promptPackage.prompt;
   const started = Date.now();
   let lastError = "";
-  const maxAttempts = Math.max(6, provider.retryCount + 4);
+  const maxAttempts = realProviderObjectAttempts(provider);
   const timeoutMs = requestTimeoutMs(provider);
   const expectedThinkingMs = expectedThinkingWindowMs(persona);
 
   const adapter = adapterFactory(provider);
   let textRecoveryAttempts = 0;
-  const maxTextRecoveryAttempts = Math.min(3, maxAttempts);
+  const maxTextRecoveryAttempts = 1;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const isCompactRepairAttempt = attempt > 1;
     const maxOutputTokens = limitMaxOutputTokens(persona.maxOutputTokens, config.costControls);
@@ -183,7 +187,7 @@ export async function buildAIDecision(
         temperature: isCompactRepairAttempt ? Math.min(persona.temperature, 0.2) : persona.temperature,
         topP: isCompactRepairAttempt ? Math.min(persona.topP, 0.8) : persona.topP,
         maxOutputTokens: isCompactRepairAttempt ? Math.min(maxOutputTokens, 600) : maxOutputTokens,
-        reasoningEffort: provider.supportsReasoningEffort ? persona.reasoningEffort : undefined,
+        reasoningEffort: providerReasoningEffort(provider, persona),
         timeoutMs
       });
       const command = commandFromModelObject(request.state, pending, result.object);
@@ -244,7 +248,7 @@ export async function buildAIDecision(
           fallback: false
         };
       }
-      if (textRecoveryAttempts < maxTextRecoveryAttempts && shouldTryTextRecovery(pending, attempt)) {
+      if (textRecoveryAttempts < maxTextRecoveryAttempts && shouldTryTextRecovery(error, pending, attempt)) {
         textRecoveryAttempts += 1;
         const textRecovered = await recoverWithTextGeneration({
           adapter,
@@ -287,7 +291,13 @@ export async function buildAIDecision(
               textRecovered.command,
               Date.now() - started,
               attempt + 1,
-              promptMetadataForPrompt(textRecovered.prompt, promptPackage.promptBudgetTokens, "COMPACT")
+              promptMetadataForPrompt(
+                textRecovered.prompt,
+                promptPackage.promptBudgetTokens,
+                "COMPACT",
+                promptPackage.contextCapTokens,
+                promptPackage.outputBudgetTokens
+              )
             ),
             memoryUpdate: textRecovered.memoryUpdate,
             fallback: false
@@ -314,17 +324,17 @@ export async function buildAIDecision(
   const reason = `真实 AI 输出连续失败：${lastError}`;
   onProgress?.({
     requestId,
-    status: "fallback",
+    status: "failed",
     seatId: pending.seatId,
     phase: request.state.phase.label,
     provider: provider.name,
     model,
     timeoutMs,
     expectedThinkingMs,
-    message: "真实模型没有产出可用动作，已触发规则兜底以免整局卡死。",
+    message: "真实模型没有产出可用动作，已暂停以避免继续消耗和错误兜底。",
     error: reason
   });
-  return fallbackDecision(request.state, reason, maxAttempts - 1, promptPackage);
+  return { ok: false, fallback: false, error: reason };
 }
 
 function resolveBrowserApiKey(provider: ProviderAccount, request: AIDecisionRequest): string | undefined {
@@ -338,10 +348,10 @@ function checkCostLimit(state: GameState, seatId: PlayerId, costControls: CostCo
   const gameCost = state.llmCalls.reduce((sum, call) => sum + call.estimatedCost, 0);
   const seatCost = state.llmCalls.filter((call) => call.seatId === seatId).reduce((sum, call) => sum + call.estimatedCost, 0);
   if (controls.maxGameCost > 0 && gameCost >= controls.maxGameCost) {
-    return `成本保护：本局费用 ${gameCost.toFixed(6)} 已达到上限 ${controls.maxGameCost.toFixed(6)}，使用 Mock 兜底。`;
+    return `成本保护：本局费用 ${gameCost.toFixed(6)} 已达到上限 ${controls.maxGameCost.toFixed(6)}，已暂停真实模型请求。`;
   }
   if (controls.maxSeatCost > 0 && seatCost >= controls.maxSeatCost) {
-    return `成本保护：该 AI 费用 ${seatCost.toFixed(6)} 已达到上限 ${controls.maxSeatCost.toFixed(6)}，使用 Mock 兜底。`;
+    return `成本保护：该 AI 费用 ${seatCost.toFixed(6)} 已达到上限 ${controls.maxSeatCost.toFixed(6)}，已暂停真实模型请求。`;
   }
   return undefined;
 }
@@ -362,13 +372,28 @@ function expectedThinkingWindowMs(persona: AIPersona): number {
     minimal: 15000,
     low: 30000,
     medium: 55000,
-    high: 85000
+    high: 85000,
+    max: 120000
   };
   return Math.max(byReasoningStrength[persona.reasoningStrength], byEffort[persona.reasoningEffort]);
 }
 
 function requestTimeoutMs(_provider: ProviderAccount): number | undefined {
   return 0;
+}
+
+function realProviderObjectAttempts(provider: ProviderAccount): number {
+  if (isDeepSeekProvider(provider)) return 1;
+  return Math.max(1, Math.min(2, provider.retryCount));
+}
+
+function providerReasoningEffort(provider: ProviderAccount, persona: AIPersona): AIPersona["reasoningEffort"] | undefined {
+  if (!provider.supportsReasoningEffort && !isDeepSeekProvider(provider)) return undefined;
+  return provider.reasoningEffort ?? persona.reasoningEffort;
+}
+
+function isDeepSeekProvider(provider: ProviderAccount): boolean {
+  return provider.baseUrl.includes("api.deepseek.com");
 }
 
 function selectPendingAction(state: GameState, seatId?: PlayerId): PendingAction | undefined {
@@ -395,9 +420,11 @@ function fallbackDecision(state: GameState, reason: string, retryCount = 0, prom
   };
 }
 
-function shouldTryTextRecovery(pending: PendingAction, attempt: number): boolean {
-  if (pending.kind === "speech") return attempt >= 0;
-  return attempt >= 1;
+function shouldTryTextRecovery(error: unknown, _pending: PendingAction, attempt: number): boolean {
+  if (attempt > 0) return false;
+  const message = normalizeError(error).message;
+  if (/LLM request failed|fetch failed|aborted|network|timeout/i.test(message)) return false;
+  return true;
 }
 
 function recoverTextDecisionFromParseError(
@@ -450,7 +477,7 @@ async function recoverWithTextGeneration({
       temperature: Math.min(persona.temperature, 0.2),
       topP: Math.min(persona.topP, 0.8),
       maxOutputTokens: Math.min(limitMaxOutputTokens(persona.maxOutputTokens, config.costControls), 600),
-      reasoningEffort: provider.supportsReasoningEffort ? persona.reasoningEffort : undefined,
+      reasoningEffort: providerReasoningEffort(provider, persona),
       timeoutMs
     });
   } catch {
@@ -510,7 +537,13 @@ function coercePlainTextResponse(
       }
     };
   }
-  if (pending.kind === "guard_protect" || pending.kind === "seer_check") {
+  if (pending.kind === "guard_protect") {
+    const target = extractMentionedTarget(state, text, pending.legalTargets);
+    if (target) return { ...response, text, object: { target_id: target, private_reason: privateReason } };
+    if (mentionsGuardSkip(text)) return { ...response, text, object: { target_id: "skip", private_reason: privateReason } };
+    return undefined;
+  }
+  if (pending.kind === "seer_check") {
     const target = extractMentionedTarget(state, text, pending.legalTargets);
     if (!target) return undefined;
     return { ...response, text, object: { target_id: target, private_reason: privateReason } };
@@ -564,7 +597,7 @@ function buildPromptPackageForPending(
   const contextCompression = override ?? config.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION;
   const budget = buildPromptBudget(config, providerId, modelName, persona);
   const fullPrompt = buildPromptForPending(state, pending, persona, schemaName, "full");
-  const fullMeta = promptMetadataForPrompt(fullPrompt, budget.inputBudgetTokens, "FULL");
+  const fullMeta = promptMetadataForPrompt(fullPrompt, budget.inputBudgetTokens, "FULL", budget.contextCapTokens, budget.outputBudgetTokens);
   if (fullMeta.estimatedInputTokens <= budget.inputBudgetTokens) return fullMeta;
   if (!contextCompression.enabled || contextCompression.mode === "full_only") {
     return {
@@ -573,7 +606,7 @@ function buildPromptPackageForPending(
     };
   }
   const compactPrompt = buildPromptForPending(state, pending, persona, schemaName, "compact");
-  const compactMeta = promptMetadataForPrompt(compactPrompt, budget.inputBudgetTokens, "COMPACT");
+  const compactMeta = promptMetadataForPrompt(compactPrompt, budget.inputBudgetTokens, "COMPACT", budget.contextCapTokens, budget.outputBudgetTokens);
   if (compactMeta.estimatedInputTokens <= budget.inputBudgetTokens) return compactMeta;
   return {
     ...compactMeta,
@@ -602,7 +635,7 @@ function buildPromptForPending(
 
 function buildPromptBudget(config: AIConfigStore, providerId: string, modelName: string, persona: AIPersona): { inputBudgetTokens: number; contextCapTokens: number; outputBudgetTokens: number } {
   const model = findModelConfig(config.models, providerId, modelName);
-  const contextCapTokens = Math.max(2048, Math.min(model?.contextWindow ?? persona.contextLimit, persona.contextLimit));
+  const contextCapTokens = Math.max(2048, model?.contextWindow ?? persona.contextLimit);
   const outputBudgetTokens = Math.max(128, Math.min(model?.maxOutputTokens ?? persona.maxOutputTokens, limitMaxOutputTokens(persona.maxOutputTokens, config.costControls)));
   const rawInputBudget = (contextCapTokens - outputBudgetTokens - PROMPT_CONTEXT_SAFETY_TOKENS) * PROMPT_BUDGET_RATIO;
   return {
@@ -612,14 +645,43 @@ function buildPromptBudget(config: AIConfigStore, providerId: string, modelName:
   };
 }
 
-function promptMetadataForPrompt(prompt: string, promptBudgetTokens: number, compressionLevel: PromptCompressionLevel): PromptPackage {
+function promptMetadataForPrompt(
+  prompt: string,
+  promptBudgetTokens: number,
+  compressionLevel: PromptCompressionLevel,
+  contextCapTokens = 0,
+  outputBudgetTokens = 0
+): PromptPackage {
   return {
     prompt,
     compressionLevel,
     estimatedInputTokens: estimatePromptTokens(prompt),
     promptBudgetTokens,
+    contextCapTokens,
+    outputBudgetTokens,
     promptPreviewTruncated: prompt.length > PROMPT_PREVIEW_MAX_LENGTH
   };
+}
+
+function promptOverflowModeText(contextCompression: ContextCompressionConfig): string {
+  if (!contextCompression.enabled || contextCompression.mode === "full_only") {
+    return "当前已关闭上下文压缩，仅允许全文输入；请开启长局自动压缩或换更大上下文模型。";
+  }
+  return "已尝试 COMPACT 压缩，但压缩后仍超过预算；请换更大上下文模型、降低输出 token、或减少长局记录。";
+}
+
+function promptOverflowDiagnostic(provider: ProviderAccount, modelName: string, promptPackage: PromptPackage, contextCompression: ContextCompressionConfig): string {
+  const compressionLabel = contextCompression.enabled ? contextCompression.mode : "full_only";
+  const deepSeekHint = isDeepSeekV4Model(modelName)
+    ? promptPackage.contextCapTokens < 1_000_000
+      ? "如果你预期 DeepSeek V4 是 1M，请检查后端 /api/config 和 LANGRENSHA_DATA_DIR 指向的 ai-config.json，确认 deepseek-v4-flash/pro 的 contextWindow 已归一化为 1000000。"
+      : "当前 DeepSeek V4 已按 1M 上下文计算；如果仍超限，说明本局公开记录在当前输出预留和压缩策略下仍超过输入预算。"
+    : "";
+  return `诊断：模型=${provider.name}/${modelName}，上下文窗口=${promptPackage.contextCapTokens} tokens，输出预留=${promptPackage.outputBudgetTokens} tokens，输入预算=${promptPackage.promptBudgetTokens} tokens，压缩模式=${compressionLabel}。解决方向：确认实际服务配置、开启自动压缩、降低 maxOutputTokens，或减少长局公开记录。${deepSeekHint}`;
+}
+
+function isDeepSeekV4Model(modelName: string): boolean {
+  return modelName === "deepseek-v4-flash" || modelName === "deepseek-v4-pro";
 }
 
 function estimatePromptTokens(text: string): number {
@@ -635,48 +697,278 @@ function estimatePromptTokens(text: string): number {
   return Math.ceil(asciiChars / 4) + nonAsciiTokens;
 }
 
+function formatSeatList(state: GameState, ids: PlayerId[]): string {
+  return ids.length ? ids.map((id) => formatSeat(state, id)).join("、") : "无";
+}
+
+function outputRepeatBoundary(state: GameState, pending: PendingAction): string {
+  const recent = recentComparableOutputs(state, pending).slice(-3);
+  if (!recent.length) return "";
+  const formatted = recent.map((item) => `${formatSeat(state, item.seatId)}：${truncatePromptText(item.text, 90)}`).join("；");
+  return `防复读：最近同类发言为 ${formatted}。你的输出禁止照抄、改几个座位号后复述、或沿用同一句模板；必须给出你自己座位的新角度、新目标或新理由。`;
+}
+
+function recentComparableOutputs(state: GameState, pending: PendingAction): Array<{ seatId: PlayerId; text: string }> {
+  const comparableTypes =
+    pending.kind === "wolf_discussion"
+      ? new Set(["WolfDiscussionMessage"])
+      : pending.kind === "speech" || pending.kind === "sheriff_candidacy" || pending.kind === "sheriff_withdrawal"
+        ? new Set(["SpeechPublished", "LastWordsPublished", "SheriffCandidacySubmitted", "SheriffCandidateWithdrawn"])
+        : new Set<string>();
+  if (comparableTypes.size === 0) return [];
+  return state.events
+    .filter((event) => event.seatId && event.seatId !== pending.seatId && comparableTypes.has(event.type) && isRecord(event.payload))
+    .flatMap((event) => {
+      const text =
+        textValue(event.payload.text) ??
+        textValue(event.payload.publicSpeech) ??
+        textValue(event.payload.messageToWolves) ??
+        (event.type === "SheriffCandidateWithdrawn" ? "我退水。" : undefined);
+      return text && event.seatId ? [{ seatId: event.seatId, text }] : [];
+    })
+    .slice(-12);
+}
+
+function ownSeerCheckContext(state: GameState, seatId: PlayerId): string {
+  const checks = state.events
+    .filter((event) => event.type === "SeerChecked" && event.seatId === seatId && isRecord(event.payload))
+    .map((event) => {
+      const targetId = textValue(event.payload.targetId);
+      const result = textValue(event.payload.result);
+      if (!targetId || !result) return "";
+      return `${formatSeat(state, targetId)}=${result === "werewolf" ? "查杀/狼人" : "金水/好人"}`;
+    })
+    .filter(Boolean);
+  return checks.length ? `你的真实查验记录：${checks.join("、")}。` : "你的真实查验记录：暂无。";
+}
+
+function sheriffSpeechOrderContext(state: GameState, pending: Extract<PendingAction, { kind: "speech" }>): string {
+  if (!(state.phase.type === "sheriff_speech" || state.phase.type === "sheriff_pk_speech")) return "";
+  if (!(pending.speechType === "sheriff" || pending.speechType === "pk")) return "";
+  const queue = state.round.sheriff.speechQueue;
+  const currentIndex = queue.indexOf(pending.seatId);
+  const currentAndLater = currentIndex >= 0 ? queue.slice(currentIndex) : queue;
+  const remaining = currentIndex >= 0 ? queue.slice(currentIndex + 1) : queue.filter((id) => id !== pending.seatId);
+  const candidates = (state.phase.type === "sheriff_pk_speech" ? state.round.sheriff.pkCandidates : state.round.sheriff.candidates).filter((id) => {
+    const player = state.players.find((item) => item.id === id);
+    return Boolean(player?.alive && player.isSheriffCandidate && !player.hasWithdrawnSheriff);
+  });
+  const previous = candidates.filter((id) => !currentAndLater.includes(id));
+  const isLast = remaining.length === 0;
+  return [
+    `警上发言顺序：已发言=${formatSeatList(state, previous)}；当前=${formatSeat(state, pending.seatId)}；后置=${formatSeatList(state, remaining)}。`,
+    isLast
+      ? "你是本轮警上/PK 的最后发言者，禁止再说“先听后面、等后置、后面再看、后续发言补充”等话；必须基于已发言者直接给站边、警徽建议、退水态度或投票倾向。"
+      : "你后面仍有候选人发言，可以点名让后置回应，但不能假装后置已经发言。"
+  ].join("");
+}
+
+interface WolfSheriffPlanContext {
+  runnerIds: Set<PlayerId>;
+  stayDownIds: Set<PlayerId>;
+  excerpts: string[];
+}
+
+function wolfSheriffPlanContext(state: GameState, seatId: PlayerId): WolfSheriffPlanContext | undefined {
+  const player = requirePlayer(state, seatId);
+  if (player.role !== "werewolf") return undefined;
+
+  const wolfIds = new Set(state.players.filter((item) => item.role === "werewolf").map((item) => item.id));
+  const runnerIds = new Set<PlayerId>();
+  const stayDownIds = new Set<PlayerId>();
+  const teamStayRules: Array<{ runnerId?: PlayerId }> = [];
+  const excerpts: string[] = [];
+
+  const events = state.events.filter((event) => event.type === "WolfDiscussionMessage" && event.seatId && wolfIds.has(event.seatId) && isRecord(event.payload));
+  for (const event of events) {
+    if (!event.seatId || !isRecord(event.payload)) continue;
+    const text = textValue(event.payload.messageToWolves);
+    if (!text || !/(上警|警下|悍跳|起跳|预言家|警徽|倒钩|冲票)/.test(text)) continue;
+
+    excerpts.push(`#${event.seq} ${formatSeat(state, event.seatId)}：${truncatePromptText(text, 110)}`);
+    for (const sentence of splitPlanSentences(text)) {
+      if (actorDeclaresSheriffRun(sentence)) runnerIds.add(event.seatId);
+
+      for (const runnerId of extractSeatRunnerIds(state, sentence)) {
+        if (wolfIds.has(runnerId)) runnerIds.add(runnerId);
+      }
+
+      const voteRunnerId = extractSheriffVoteRunnerId(state, sentence, event.seatId);
+      if (voteRunnerId && wolfIds.has(voteRunnerId)) runnerIds.add(voteRunnerId);
+
+      if (actorDeclaresStayDown(sentence)) stayDownIds.add(event.seatId);
+      for (const stayDownId of extractSeatStayDownIds(state, sentence)) {
+        if (wolfIds.has(stayDownId)) stayDownIds.add(stayDownId);
+      }
+
+      if (teamDeclaresStayDown(sentence)) {
+        teamStayRules.push({ runnerId: voteRunnerId ?? (actorDeclaresSheriffRun(sentence) ? event.seatId : undefined) });
+      }
+    }
+  }
+
+  for (const rule of teamStayRules) {
+    const runnerId = rule.runnerId ?? (runnerIds.size === 1 ? [...runnerIds][0] : undefined);
+    if (!runnerId) continue;
+    for (const wolfId of wolfIds) {
+      if (wolfId !== runnerId) stayDownIds.add(wolfId);
+    }
+  }
+
+  if (!runnerIds.size && !stayDownIds.size && !excerpts.length) return undefined;
+  return { runnerIds, stayDownIds, excerpts: excerpts.slice(-6) };
+}
+
+function wolfSheriffPlanPromptContext(state: GameState, pending: PendingAction): string {
+  const plan = wolfSheriffPlanContext(state, pending.seatId);
+  if (!plan) return "";
+  const runners = [...plan.runnerIds];
+  const stayDown = [...plan.stayDownIds].filter((id) => !plan.runnerIds.has(id));
+  const selfStayDown = plan.stayDownIds.has(pending.seatId) && !plan.runnerIds.has(pending.seatId);
+  return [
+    "狼队夜聊警上计划（私有，只能用于狼人内部决策，公开发言禁止泄露）：",
+    `建议上警/悍跳=${formatSeatList(state, runners)}；明确警下保票/不上警=${formatSeatList(state, stayDown)}。`,
+    selfStayDown ? `你已被夜聊明确安排在警下保票/不上警，本次必须输出 run_for_sheriff=false，不能为了“抢视角”临时违背狼队计划。` : "",
+    `夜聊摘要：${plan.excerpts.length ? plan.excerpts.join("；") : "暂无明确原文"}。`
+  ]
+    .filter(Boolean)
+    .join("");
+}
+
+function splitPlanSentences(text: string): string[] {
+  return text
+    .split(/[。！？；;\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function actorDeclaresSheriffRun(sentence: string): boolean {
+  if (actorDeclaresStayDown(sentence)) return false;
+  if (/(?:我同意|我支持|我赞成|我认可|我觉得|我认为|我建议).{0,12}\d+\s*号/.test(sentence)) return false;
+  return (
+    /(?:我|自己).{0,10}(?:来上|去上警|上警|抢警徽|拿警徽)/.test(sentence) ||
+    /(?:我来|我去|我负责|我选择|我准备|我打算).{0,24}(?:悍跳|起跳|跳预言家|跳警|上警)/.test(sentence)
+  );
+}
+
+function actorDeclaresStayDown(sentence: string): boolean {
+  return (
+    /(?:我|自己)(?:明天|今天)?(?:不上警|不去上警|不竞选|不上)/.test(sentence) ||
+    /(?:我|自己).{0,6}(?:留在|待在|站在|在)?警下(?:投票|投|冲票|倒钩|保票|支持|待着)?/.test(sentence)
+  );
+}
+
+function teamDeclaresStayDown(sentence: string): boolean {
+  return (
+    /(?:你们|大家|其他队友|其余队友).{0,12}(?:都)?(?:别|不要|不用).{0,4}上警/.test(sentence) ||
+    /(?:大家|你们|其他队友|其余队友|我们(?:三|四|几个)?个).{0,12}警下.{0,10}(?:投|支持|冲票|保票)/.test(sentence)
+  );
+}
+
+function extractSeatRunnerIds(state: GameState, sentence: string): PlayerId[] {
+  return extractSeatIdsByPattern(state, sentence, /(\d+)\s*号.{0,16}(?:来上|去上警|上警|悍跳|起跳|跳预言家|跳警|抢警徽|拿警徽)/g).filter(
+    (id) => !extractSeatStayDownIds(state, sentence).includes(id)
+  );
+}
+
+function extractSeatStayDownIds(state: GameState, sentence: string): PlayerId[] {
+  return extractSeatIdsByPattern(state, sentence, /(\d+)\s*号.{0,16}(?:不上警|不去上警|不竞选|警下(?:投票|冲票|倒钩|保票)|留在警下|待在警下)/g);
+}
+
+function extractSheriffVoteRunnerId(state: GameState, sentence: string, actorId: PlayerId): PlayerId | undefined {
+  if (/(?:投我|支持我|给我|冲我)/.test(sentence) && /(?:警下|投票|冲票|支持|保票)/.test(sentence)) return actorId;
+  const match = /(?:警下|投票|冲票|支持|保票).{0,12}(?:投|支持|给|冲)?\s*(\d+)\s*号/.exec(sentence);
+  if (!match) return undefined;
+  const seatNumber = Number(match[1]);
+  return state.players.find((item) => item.seatNumber === seatNumber)?.id;
+}
+
+function extractSeatIdsByPattern(state: GameState, text: string, pattern: RegExp): PlayerId[] {
+  const ids: PlayerId[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    const seatNumber = Number(match[1]);
+    const player = state.players.find((item) => item.seatNumber === seatNumber);
+    if (player) ids.push(player.id);
+  }
+  return ids;
+}
+
+function assertSheriffCandidacyMatchesWolfPlan(state: GameState, pending: Extract<PendingAction, { kind: "sheriff_candidacy" }>, runForSheriff: boolean): void {
+  if (!runForSheriff) return;
+  const plan = wolfSheriffPlanContext(state, pending.seatId);
+  if (!plan) return;
+  if (plan.stayDownIds.has(pending.seatId) && !plan.runnerIds.has(pending.seatId)) {
+    throw new Error(`警长竞选决策非法：狼队夜聊已明确安排${formatSeat(state, pending.seatId)}警下保票/不上警，run_for_sheriff 必须为 false。`);
+  }
+}
+
 function buildPhaseTask(state: GameState, pending: PendingAction): string {
   const legalTargets = "legalTargets" in pending ? pending.legalTargets.map((id) => `${id}=${formatSeat(state, id)}`).join("，") : "无";
-  const targetRule = legalTargets && legalTargets !== "无" ? "目标字段必须使用合法目标等号左侧的 player_N ID，不要使用座位号、昵称或等号右侧文本。" : "";
+  const targetRule =
+    legalTargets && legalTargets !== "无"
+      ? pending.kind === "guard_protect"
+        ? '守护具体玩家时，target_id 必须使用合法目标等号左侧的 player_N ID；空守时只能输出字符串 "skip"。不要使用座位号、昵称或等号右侧文本。'
+        : "目标字段必须使用合法目标等号左侧的 player_N ID，不要使用座位号、昵称或等号右侧文本。"
+      : "";
+  const legalSeatNumbers = state.players.map((player) => `${player.seatNumber}号`).join("、");
+  const seatBoundary = `本局总人数：${state.players.length}。合法座位号只有：${legalSeatNumbers}；公开发言、狼队私聊和推理理由禁止提到不存在的座位号。`;
   const identityBoundary =
     "信息边界：公开判断必须基于场上发言、公开票型、警徽流、公开事件和你的合法技能结果；死亡、出局、被投票、遗言和玩家自称不会自动验明真实身份，禁止读取其他玩家后台身份。";
   const selfExplosionRule = canWolfSelfExplode(state, pending.seatId)
     ? "狼人自爆：如果你是狼人且公开自爆能明确打断当前白天、保护队友或避免更大损失，可以输出 self_explode=true；自爆后你出局，本回合直接结束并进入夜晚。没有明确收益不要自爆。公开发言里禁止用普通发言泄露自己是狼、狼队友或狼队私聊；要认狼只能用 self_explode=true。"
     : "";
-  const base = `当前阶段：${state.phase.label}。行动座位：${formatSeat(state, pending.seatId)}。合法目标：${legalTargets || "无"}。${targetRule}${identityBoundary}`;
-  if (pending.kind === "guard_protect") return `${base} 请选择一名玩家守护，输出 target_id 和 private_reason。`;
+  const repeatBoundary = outputRepeatBoundary(state, pending);
+  const base = `当前阶段：${state.phase.label}。行动座位：${formatSeat(state, pending.seatId)}。合法目标：${legalTargets || "无"}。${targetRule}${seatBoundary}${identityBoundary}${repeatBoundary}`;
+  if (pending.kind === "guard_protect") return `${base} 请选择一名玩家守护，或在没有合适守护目标、需要避开连续机械守护/守救冲突风险时输出 target_id="skip" 表示空守。输出 target_id 和 private_reason。`;
   if (pending.kind === "seer_check") return `${base} 请选择一名玩家查验，输出 target_id 和 private_reason。`;
   if (pending.kind === "witch_action") {
     return `${base} 狼人刀口：${pending.wolfTarget ? formatSeat(state, pending.wolfTarget) : "无"}。canSave=${pending.canSave}，canPoison=${pending.canPoison}。女巫只知道刀口和自己的药，不知道毒药目标的真实身份。策略：首夜通常偏向使用解药保轮次，但要遵守当前是否可自救、是否守救同死；银水不是金水，之后仍要听发言判断。毒药必须谨慎，优先给明确悍跳狼、强查杀逻辑位或身份矛盾无法自证的位置；公开信息不足时应留毒。输出 save、poison_target_id 和 private_reason。`;
   }
   if (pending.kind === "wolf_discussion") {
-    return `${base} 狼人夜间私聊第 ${pending.round}/3 轮。当前提案：${pending.currentProposal ? formatSeat(state, pending.currentProposal) : "暂无"}。狼刀合法目标包含所有存活玩家，因此可以自刀或刀队友，但必须说明收益；不能假装知道非狼玩家的具体神职身份。除刀口外，还要在狼队内讨论明天警上安排：推荐至少一名狼人上警、悍跳、倒钩或警下配合，并说明谁适合冲、谁适合倒钩、谁适合警下投票。输出 message_to_wolves、proposed_target、agree_current_proposal 和 private_reason。`;
+    return `${base} 狼人夜间私聊第 ${pending.round}/3 轮。当前提案：${pending.currentProposal ? formatSeat(state, pending.currentProposal) : "暂无"}。狼刀合法目标包含所有存活玩家，因此可以自刀或刀队友，但必须说明收益；不能假装知道非狼玩家的具体神职身份。除刀口外，必须讨论明天警上方案：谁上警、谁不上警、谁悍跳预言家、假验人给谁、警徽流怎么留、谁倒钩、谁冲锋、谁警下投票。通常需要至少一名狼人上警制造对跳或抢警徽；不要让多名狼人无目的上警稀释警下票，也不要全员警下让真预言家单边坐实，除非 private_reason 写明特殊收益。输出 message_to_wolves、proposed_target、agree_current_proposal 和 private_reason。`;
   }
   if (pending.kind === "sheriff_candidacy") {
-    return `${base}${selfExplosionRule} 请只决定是否报名上警；这不是正式警上发言，public_speech 只写一句简短报名/不上警理由。策略倾向：真预言家通常应上警争警徽；狼队通常需要至少一名成员上警悍跳、搅局或抢发言视角，尤其当前还没有狼人报名时，全员警下会让真预言家单边坐实；平民、猎人、守卫、女巫等好人也可为了炸身份、挡刀、混淆真预言家或阻止警徽落狼手而上警。上警后可在正式警上发言阶段退水；你可以不上警，但 private_reason 必须说明不上警收益，不要机械地只让真预言家上警。输出 run_for_sheriff、public_speech 和 private_reason。`;
+    const wolfSheriffPlan = wolfSheriffPlanPromptContext(state, pending);
+    return `${base}${selfExplosionRule}${wolfSheriffPlan} 请只决定是否报名上警；这不是正式警上发言，public_speech 只写一句简短报名/不上警理由，不要在这里展开警徽流。判断标准：真预言家通常应上警争警徽；狼人要优先参考狼队夜聊分工，如果队伍需要悍跳且你适合执行，应上警，若已有足够狼队友上警则可警下保票或倒钩；平民、猎人、守卫、女巫等好人可为了炸身份、挡刀、混淆真预言家或阻止警徽落狼手而上警，但必须有目的，不能只说抢视角。上警后可在正式警上发言阶段退水；你可以不上警，但 private_reason 必须说明不上警收益。输出 run_for_sheriff、public_speech 和 private_reason。`;
   }
   if (pending.kind === "sheriff_withdrawal") {
     return `${base}${selfExplosionRule} 这是警长投票前的退水确认。你已经听完警上发言，可以选择继续留警或退水：run_for_sheriff=true 表示留警，run_for_sheriff=false 表示退水。真预言家通常不要退水；好人挡刀/炸身份目的达成、发言质量不足、继续竞选会干扰真预言家时应考虑退水；狼人要根据狼队收益决定留警悍跳、倒钩退水或制造票型混乱。public_speech 只写一句游戏内退水/留警声明，输出 run_for_sheriff、public_speech 和 private_reason。`;
   }
   if (pending.kind === "speech") {
+    const player = requirePlayer(state, pending.seatId);
+    const sheriffOrderContext = sheriffSpeechOrderContext(state, pending);
+    const ownVoteCommitment = ownVoteSpeechCommitment(state, pending.seatId);
+    const roleSpeechContext =
+      pending.speechType === "sheriff" && player.role === "seer"
+        ? `你是真预言家，警上发言要围绕真实查验和警徽流展开。${ownSeerCheckContext(state, pending.seatId)}`
+        : pending.speechType === "sheriff" && player.role === "werewolf"
+          ? "你是狼人，上警后不能只说抢视角。若狼队夜聊安排你悍跳，应给出可信的预言家故事：假验人、警徽流、为什么你是真预言家的逻辑；若不悍跳，也要说明上警的好人视角收益，并准备退水/倒钩/搅票。"
+          : pending.speechType === "sheriff"
+            ? "如果你不是预言家，上警发言必须说明上警目的、你听到的具体矛盾、是否准备退水，不能只有“听对跳/看退水”这种空话。"
+            : "";
     const evidenceRule =
       "只能引用已经发生且对你可见的公开事实；没有警下票型、PK 票型、死亡信息、对跳或站边时，禁止把这些内容编成依据。若当前只有上警名单，就围绕实际上警名单、已发言内容和退水情况发言，不要要求未参与上警的人解释站边。";
     const speechRule =
       pending.speechType === "sheriff"
-        ? `这是正式警上发言；如果跳预言家，需要报验人、警徽流和站边逻辑。非预言家不要无收益乱跳预言家；如果你上警只是为了炸身份、挡刀、抢发言视角或搅局，目的达到、继续竞选收益低、发言质量不足或会干扰好人时，可以输出 withdraw_sheriff=true 主动退水。${evidenceRule}`
+        ? `这是正式警上发言；如果跳预言家，需要报验人、警徽流和站边逻辑。非预言家不要无收益乱跳预言家；如果你上警只是为了炸身份、挡刀、抢发言视角或搅局，目的达到、继续竞选收益低、发言质量不足或会干扰好人时，可以输出 withdraw_sheriff=true 主动退水。${sheriffOrderContext}${roleSpeechContext}${evidenceRule}`
         : `发言必须像狼人杀玩家，围绕已经公开的警上/警下、票型、刀口、对跳、警徽流、站边和发言矛盾展开，不要写泛泛模板。${evidenceRule}`;
     const wolfTeamRule =
-      requirePlayer(state, pending.seatId).role === "werewolf"
+      player.role === "werewolf"
         ? "狼人团队约束：你知道狼队友。可以倒钩或切割，但必须有明确收益；如果局面只是五五开、队友仍可救、或你没有更好的抗推目标，不要主动把队友打成主要出局焦点，也不要公开发言和夜聊安排完全矛盾。"
         : "";
-    return `${base}${selfExplosionRule} 请进行${pending.speechType === "last_words" ? "遗言" : "公开发言"}。${speechRule}${wolfTeamRule} 发言前先确定你的个人路线：你当前最信谁、最怀疑谁、下一票/下一验/下一刀希望怎么走；public_speech 必须体现你的独立判断，至少引用一个具体玩家发言或公开事件，不要只是复述上一位观点或空泛说“看后面发言”。输出 public_speech 和 private_reason 等字段。`;
+    return `${base}${selfExplosionRule} 请进行${pending.speechType === "last_words" ? "遗言" : "公开发言"}。${ownVoteCommitment}${speechRule}${wolfTeamRule} 发言前先确定你的个人路线：你当前最信谁、最怀疑谁、下一票/下一验/下一刀希望怎么走；public_speech 必须体现你的独立判断，至少引用一个具体玩家发言或公开事件，不要只是复述上一位观点或空泛说“看后面发言”。输出 public_speech 和 private_reason 等字段。`;
   }
   if (pending.kind === "vote") {
+    const sheriffVoteContext =
+      pending.voteType === "sheriff" || pending.voteType === "sheriff_pk"
+        ? `当前仍在警上的候选人：${formatSeatList(state, pending.legalTargets)}。当前有投票权的是警下且未退水玩家；仍在候选名单中或已经退水的玩家不会收到投票动作。`
+        : "";
     const voteRule =
       pending.voteType === "sheriff" || pending.voteType === "sheriff_pk"
         ? "警长票只能基于警上发言、退水、对跳质量和警下票型判断；不能因为后台真实身份或狼夜聊支持某位候选人。若某候选人公开查杀你、强打你或把你作为主要狼坑，通常不要把票投给他，除非你在 private_reason 中明确说明这是狼人倒钩/战术弃防且符合已公开立场。"
         : "放逐票只能基于公开发言、票型、公开死亡结果、技能声明和站边矛盾判断；不能使用未公开真实身份或私聊信息。";
-    return `${base}${selfExplosionRule} 你是${formatSeat(state, pending.seatId)}，不能投给自己，禁止输出 ${pending.seatId}。${voteRule} 请投票；如果允许弃票且当前没有足够可信目标、票型信息不足或强行投票会暴露身份，可以输出 abstain，弃票不是错误。输出 vote_target、private_reason、confidence。`;
+    return `${base}${selfExplosionRule}${sheriffVoteContext} 你是${formatSeat(state, pending.seatId)}，不能投给自己，禁止输出 ${pending.seatId}。${voteRule} 你的投票必须与你已经公开表达的站边、查杀/金水关系和上一轮发言逻辑一致；如果要改票或倒钩，private_reason 必须引用新事实解释为什么改变。请投票；如果允许弃票，且你判断当前局势没有聊清、没有足够可信目标、票型信息不足或强行投票只会制造噪音/暴露身份，可以输出 abstain；不要为了投票而强行投一个目标，弃票不是错误。输出 vote_target、private_reason、confidence。`;
   }
   if (pending.kind === "badge_decision") return `${base} 警长已经死亡，请选择一名存活玩家移交警徽，或输出 destroy 撕毁警徽。输出 target_id 和 private_reason。`;
   return `${base} 你是猎人，请选择开枪目标或 skip，输出 target_id 和 private_reason。`;
@@ -708,7 +1000,9 @@ function buildVisibleFacts(state: GameState, pending: PendingAction, contextMode
     `你的身份：${ROLE_DEFINITIONS[player.role].name}`,
     "信息确认边界：公开判断只能使用场上发言、公开票型、公开事件和你的合法技能结果；死亡、出局、被投票和遗言不会自动公开真实身份。没有技能结果、狼人队友信息或公开揭示时，只能说可能/倾向/判断，不能说已知某人是狼、好人、平民或神职。",
     `存活玩家：${state.players.filter((item) => item.alive).map((item) => formatSeat(state, item.id)).join("、")}`,
-    `警长：${state.sheriffSeatId ? formatSeat(state, state.sheriffSeatId) : "无"}`
+    state.sheriffSeatId
+      ? `当前警长唯一为：${formatSeat(state, state.sheriffSeatId)}。公开发言禁止声称其他玩家是警长、警长归票位或拥有警徽。`
+      : "当前警长：无。公开发言禁止声称任何玩家已经是警长或拥有警徽。"
   ];
   if (player.role === "werewolf") {
     facts.push(`狼人队友：${state.players.filter((item) => item.role === "werewolf").map((item) => formatSeat(state, item.id)).join("、")}`);
@@ -716,10 +1010,59 @@ function buildVisibleFacts(state: GameState, pending: PendingAction, contextMode
 
   const visibleEvents = promptVisibleEvents(state, pending);
   facts.push(...buildPrivateResourceFacts(state, pending.seatId));
+  facts.push(...buildOwnVoteRecordFacts(state, pending.seatId));
+  facts.push(buildStageTimelineBoundary(state));
   facts.push(...buildPublicClaimFacts(state));
   facts.push(...(contextMode === "compact" ? buildCompactPublicContextFacts(state, pending.seatId) : buildPublicRecordFacts(state, pending.seatId)));
   facts.push(...buildVisibleEventFacts(state, pending, visibleEvents));
   return facts;
+}
+
+function buildOwnVoteRecordFacts(state: GameState, seatId: PlayerId): string[] {
+  const ownVotes = state.events
+    .filter((event) => event.type === "VoteCast" && event.seatId === seatId && isRecord(event.payload))
+    .map((event) => {
+      const voteType = textValue(event.payload.voteType) ?? "vote";
+      const targetId = textValue(event.payload.targetId);
+      const target = targetId === "abstain" ? "弃票" : targetId ? formatSeat(state, targetId) : "未知";
+      return `#${event.seq} ${voteType} -> ${target}`;
+    });
+  return [`你的已提交投票记录（这是你的真实历史动作，公开发言必须与其一致；变更立场要解释新事实）：${ownVotes.length ? ownVotes.join("；") : "暂无"}`];
+}
+
+function ownVoteSpeechCommitment(state: GameState, seatId: PlayerId): string {
+  const event = [...state.events].reverse().find((item) => item.type === "VoteCast" && item.seatId === seatId && isRecord(item.payload));
+  if (!event || !isRecord(event.payload)) return "";
+  const voteType = textValue(event.payload.voteType) ?? "vote";
+  const targetId = textValue(event.payload.targetId);
+  const targetText = targetId === "abstain" ? "弃票" : targetId ? `投给${formatSeat(state, targetId)}` : "投票目标未知";
+  return `你的最近一次真实投票：你在${voteTypeLabel(voteType)}中${targetText}。本次公开发言必须承认这张票的存在，并让立场与它一致；如果你现在站边或攻击方向不同，必须说明哪些新的公开事实让你改变想法。`;
+}
+
+function voteTypeLabel(voteType: string): string {
+  const labels: Record<string, string> = {
+    sheriff: "警长投票",
+    sheriff_pk: "警长 PK 投票",
+    day: "白天放逐投票",
+    day_pk: "放逐 PK 投票"
+  };
+  return labels[voteType] ?? "投票";
+}
+
+function buildStageTimelineBoundary(state: GameState): string {
+  if (state.phase.type === "sheriff_vote" || state.phase.type === "sheriff_pk_vote") {
+    return "时间线边界：当前正在警长投票，尚未产生本轮警长投票结果；最终仍在警上的候选人不能投票，已经退水的玩家也不能投票。";
+  }
+  if (state.phase.type === "day_speech") {
+    return "时间线边界：当前是白天发言，白天放逐投票尚未开始；可以引用已经公开的警长票型，但禁止声称已经看到本轮白天放逐票型。警长票发生在警上发言和退水之后、白天发言之前。";
+  }
+  if (state.phase.type === "day_vote" || state.phase.type === "day_pk_vote") {
+    return "时间线边界：当前正在白天/PK 投票，尚未产生本轮投票结算；投票理由只能基于投票前已经公开的发言、身份声明和票型。";
+  }
+  if (state.phase.type === "sheriff_speech" || state.phase.type === "sheriff_withdrawal" || state.phase.type === "sheriff_pk_speech") {
+    return "时间线边界：当前仍在警长竞选流程，尚未产生警长投票结果；禁止引用未发生的警长票型、白天发言或放逐票型。";
+  }
+  return "时间线边界：只能引用当前阶段之前已经发生的事件，禁止把后续投票、发言或死亡结果当作已经发生。";
 }
 
 function buildPrivateResourceFacts(state: GameState, seatId: PlayerId): string[] {
@@ -777,13 +1120,18 @@ function buildCompactPublicContextFacts(state: GameState, viewerSeatId: PlayerId
 }
 
 function buildCompactPublicEventIndex(state: GameState, viewerSeatId: PlayerId, publicEvents: GameState["events"]): string[] {
+  const speechEvents = publicEvents.filter((event) => event.type === "SpeechPublished" || event.type === "LastWordsPublished");
+  const nonSpeechEvents = publicEvents.filter((event) => event.type !== "SpeechPublished" && event.type !== "LastWordsPublished");
+  const indexedNonSpeechEvents = nonSpeechEvents.slice(-160);
   return [
-    `全场公开事件索引：共 ${publicEvents.length} 条，以下 seq/type/actor 不可丢。`,
-    ...publicEvents.map((event) => {
+    `全场公开事件索引：共 ${publicEvents.length} 条；发言/遗言 ${speechEvents.length} 条已按玩家折叠，非发言关键事件保留最近 ${indexedNonSpeechEvents.length}/${nonSpeechEvents.length} 条。`,
+    ...state.players.map((player) => {
+      const playerSpeechSeqs = speechEvents.filter((event) => event.seatId === player.id).map((event) => `#${event.seq}`);
+      const omitted = Math.max(0, playerSpeechSeqs.length - 10);
+      return `${formatSeat(state, player.id)}公开发言索引：共 ${playerSpeechSeqs.length} 条${omitted > 0 ? `，省略较早 ${omitted} 条` : ""}，最近=${playerSpeechSeqs.slice(-10).join("、") || "暂无"}`;
+    }),
+    ...indexedNonSpeechEvents.map((event) => {
       const actor = event.seatId ? formatSeat(state, event.seatId) : "系统";
-      if (event.type === "SpeechPublished" || event.type === "LastWordsPublished") {
-        return `公开索引 #${event.seq} ${event.type} ${actor}`;
-      }
       return `公开索引 #${event.seq} ${event.type} ${actor}: ${truncatePromptText(summarizePublicRecordEvent(state, viewerSeatId, event), 48)}`;
     })
   ];
@@ -1046,7 +1394,17 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
     };
   }
 
-  if (pending.kind === "guard_protect" || pending.kind === "seer_check") {
+  if (pending.kind === "guard_protect") {
+    const rawTarget = firstValue(object, ["target_id", "targetId", "target"]);
+    return {
+      type: "SubmitNightAction",
+      seatId: pending.seatId,
+      action: pending.kind,
+      targetId: parseGuardTarget(state, rawTarget, pending.legalTargets),
+      privateReason: requiredPrivateReason(object)
+    };
+  }
+  if (pending.kind === "seer_check") {
     return {
       type: "SubmitNightAction",
       seatId: pending.seatId,
@@ -1068,6 +1426,8 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
   if (pending.kind === "wolf_discussion") {
     const messageToWolves = requiredFieldText(object, ["message_to_wolves", "messageToWolves", "message"]);
     assertImmersiveOutputText(messageToWolves, "狼人私聊发言");
+    assertReferencedSeatNumbersAreValid(state, messageToWolves, "狼人私聊发言");
+    assertRecentOutputIsDistinct(state, pending, messageToWolves, "狼人私聊发言");
     return {
       type: "SubmitWolfDiscussionMessage",
       seatId: pending.seatId,
@@ -1080,8 +1440,12 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
   if (pending.kind === "sheriff_candidacy") {
     const publicSpeech = normalizeUnsupportedPublicRoleCertainty(state, pending.seatId, requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]));
     assertImmersiveOutputText(publicSpeech, "警长竞选发言");
+    assertReferencedSeatNumbersAreValid(state, publicSpeech, "警长竞选发言");
     assertPublicSpeechDoesNotLeakPrivateIdentity(state, pending.seatId, publicSpeech, "警长竞选发言");
+    assertPublicSpeechDoesNotMisstateSheriff(state, publicSpeech, "警长竞选发言");
+    assertRecentOutputIsDistinct(state, pending, publicSpeech, "警长竞选发言");
     const decision = normalizeSheriffCandidacyDecision(object, publicSpeech, requiredPrivateReason(object));
+    assertSheriffCandidacyMatchesWolfPlan(state, pending, decision.runForSheriff);
     return {
       type: "SubmitSheriffCandidacy",
       seatId: pending.seatId,
@@ -1093,7 +1457,10 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
   if (pending.kind === "sheriff_withdrawal") {
     const publicSpeech = normalizeUnsupportedPublicRoleCertainty(state, pending.seatId, requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]));
     assertImmersiveOutputText(publicSpeech, "退水确认发言");
+    assertReferencedSeatNumbersAreValid(state, publicSpeech, "退水确认发言");
     assertPublicSpeechDoesNotLeakPrivateIdentity(state, pending.seatId, publicSpeech, "退水确认发言");
+    assertPublicSpeechDoesNotMisstateSheriff(state, publicSpeech, "退水确认发言");
+    assertRecentOutputIsDistinct(state, pending, publicSpeech, "退水确认发言");
     const decision = normalizeSheriffCandidacyDecision(object, publicSpeech, requiredPrivateReason(object));
     const explicitWithdraw = optionalBooleanFromModel(firstValue(object, ["withdraw_sheriff", "withdrawSheriff", "withdraw", "drop_out"]));
     return {
@@ -1106,7 +1473,10 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
   if (pending.kind === "speech") {
     const text = normalizeUnsupportedPublicRoleCertainty(state, pending.seatId, requiredFieldText(object, ["public_speech", "publicSpeech", "speech"]));
     assertImmersiveOutputText(text, "公开发言");
+    assertReferencedSeatNumbersAreValid(state, text, "公开发言");
     assertPublicSpeechDoesNotLeakPrivateIdentity(state, pending.seatId, text, "公开发言");
+    assertPublicSpeechDoesNotMisstateSheriff(state, text, "公开发言");
+    assertRecentOutputIsDistinct(state, pending, text, "公开发言");
     if (shouldWithdrawSheriffFromSpeech(state, pending, object, text)) {
       return {
         type: "WithdrawSheriffCandidacy",
@@ -1330,6 +1700,13 @@ function requireLegalTarget(state: GameState, rawValue: unknown, legalTargets: P
   return targetId;
 }
 
+function parseGuardTarget(state: GameState, rawValue: unknown, legalTargets: PlayerId[]): PlayerId | "skip" {
+  if (typeof rawValue === "string" && /^(skip|none|null|空守|不守|不守护|跳过)$/i.test(rawValue.trim())) {
+    return "skip";
+  }
+  return requireLegalTarget(state, rawValue, legalTargets);
+}
+
 function referencesSeat(state: GameState, rawTarget: string, seatId: PlayerId): boolean {
   const player = state.players.find((item) => item.id === seatId);
   if (!player) return false;
@@ -1445,6 +1822,10 @@ function mentionsSkipHunterShot(text: string): boolean {
   return /(不开枪|不带人|不开|skip)/i.test(text);
 }
 
+function mentionsGuardSkip(text: string): boolean {
+  return /(空守|不守|不守护|跳过守护|skip)/i.test(text);
+}
+
 function mentionsWolfSelfExplosion(text: string): boolean {
   return /(我自爆|选择自爆|直接自爆|狼人自爆|自爆身份|认狼自爆|self[_\s-]?explode)/i.test(text);
 }
@@ -1529,6 +1910,73 @@ function assertImmersiveOutputText(text: string, fieldName: string): void {
   }
 }
 
+function assertReferencedSeatNumbersAreValid(state: GameState, text: string, fieldName: string): void {
+  const validSeats = new Set(state.players.map((player) => player.seatNumber));
+  const invalidSeats = new Set<number>();
+  for (const match of text.matchAll(/(?:^|[^0-9])(\d{1,2})\s*号/g)) {
+    const seatNumber = Number(match[1]);
+    if (!validSeats.has(seatNumber)) invalidSeats.add(seatNumber);
+  }
+  for (const fragment of text.matchAll(/警徽流[^。！？!?\n]{0,40}/g)) {
+    const value = fragment[0];
+    for (const match of value.matchAll(/(?:先|后|留|验|查|打|压|投|归|保|听)\s*(\d{1,2})/g)) {
+      const seatNumber = Number(match[1]);
+      if (!validSeats.has(seatNumber)) invalidSeats.add(seatNumber);
+    }
+    for (const match of value.matchAll(/(\d{1,2})\s*后\s*(\d{1,2})/g)) {
+      for (const raw of [match[1], match[2]]) {
+        const seatNumber = Number(raw);
+        if (!validSeats.has(seatNumber)) invalidSeats.add(seatNumber);
+      }
+    }
+  }
+  if (invalidSeats.size > 0) {
+    const invalidText = [...invalidSeats].sort((a, b) => a - b).map((seat) => `${seat}号`).join("、");
+    const validText = state.players.map((player) => `${player.seatNumber}号`).join("、");
+    throw new Error(`${fieldName}非法：提到了不存在的座位号 ${invalidText}；本局合法座位号只有 ${validText}`);
+  }
+}
+
+function assertRecentOutputIsDistinct(state: GameState, pending: PendingAction, text: string, fieldName: string): void {
+  const normalized = normalizeComparableText(text);
+  if (normalized.length < 12) return;
+  for (const recent of recentComparableOutputs(state, pending)) {
+    const recentNormalized = normalizeComparableText(recent.text);
+    if (!recentNormalized) continue;
+    const exact = normalized === recentNormalized;
+    const tooSimilar = Math.min(normalized.length, recentNormalized.length) >= 36 && bigramOverlap(normalized, recentNormalized) >= 0.9;
+    if (exact || tooSimilar) {
+      throw new Error(`${fieldName}非法：和${formatSeat(state, recent.seatId)}最近发言重复，需要换角度重新输出`);
+    }
+  }
+}
+
+function normalizeComparableText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[\s，。！？、；：,.!?;:"“”‘’'（）()【】\[\]{}<>《》\-—_]/g, "")
+    .trim();
+}
+
+function bigramOverlap(left: string, right: string): number {
+  const leftGrams = ngrams(left, 2);
+  const rightGrams = ngrams(right, 2);
+  if (!leftGrams.size || !rightGrams.size) return 0;
+  let overlap = 0;
+  for (const gram of leftGrams) {
+    if (rightGrams.has(gram)) overlap += 1;
+  }
+  return overlap / Math.min(leftGrams.size, rightGrams.size);
+}
+
+function ngrams(text: string, size: number): Set<string> {
+  const grams = new Set<string>();
+  for (let index = 0; index <= text.length - size; index += 1) {
+    grams.add(text.slice(index, index + size));
+  }
+  return grams;
+}
+
 function assertPublicSpeechDoesNotLeakPrivateIdentity(state: GameState, seatId: PlayerId, text: string, fieldName: string): void {
   const player = requirePlayer(state, seatId);
   const privateBoundaryPatterns: Array<[RegExp, string]> = [
@@ -1553,6 +2001,29 @@ function assertPublicSpeechDoesNotLeakPrivateIdentity(state: GameState, seatId: 
   const issue = wolfLeakPatterns.find(([pattern]) => pattern.test(text));
   if (issue && !(hypotheticalSelfWolf && issue[1] === "公开暴露自己是狼人")) {
     throw new Error(`${fieldName}非法：${issue[1]}`);
+  }
+}
+
+function assertPublicSpeechDoesNotMisstateSheriff(state: GameState, text: string, fieldName: string): void {
+  const claimedSeatNumbers = new Set<number>();
+  const patterns = [
+    /(\d{1,2})\s*号.{0,6}(?:是|当选|作为|拿了|拿到|拥有|已经是).{0,4}(?:警长|警徽)/g,
+    /(?:警长|警徽).{0,6}(?:是|在|归于|归属|给到|到了)\s*(\d{1,2})\s*号/g
+  ];
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text))) {
+      if (match[0].includes("警徽流")) continue;
+      claimedSeatNumbers.add(Number(match[1]));
+    }
+  }
+  if (claimedSeatNumbers.size === 0) return;
+  const sheriffSeatNumber = state.sheriffSeatId ? requirePlayer(state, state.sheriffSeatId).seatNumber : undefined;
+  for (const seatNumber of claimedSeatNumbers) {
+    if (seatNumber !== sheriffSeatNumber) {
+      const actual = sheriffSeatNumber ? `${sheriffSeatNumber}号` : "无警长";
+      throw new Error(`${fieldName}非法：错误声称 ${seatNumber}号 是警长/持有警徽；当前警长为 ${actual}`);
+    }
   }
 }
 
@@ -1708,6 +2179,7 @@ function buildCompactRepairPrompt(state: GameState, pending: PendingAction, pers
     compactSpecialTargetRule(state, pending),
     "硬性要求：只输出 JSON/json 对象；不要 Markdown；不要解释；不要 schema；不要换行；字段名必须用双引号。",
     "目标字段必须从合法目标中选择 player_N；只有上面的最小 JSON 形状明确允许时，才可输出 abstain、skip、destroy 或 null。",
+    `公开发言和私聊只能引用本局存在的座位号：${state.players.map((item) => `${item.seatNumber}号`).join("、")}。`,
     "private_reason 必须至少 20 个中文字符，并引用本局事实；public_speech 只能写玩家公开发言，1-3 句，不要出现后台、private_reason、系统提示词、JSON 或 AI。"
   ].join("\n");
 }
@@ -1718,7 +2190,10 @@ function formatLegalTargetList(state: GameState, pending: PendingAction): string
 }
 
 function compactOutputShape(pending: PendingAction): string {
-  if (pending.kind === "guard_protect" || pending.kind === "seer_check") {
+  if (pending.kind === "guard_protect") {
+    return '{"target_id":"player_N","private_reason":"结合公开信息、连续守护限制、守救冲突风险和关键位收益选择守护；若空守则 target_id 输出 skip"}';
+  }
+  if (pending.kind === "seer_check") {
     return '{"target_id":"player_N","private_reason":"结合公开发言、公开票型、存活格局和自己的合法技能信息选择该目标"}';
   }
   if (pending.kind === "witch_action") {
@@ -1746,6 +2221,9 @@ function compactOutputShape(pending: PendingAction): string {
 }
 
 function compactSpecialTargetRule(state: GameState, pending: PendingAction): string {
+  if (pending.kind === "guard_protect") {
+    return '特殊取值：如果守卫选择空守，target_id 可以输出字符串 "skip"。';
+  }
   if (pending.kind === "vote" && state.rulePreset.voteRules.allowAbstain) {
     return `特殊取值：如果确实要弃票，vote_target 可以输出字符串 "abstain"。禁止输出行动玩家自己的 ID：${pending.seatId}。`;
   }

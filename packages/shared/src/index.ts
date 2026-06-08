@@ -71,7 +71,7 @@ export const ROLE_DEFINITIONS: Record<RoleId, RoleDefinition> = {
     category: "god",
     icon: "shield",
     publicDescription: "每晚守护一名玩家，使其免受狼人击杀。",
-    privateDescription: "需要避开连续机械守护，默认守救同目标不导致死亡。"
+    privateDescription: "需要避开连续机械守护；标准规则下守卫和女巫同救同一刀口会死亡，可选择空守。"
   }
 };
 
@@ -173,7 +173,7 @@ export const STANDARD_PRESET: RulePreset = {
   witchRules: {
     allowSelfSaveFirstNight: true,
     allowSaveAndPoisonSameNight: false,
-    guardSaveSameTargetDies: false,
+    guardSaveSameTargetDies: true,
     poisonedHunterCanShoot: false
   }
 };
@@ -254,6 +254,10 @@ export type ProviderType =
   | "xai"
   | "codex_cli_local";
 
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "max";
+
+export type ThinkingMode = "auto" | "enabled" | "disabled";
+
 export interface ProviderAccount {
   id: string;
   name: string;
@@ -275,6 +279,8 @@ export interface ProviderAccount {
   supportsStreaming: boolean;
   supportsReasoningEffort: boolean;
   supportsModelList: boolean;
+  reasoningEffort?: ReasoningEffort;
+  thinkingMode?: ThinkingMode;
 }
 
 export interface ModelConfig {
@@ -320,7 +326,7 @@ export interface AIPersona {
   temperature: number;
   topP: number;
   maxOutputTokens: number;
-  reasoningEffort: "minimal" | "low" | "medium" | "high";
+  reasoningEffort: ReasoningEffort;
   allowRandomSelection: boolean;
   weight: number;
 }
@@ -479,7 +485,9 @@ export const DEFAULT_AI_CONFIG: AIConfigStore = {
       supportsToolCall: false,
       supportsStreaming: false,
       supportsReasoningEffort: false,
-      supportsModelList: false
+      supportsModelList: false,
+      reasoningEffort: "medium",
+      thinkingMode: "disabled"
     }
   ],
   models: [

@@ -114,6 +114,99 @@ describe("werewolf engine", () => {
     expect(state.events.some((event) => event.type === "WolfKillLocked")).toBe(true);
   });
 
+  it("keeps mock sheriff candidacy aligned with the wolf night plan", () => {
+    const state = createGame({
+      totalPlayers: 12,
+      humanPlayers: 0,
+      aiPlayers: 12,
+      seed: "mock-wolf-sheriff-plan",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const seat = (seatNumber: number) => {
+      const player = state.players.find((item) => item.seatNumber === seatNumber);
+      if (!player) throw new Error(`missing seat ${seatNumber}`);
+      return player;
+    };
+    for (const player of state.players) player.role = "villager";
+    for (const seatNumber of [1, 6, 9, 12]) seat(seatNumber).role = "werewolf";
+    const seat6 = seat(6);
+    state.day = 1;
+    state.phase = { type: "sheriff_candidacy", day: 1, label: "警长竞选 · 是否上警" };
+    state.pendingActions = [{ kind: "sheriff_candidacy", seatId: seat6.id }];
+    state.events.push(
+      {
+        id: "event_mock_wolf_plan_runner",
+        gameId: state.id,
+        seq: state.events.length + 1,
+        type: "WolfDiscussionMessage",
+        visibility: "private",
+        seatId: seat(1).id,
+        payload: {
+          seatId: seat(1).id,
+          round: 1,
+          messageToWolves: "我来一波自刀，骗一个银水，然后悍跳预言家，大家警下投我，你们都别上警我来上。",
+          proposedTarget: seat(1).id,
+          agreeCurrentProposal: true
+        },
+        createdAt: new Date().toISOString()
+      },
+      {
+        id: "event_mock_wolf_plan_seat6_stay_down",
+        gameId: state.id,
+        seq: state.events.length + 2,
+        type: "WolfDiscussionMessage",
+        visibility: "private",
+        seatId: seat6.id,
+        payload: {
+          seatId: seat6.id,
+          round: 1,
+          messageToWolves: "我同意1号自刀悍跳的方案。我明天不上警，警下直接冲票。",
+          proposedTarget: seat(1).id,
+          agreeCurrentProposal: true
+        },
+        createdAt: new Date().toISOString()
+      }
+    );
+
+    const decision = createMockDecision(state);
+
+    expect(decision?.command).toMatchObject({ type: "SubmitSheriffCandidacy", seatId: seat6.id, runForSheriff: false });
+  });
+
+  it("keeps mock wolf discussion from defaulting to teammates or exact repeated lines", () => {
+    const humanWolfState = createGame({
+      totalPlayers: 8,
+      humanPlayers: 1,
+      aiPlayers: 7,
+      seed: "ui-wolf-0",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const decision = createMockDecision(humanWolfState);
+    const command = decision?.command;
+    if (!command || command.type !== "SubmitWolfDiscussionMessage") throw new Error("expected wolf discussion");
+    expect(humanWolfState.players.find((player) => player.id === command.proposedTargetId)?.role).not.toBe("werewolf");
+
+    let allAIState = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "mock-wolf-variety",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    for (let index = 0; index < 12 && allAIState.events.filter((event) => event.type === "WolfDiscussionMessage").length < 3; index += 1) {
+      allAIState = applyMockStep(allAIState);
+    }
+    const messages = allAIState.events
+      .filter((event) => event.type === "WolfDiscussionMessage")
+      .map((event) => String((event.payload as { messageToWolves?: string }).messageToWolves));
+
+    expect(messages.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(messages).size).toBe(messages.length);
+  });
+
   it("reveals night actions to dead viewers without exposing them to living bystanders", () => {
     const hiddenDebugMode = {
       ...DEFAULT_DEBUG_MODE,
@@ -201,6 +294,125 @@ describe("werewolf engine", () => {
 
     expect(state.phase.type).toBe("night_wolves");
     expect(state.pendingActions[0]).toMatchObject({ kind: "wolf_discussion" });
+  });
+
+  it("lets the guard skip protection", () => {
+    let state = createGame({
+      totalPlayers: 10,
+      humanPlayers: 0,
+      aiPlayers: 10,
+      seed: "guard-skip",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions.find((action) => action.kind === "guard_protect");
+    if (!pending || pending.kind !== "guard_protect") throw new Error("expected guard pending action");
+
+    state = applyCommand(state, {
+      type: "SubmitNightAction",
+      seatId: pending.seatId,
+      action: "guard_protect",
+      targetId: "skip",
+      privateReason: "测试守卫空守。"
+    });
+
+    const guardEvent = state.events.find((event) => event.type === "NightActionSubmitted" && event.seatId === pending.seatId);
+    expect(state.round.night?.protectedTarget).toBeUndefined();
+    expect(state.phase.type).toBe("night_wolves");
+    expect(guardEvent?.payload).toMatchObject({ action: "guard_protect" });
+    expect((guardEvent?.payload as { targetId?: string } | undefined)?.targetId).toBeUndefined();
+  });
+
+  it("kills the wolf target when guard protection and witch save hit the same target", () => {
+    let state = createGame({
+      totalPlayers: 10,
+      humanPlayers: 0,
+      aiPlayers: 10,
+      seed: "guard-witch-clash",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const guardPending = state.pendingActions.find((action) => action.kind === "guard_protect");
+    if (!guardPending || guardPending.kind !== "guard_protect") throw new Error("expected guard pending action");
+    const targetId = state.players.find((player) => player.alive && player.id !== guardPending.seatId && player.role !== "witch")?.id ?? guardPending.legalTargets[0];
+    const witch = state.players.find((player) => player.role === "witch");
+    if (!targetId || !witch) throw new Error("expected guard target and witch");
+
+    state = applyCommand(state, {
+      type: "SubmitNightAction",
+      seatId: guardPending.seatId,
+      action: "guard_protect",
+      targetId,
+      privateReason: "测试守卫守护刀口。"
+    });
+    state.round.night!.wolfTarget = targetId;
+    state.phase = { type: "night_witch", day: 0, label: "夜晚 0 · 女巫行动", actingSeatId: witch.id };
+    state.pendingActions = [
+      {
+        kind: "witch_action",
+        seatId: witch.id,
+        wolfTarget: targetId,
+        canSave: true,
+        canPoison: false,
+        legalTargets: state.players.filter((player) => player.alive && player.id !== witch.id).map((player) => player.id)
+      }
+    ];
+
+    state = applyCommand(state, {
+      type: "SubmitWitchAction",
+      seatId: witch.id,
+      save: true,
+      privateReason: "测试女巫解药同救刀口。"
+    });
+
+    expect(STANDARD_PRESET.witchRules.guardSaveSameTargetDies).toBe(true);
+    expect(state.players.find((player) => player.id === targetId)?.alive).toBe(false);
+    expect(state.round.lastDeaths).toContain(targetId);
+  });
+
+  it("does not give last words to the player killed by a hunter shot", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "hunter-shot-last-words",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const hunter = state.players[0];
+    const targetSheriff = state.players[1];
+    const badgeRecipient = state.players[2];
+    hunter.role = "hunter";
+    targetSheriff.role = "villager";
+    targetSheriff.isSheriff = true;
+    state.sheriffSeatId = targetSheriff.id;
+    state.day = 1;
+    hunter.alive = false;
+    hunter.death = { day: 1, phase: "day_vote", reason: "exile" };
+    state.round.lastDeaths = [hunter.id];
+    state.round.hunterReturn = "after_day";
+    state.resources[hunter.id].hunterCanShoot = true;
+    state.phase = { type: "hunter_shot", day: 1, label: "猎人开枪", actingSeatId: hunter.id };
+    state.pendingActions = [{ kind: "hunter_shot", seatId: hunter.id, legalTargets: [targetSheriff.id, badgeRecipient.id], canSkip: true }];
+
+    state = applyCommand(state, {
+      type: "SubmitHunterShot",
+      seatId: hunter.id,
+      targetId: targetSheriff.id,
+      privateReason: "测试猎人带走警长。"
+    });
+    expect(state.phase.type).toBe("badge_decision");
+
+    state = applyCommand(state, {
+      type: "SubmitBadgeDecision",
+      seatId: targetSheriff.id,
+      targetId: badgeRecipient.id,
+      privateReason: "测试警徽移交。"
+    });
+
+    expect(state.phase.type).toBe("last_words");
+    expect(state.pendingActions[0]).toMatchObject({ kind: "speech", seatId: hunter.id, speechType: "last_words" });
+    expect(state.pendingActions[0]?.seatId).not.toBe(targetSheriff.id);
   });
 
   it("rejects illegal command targets instead of silently replacing them", () => {
@@ -828,6 +1040,64 @@ describe("werewolf engine", () => {
     expect(state.sheriffSeatId).toBe(candidates[1]);
     expect(state.events.some((event) => event.type === "SheriffCandidateWithdrawn" && event.seatId === candidates[0])).toBe(true);
     expect(state.events.some((event) => event.type === "SheriffElected" && (event.payload as { sheriffId?: string }).sheriffId === candidates[1])).toBe(true);
+  });
+
+  it("does not let withdrawn sheriff candidates vote for sheriff", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "sheriff-withdraw-no-vote",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+
+    for (let index = 0; index < 20 && state.phase.type !== "sheriff_candidacy"; index += 1) {
+      state = applyMockStep(state);
+    }
+    expect(state.phase.type).toBe("sheriff_candidacy");
+
+    const aliveIds = state.players.filter((player) => player.alive).map((player) => player.id);
+    const candidates = aliveIds.slice(0, 3);
+    const withdrawnId = candidates[0];
+    for (const seatId of aliveIds) {
+      state = applyCommand(state, {
+        type: "SubmitSheriffCandidacy",
+        seatId,
+        runForSheriff: candidates.includes(seatId),
+        publicSpeech: candidates.includes(seatId) ? "我上警争警徽。" : "我警下投票。",
+        privateReason: "测试警长竞选。"
+      });
+    }
+
+    expect(state.phase.type).toBe("sheriff_speech");
+    state = applyCommand(state, { type: "WithdrawSheriffCandidacy", seatId: withdrawnId, privateReason: "测试退水后无警长投票权。" });
+
+    for (let guard = 0; guard < 8 && state.phase.type === "sheriff_speech"; guard += 1) {
+      const pending = state.pendingActions[0];
+      if (!pending || pending.kind !== "speech") throw new Error("expected sheriff speech pending action");
+      state = applyCommand(state, {
+        type: "SubmitSpeech",
+        seatId: pending.seatId,
+        text: "我继续留警，进入警下投票。",
+        privateReason: "测试完成警上发言。"
+      });
+    }
+    for (let guard = 0; guard < 8 && state.phase.type === "sheriff_withdrawal"; guard += 1) {
+      const pending = state.pendingActions[0];
+      if (!pending || pending.kind !== "sheriff_withdrawal") throw new Error("expected withdrawal pending action");
+      state = applyCommand(state, {
+        type: "SubmitSheriffWithdrawalDecision",
+        seatId: pending.seatId,
+        withdraw: false,
+        privateReason: "测试继续留警。"
+      });
+    }
+
+    expect(state.phase.type).toBe("sheriff_vote");
+    expect(state.players.find((player) => player.id === withdrawnId)?.hasWithdrawnSheriff).toBe(true);
+    expect(state.pendingActions.some((action) => action.seatId === withdrawnId)).toBe(false);
+    expect(state.pendingActions.every((action) => action.kind === "vote" && !action.legalTargets.includes(withdrawnId))).toBe(true);
   });
 
   it("lets a dead sheriff pass the badge before the game continues", () => {

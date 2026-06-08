@@ -194,7 +194,7 @@ export interface GameState {
 }
 
 export type GameCommand =
-  | { type: "SubmitNightAction"; seatId: PlayerId; action: "guard_protect" | "seer_check"; targetId: PlayerId; privateReason?: string }
+  | { type: "SubmitNightAction"; seatId: PlayerId; action: "guard_protect" | "seer_check"; targetId: PlayerId | "skip"; privateReason?: string }
   | {
       type: "SubmitWitchAction";
       seatId: PlayerId;
@@ -423,7 +423,7 @@ export function createMockDecision(state: GameState): MockDecision | undefined {
     case "wolf_discussion": {
       const proposedTargetId = chooseWolfTarget(state, action.legalTargets);
       const agree = !action.currentProposal || action.currentProposal === proposedTargetId || action.round >= 2;
-      const messageToWolves = `我建议刀${formatSeat(state, proposedTargetId)}，这个位置白天信息量偏高，留着容易带队。`;
+      const messageToWolves = buildMockWolfDiscussionMessage(state, player.id, proposedTargetId, Boolean(action.currentProposal), agree, action.round);
       return {
         command: {
           type: "SubmitWolfDiscussionMessage",
@@ -1113,11 +1113,11 @@ function handleNightAction(
 ): void {
   const pending = findPending(state, command.seatId, command.action);
   if (!pending) return;
-  const targetId = ensureLegalTarget(command.targetId, pending.legalTargets);
   const night = requireNight(state);
   const actor = requirePlayer(state, command.seatId);
 
   if (command.action === "guard_protect") {
+    const targetId = command.targetId === "skip" ? undefined : ensureLegalTarget(command.targetId, pending.legalTargets);
     night.protectedTarget = targetId;
     actor.hasActed = true;
     pushEvent(
@@ -1145,6 +1145,10 @@ function handleNightAction(
     return;
   }
 
+  if (command.targetId === "skip") {
+    throw new Error("预言家查验不能跳过目标。");
+  }
+  const targetId = ensureLegalTarget(command.targetId, pending.legalTargets);
   night.seerCheck = {
     seerId: command.seatId,
     targetId,
@@ -1501,7 +1505,7 @@ function resolveSheriffWithdrawalRound(state: GameState, voteType: "sheriff" | "
 
 function enterSheriffVote(state: GameState, voteType: "sheriff" | "sheriff_pk", candidates: PlayerId[]): void {
   const eligible = alivePlayers(state)
-    .filter((player) => !candidates.includes(player.id))
+    .filter((player) => !candidates.includes(player.id) && !player.hasWithdrawnSheriff)
     .map((player) => player.id);
   if (eligible.length === 0) {
     electSheriff(state, chooseDeterministic(state, candidates, "sheriff-no-voters"), "无警下投票者，按种子随机当选");
@@ -1867,7 +1871,7 @@ function handleHunterShot(state: GameState, command: Extract<GameCommand, { type
       state,
       pendingBadgeSeatId,
       state.round.hunterReturn === "last_words" ? "after_hunter_last_words" : "after_hunter_day",
-      shotDeathId ? [shotDeathId] : []
+      state.round.hunterReturn === "after_day" ? [command.seatId] : shotDeathId ? [shotDeathId] : []
     );
     return;
   }
@@ -2200,7 +2204,34 @@ function chooseGuardTarget(state: GameState, legalTargets: PlayerId[]): PlayerId
 }
 
 function chooseWolfTarget(state: GameState, legalTargets: PlayerId[]): PlayerId {
-  return choosePublicAttentionTarget(state, legalTargets, "wolf-target") ?? legalTargets[0];
+  const nonWolfTargets = legalTargets.filter((id) => getPlayer(state, id)?.role !== "werewolf");
+  const candidates = nonWolfTargets.length > 0 ? nonWolfTargets : legalTargets;
+  return choosePublicAttentionTarget(state, candidates, "wolf-target") ?? candidates[0];
+}
+
+function buildMockWolfDiscussionMessage(
+  state: GameState,
+  actorId: PlayerId,
+  proposedTargetId: PlayerId,
+  hasCurrentProposal: boolean,
+  agreeCurrentProposal: boolean,
+  round: number
+): string {
+  const target = formatSeat(state, proposedTargetId);
+  const actor = requirePlayer(state, actorId);
+  const prefix = `${actor.seatNumber}号视角`;
+  const variants = hasCurrentProposal && agreeCurrentProposal
+    ? [
+        `${prefix}跟${target}这个刀口，先统一目标别分票，明天我会按警上站边继续伪装。`,
+        `${prefix}同意刀${target}，理由是这个位置容易带队，先把狼队口径统一住。`,
+        `${prefix}同意压${target}，夜里先别改来改去，白天我会把理由包装成警徽流和发言压力。`
+      ]
+    : [
+        `${prefix}先提${target}，这个位置更像能带节奏的好人，刀掉后白天更好控场。`,
+        `${prefix}想改刀${target}，他留着容易把信息盘清楚，明天我们可以分开站边。`,
+        `${prefix}认为${target}优先级更高，刀这里比乱碰低信息位收益大，白天我负责找理由转移焦点。`
+      ];
+  return variants[(actor.seatNumber + round) % variants.length];
 }
 
 function chooseSeerTarget(state: GameState, seerId: PlayerId, legalTargets: PlayerId[]): PlayerId {
@@ -2253,6 +2284,9 @@ function shouldRunForSheriff(state: GameState, seatId: PlayerId, persona: (typeo
   const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${seatId}:sheriff-candidacy`);
   if (player.role === "seer") return rng() < 0.9;
   if (player.role === "werewolf") {
+    const wolfPlan = extractWolfSheriffPlan(state);
+    if (wolfPlan.stayDownIds.has(seatId) && !wolfPlan.runnerIds.has(seatId)) return false;
+    if (wolfPlan.runnerIds.has(seatId)) return true;
     const aliveWolves = alivePlayers(state)
       .filter((item) => item.role === "werewolf")
       .map((item) => item.id);
@@ -2270,6 +2304,75 @@ function shouldRunForSheriff(state: GameState, seatId: PlayerId, persona: (typeo
   };
   const style = (persona.aggression + persona.voteIndependence - persona.conservatism) / 300;
   return rng() < Math.max(0.04, roleBase[player.role] + style * 0.18);
+}
+
+function extractWolfSheriffPlan(state: GameState): { runnerIds: Set<PlayerId>; stayDownIds: Set<PlayerId> } {
+  const wolfIds = new Set(state.players.filter((item) => item.role === "werewolf").map((item) => item.id));
+  const runnerIds = new Set<PlayerId>();
+  const stayDownIds = new Set<PlayerId>();
+  const teamStayRules: Array<{ runnerId?: PlayerId }> = [];
+
+  for (const event of state.events) {
+    if (event.type !== "WolfDiscussionMessage" || !event.seatId || !wolfIds.has(event.seatId) || !isRecord(event.payload)) continue;
+    const text = typeof event.payload.messageToWolves === "string" ? event.payload.messageToWolves : "";
+    if (!text || !/(上警|警下|悍跳|起跳|预言家|警徽|倒钩|冲票)/.test(text)) continue;
+    for (const sentence of text.split(/[。！？；;\n]+/).map((item) => item.trim()).filter(Boolean)) {
+      const actorStayDown =
+        /(?:我|自己)(?:明天|今天)?(?:不上警|不去上警|不竞选|不上)/.test(sentence) ||
+        /(?:我|自己).{0,6}(?:留在|待在|站在|在)?警下(?:投票|投|冲票|倒钩|保票|支持|待着)?/.test(sentence);
+      const actorRun =
+        !actorStayDown &&
+        !/(?:我同意|我支持|我赞成|我认可|我觉得|我认为|我建议).{0,12}\d+\s*号/.test(sentence) &&
+        (/(?:我|自己).{0,10}(?:来上|去上警|上警|抢警徽|拿警徽)/.test(sentence) ||
+          /(?:我来|我去|我负责|我选择|我准备|我打算).{0,24}(?:悍跳|起跳|跳预言家|跳警|上警)/.test(sentence));
+      if (actorRun) {
+        runnerIds.add(event.seatId);
+      }
+      if (actorStayDown) stayDownIds.add(event.seatId);
+
+      for (const runnerId of extractPlanSeatIds(state, sentence, /(\d+)\s*号.{0,16}(?:来上|去上警|上警|悍跳|起跳|跳预言家|跳警|抢警徽|拿警徽)/g)) {
+        if (wolfIds.has(runnerId)) runnerIds.add(runnerId);
+      }
+      for (const stayDownId of extractPlanSeatIds(state, sentence, /(\d+)\s*号.{0,16}(?:不上警|不去上警|不竞选|警下(?:投票|冲票|倒钩|保票)|留在警下|待在警下)/g)) {
+        if (wolfIds.has(stayDownId)) stayDownIds.add(stayDownId);
+      }
+
+      const voteRunnerId = extractPlanVoteRunnerId(state, sentence, event.seatId);
+      if (voteRunnerId && wolfIds.has(voteRunnerId)) runnerIds.add(voteRunnerId);
+      const teamStayDown =
+        /(?:你们|大家|其他队友|其余队友).{0,12}(?:都)?(?:别|不要|不用).{0,4}上警/.test(sentence) ||
+        /(?:大家|你们|其他队友|其余队友|我们(?:三|四|几个)?个).{0,12}警下.{0,10}(?:投|支持|冲票|保票)/.test(sentence);
+      if (teamStayDown) teamStayRules.push({ runnerId: voteRunnerId ?? (actorRun ? event.seatId : undefined) });
+    }
+  }
+
+  for (const rule of teamStayRules) {
+    const runnerId = rule.runnerId ?? (runnerIds.size === 1 ? [...runnerIds][0] : undefined);
+    if (!runnerId) continue;
+    for (const wolfId of wolfIds) {
+      if (wolfId !== runnerId) stayDownIds.add(wolfId);
+    }
+  }
+
+  return { runnerIds, stayDownIds };
+}
+
+function extractPlanSeatIds(state: GameState, text: string, pattern: RegExp): PlayerId[] {
+  const ids: PlayerId[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    const seatNumber = Number(match[1]);
+    const player = state.players.find((item) => item.seatNumber === seatNumber);
+    if (player) ids.push(player.id);
+  }
+  return ids;
+}
+
+function extractPlanVoteRunnerId(state: GameState, sentence: string, actorId: PlayerId): PlayerId | undefined {
+  if (/(?:投我|支持我|给我|冲我)/.test(sentence) && /(?:警下|投票|冲票|支持|保票)/.test(sentence)) return actorId;
+  const match = /(?:警下|投票|冲票|支持|保票).{0,12}(?:投|支持|给|冲)?\s*(\d+)\s*号/.exec(sentence);
+  if (!match) return undefined;
+  return state.players.find((item) => item.seatNumber === Number(match[1]))?.id;
 }
 
 function shouldWithdrawBeforeSheriffVote(

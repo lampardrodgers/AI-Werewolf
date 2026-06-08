@@ -141,7 +141,7 @@ describe("LLM gateway", () => {
     expect(body.response_format?.json_schema?.schema).toMatchObject({ type: "object" });
   });
 
-  it("uses JSON object response_format for DeepSeek object requests", async () => {
+  it("uses JSON object response_format for DeepSeek object requests with enabled default thinking", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     vi.stubGlobal(
       "fetch",
@@ -163,7 +163,9 @@ describe("LLM gateway", () => {
       type: "openai_compatible",
       baseUrl: "https://api.deepseek.com",
       defaultModel: "deepseek-v4-flash",
-      supportsJsonSchema: false
+      supportsJsonSchema: false,
+      supportsReasoningEffort: false,
+      thinkingMode: undefined
     };
 
     const adapter = createProviderAdapter(provider);
@@ -172,6 +174,7 @@ describe("LLM gateway", () => {
       model: "deepseek-v4-flash",
       prompt: "Return JSON.",
       apiKey: "test-secret",
+      reasoningEffort: "high",
       schema: { type: "object", properties: { ok: { type: "boolean" } } }
     });
 
@@ -179,17 +182,19 @@ describe("LLM gateway", () => {
       messages?: Array<{ content?: string }>;
       response_format?: { type?: string; json_schema?: unknown };
       thinking?: { type?: string };
+      reasoning_effort?: string;
     };
     expect(calls[0].url).toBe("https://api.deepseek.com/chat/completions");
     expect(body.response_format?.type).toBe("json_object");
     expect(body.response_format?.json_schema).toBeUndefined();
-    expect(body.thinking?.type).toBe("disabled");
+    expect(body.thinking?.type).toBe("enabled");
+    expect(body.reasoning_effort).toBe("high");
     expect(body.messages?.[0]?.content).toContain("Return JSON.");
     expect(body.messages?.[0]?.content).toContain("JSON/json");
     expect(body.messages?.[0]?.content).toContain("Schema:");
   });
 
-  it("disables DeepSeek thinking mode for text repair requests", async () => {
+  it("uses official DeepSeek thinking disabled mode for text repair requests", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     vi.stubGlobal(
       "fetch",
@@ -211,7 +216,9 @@ describe("LLM gateway", () => {
       type: "openai_compatible",
       baseUrl: "https://api.deepseek.com",
       defaultModel: "deepseek-v4-pro",
-      supportsJsonSchema: false
+      supportsJsonSchema: false,
+      supportsReasoningEffort: false,
+      thinkingMode: "disabled"
     };
 
     const adapter = createProviderAdapter(provider);
@@ -219,11 +226,131 @@ describe("LLM gateway", () => {
       provider,
       model: "deepseek-v4-pro",
       prompt: "Return JSON.",
-      apiKey: "test-secret"
+      apiKey: "test-secret",
+      reasoningEffort: "high"
     });
 
-    const body = JSON.parse(String(calls[0].init.body)) as { thinking?: { type?: string } };
+    const body = JSON.parse(String(calls[0].init.body)) as { thinking?: { type?: string }; reasoning_effort?: string };
     expect(body.thinking?.type).toBe("disabled");
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("passes reasoning effort to DeepSeek when thinking mode is auto", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "ok" } }],
+            usage: { prompt_tokens: 10, completion_tokens: 3 }
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      })
+    );
+    const provider: ProviderAccount = {
+      ...DEFAULT_AI_CONFIG.providers[0],
+      id: "deepseek-provider",
+      name: "DeepSeek",
+      type: "openai_compatible",
+      baseUrl: "https://api.deepseek.com",
+      defaultModel: "deepseek-v4-flash",
+      supportsReasoningEffort: true,
+      thinkingMode: "auto"
+    };
+
+    const adapter = createProviderAdapter(provider);
+    await adapter.generateText({
+      provider,
+      model: "deepseek-v4-flash",
+      prompt: "Return text.",
+      apiKey: "test-secret",
+      reasoningEffort: "low"
+    });
+
+    const body = JSON.parse(String(calls[0].init.body)) as { thinking?: { type?: string }; reasoning_effort?: string };
+    expect(body.thinking).toBeUndefined();
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("passes max reasoning effort to DeepSeek when thinking mode is enabled", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "ok" } }],
+            usage: {
+              prompt_tokens: 10,
+              completion_tokens: 3,
+              prompt_cache_hit_tokens: 4,
+              completion_tokens_details: { reasoning_tokens: 2 }
+            }
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      })
+    );
+    const provider: ProviderAccount = {
+      ...DEFAULT_AI_CONFIG.providers[0],
+      id: "deepseek-provider",
+      name: "DeepSeek",
+      type: "openai_compatible",
+      baseUrl: "https://api.deepseek.com",
+      defaultModel: "deepseek-v4-pro",
+      supportsReasoningEffort: false,
+      thinkingMode: "enabled"
+    };
+
+    const adapter = createProviderAdapter(provider);
+    const response = await adapter.generateText({
+      provider,
+      model: "deepseek-v4-pro",
+      prompt: "Return text.",
+      apiKey: "test-secret",
+      reasoningEffort: "max"
+    });
+
+    const body = JSON.parse(String(calls[0].init.body)) as { thinking?: { type?: string }; reasoning_effort?: string };
+    expect(body.thinking?.type).toBe("enabled");
+    expect(body.reasoning_effort).toBe("max");
+    expect(response.usage.reasoningTokens).toBe(2);
+    expect(response.usage.cachedTokens).toBe(4);
+  });
+
+  it("includes provider error body when chat completions fail", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ error: { message: "Unrecognized request argument supplied: thinking" } }), {
+          status: 400,
+          statusText: "Bad Request",
+          headers: { "Content-Type": "application/json" }
+        })
+      )
+    );
+    const provider: ProviderAccount = {
+      ...DEFAULT_AI_CONFIG.providers[0],
+      id: "compatible-provider",
+      name: "Compatible",
+      type: "openai_compatible",
+      baseUrl: "https://example.test/v1",
+      defaultModel: "compatible-model"
+    };
+
+    const adapter = createProviderAdapter(provider);
+    await expect(
+      adapter.generateText({
+        provider,
+        model: "compatible-model",
+        prompt: "Return text.",
+        apiKey: "test-secret"
+      })
+    ).rejects.toThrow("Unrecognized request argument supplied: thinking");
   });
 
   it("parses JSON from reasoning content when chat content is empty", async () => {

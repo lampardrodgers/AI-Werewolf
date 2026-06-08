@@ -15,6 +15,7 @@ import {
   Shield,
   Skull,
   StepForward,
+  Sun,
   Upload,
   Vote
 } from "lucide-react";
@@ -52,8 +53,10 @@ import {
   ProviderAccount,
   ProviderType,
   ROLE_DEFINITIONS,
+  ReasoningEffort,
   RoleId,
-  STANDARD_PRESET
+  STANDARD_PRESET,
+  ThinkingMode
 } from "@langrensha/shared";
 import { AIDecisionStatus, loadAIConfig, loadAIDecisionStatus, requestAIDecision, saveAIConfig, testProvider } from "./api";
 
@@ -67,6 +70,16 @@ type ReadableOutputPause = {
   seatId: PlayerId;
   phaseLabel: string;
   publicText: string;
+  outputLabel?: string;
+  progressLabel?: string;
+  doneLabel?: string;
+};
+type AIDecisionResult = Awaited<ReturnType<typeof requestAIDecision>>;
+type ParallelAIDecisionResult = {
+  pending: PendingAction;
+  requestId: string;
+  result?: AIDecisionResult;
+  error?: string;
 };
 
 const AUTO_STEP_DELAY_MS = 700;
@@ -149,7 +162,9 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     supportsToolCall: true,
     supportsStreaming: true,
     supportsReasoningEffort: true,
-    supportsModelList: true
+    supportsModelList: true,
+    reasoningEffort: "medium",
+    thinkingMode: "auto"
   },
   openai_compatible: {
     name: "OpenAI Compatible",
@@ -165,7 +180,9 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     supportsToolCall: false,
     supportsStreaming: false,
     supportsReasoningEffort: false,
-    supportsModelList: true
+    supportsModelList: true,
+    reasoningEffort: "medium",
+    thinkingMode: "disabled"
   },
   anthropic: {
     name: "Anthropic",
@@ -181,7 +198,9 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     supportsToolCall: true,
     supportsStreaming: true,
     supportsReasoningEffort: false,
-    supportsModelList: true
+    supportsModelList: true,
+    reasoningEffort: "medium",
+    thinkingMode: "auto"
   },
   gemini: {
     name: "Gemini",
@@ -197,7 +216,9 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     supportsToolCall: true,
     supportsStreaming: true,
     supportsReasoningEffort: false,
-    supportsModelList: true
+    supportsModelList: true,
+    reasoningEffort: "medium",
+    thinkingMode: "auto"
   },
   xai: {
     name: "xAI",
@@ -213,7 +234,9 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     supportsToolCall: true,
     supportsStreaming: true,
     supportsReasoningEffort: false,
-    supportsModelList: true
+    supportsModelList: true,
+    reasoningEffort: "medium",
+    thinkingMode: "auto"
   },
   codex_cli_local: {
     name: "Codex Local",
@@ -229,9 +252,30 @@ const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKe
     supportsToolCall: false,
     supportsStreaming: false,
     supportsReasoningEffort: false,
-    supportsModelList: false
+    supportsModelList: false,
+    reasoningEffort: "medium",
+    thinkingMode: "disabled"
   }
 };
+
+const REASONING_EFFORT_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
+  { value: "minimal", label: "minimal" },
+  { value: "low", label: "low" },
+  { value: "medium", label: "medium" },
+  { value: "high", label: "high" },
+  { value: "max", label: "max" }
+];
+
+const DEEPSEEK_REASONING_EFFORT_OPTIONS: Array<{ value: ReasoningEffort; label: string }> = [
+  { value: "high", label: "high" },
+  { value: "max", label: "max" }
+];
+
+const THINKING_MODE_OPTIONS: Array<{ value: ThinkingMode; label: string }> = [
+  { value: "auto", label: "auto" },
+  { value: "enabled", label: "enabled" },
+  { value: "disabled", label: "disabled" },
+];
 
 export function App(): JSX.Element {
   const [setup, setSetup] = useState<GameSetup>(() => createDefaultSetup());
@@ -243,6 +287,8 @@ export function App(): JSX.Element {
   const [adminSection, setAdminSection] = useState<AdminSection>("ai");
   const [speechText, setSpeechText] = useState("");
   const [selectedTarget, setSelectedTarget] = useState<PlayerId | "abstain" | "skip" | "destroy">("abstain");
+  const [witchSave, setWitchSave] = useState(false);
+  const [witchPoisonTarget, setWitchPoisonTarget] = useState<PlayerId | "skip">("skip");
   const [wolfAgree, setWolfAgree] = useState(true);
   const [sheriffRun, setSheriffRun] = useState(false);
   const [config, setConfig] = useState<AIConfigStore>(DEFAULT_AI_CONFIG);
@@ -257,11 +303,12 @@ export function App(): JSX.Element {
   const [aiProgress, setAiProgress] = useState<AIDecisionStatus | null>(null);
   const [aiStepStatus, setAiStepStatus] = useState("等待玩家行动。");
   const [streamingSpeech, setStreamingSpeech] = useState("");
-  const [streamingSpeechSeatId, setStreamingSpeechSeatId] = useState<PlayerId | undefined>();
   const [readableOutputPause, setReadableOutputPause] = useState<ReadableOutputPause | null>(null);
   const [batchResult, setBatchResult] = useState<MockBatchRunResult | null>(null);
   const [debugStatus, setDebugStatus] = useState("");
   const streamingTimerRef = useRef<number | undefined>();
+  const aiInFlightRef = useRef<string | null>(null);
+  const gameRef = useRef<GameState | null>(null);
 
   const humanPlayerId = useMemo(() => game?.players.find((player) => player.controller === "human")?.id, [game]);
   const publicGame = useMemo(() => (game ? toPublicViewState(game) : null), [game]);
@@ -292,6 +339,15 @@ export function App(): JSX.Element {
       })
       .catch((error) => setConfigStatus(error instanceof Error ? error.message : "读取配置失败"));
   }, []);
+
+  useEffect(() => {
+    gameRef.current = game;
+  }, [game]);
+
+  function commitGame(next: GameState | null): void {
+    gameRef.current = next;
+    setGame(next);
+  }
 
   useEffect(() => {
     if (!autoRun || isPaused || !game || game.status === "ended") return undefined;
@@ -329,18 +385,21 @@ export function App(): JSX.Element {
     const legal = legalTargetsFor(humanPending);
     setSelectedTarget(defaultTargetFor(humanPending, legal, game?.rulePreset.voteRules.allowAbstain ?? true));
     setSpeechText(defaultSpeechFor(humanPending));
+    setWitchSave(false);
+    setWitchPoisonTarget("skip");
     setSheriffRun(humanPending.kind === "sheriff_withdrawal");
     setWolfAgree(true);
   }, [game?.rulePreset.voteRules.allowAbstain, humanPending?.kind, humanPending?.seatId, humanPending && "round" in humanPending ? humanPending.round : undefined]);
 
   function startGame(): void {
+    aiInFlightRef.current = null;
     const normalized: GameSetup = {
       ...setup,
       aiPlayers: setup.totalPlayers - setup.humanPlayers,
       seed: setup.seed.trim() || createRandomSeed()
     };
     setSetup(normalized);
-    setGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
+    commitGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
     setBatchResult(null);
     setIsPaused(false);
     setAutoRun(true);
@@ -353,6 +412,7 @@ export function App(): JSX.Element {
   }
 
   function restartGame(): void {
+    aiInFlightRef.current = null;
     setIsPaused(false);
     setAutoRun(true);
     const normalized: GameSetup = {
@@ -360,7 +420,7 @@ export function App(): JSX.Element {
       aiPlayers: setup.totalPlayers - setup.humanPlayers,
       seed: setup.seed.trim() || createRandomSeed()
     };
-    setGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
+    commitGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
     clearStreamingOutput();
     setReadableOutputPause(null);
     setAiProgress(null);
@@ -371,20 +431,35 @@ export function App(): JSX.Element {
   }
 
   async function stepAI(): Promise<void> {
-    if (!game || game.status === "ended" || aiBusy) return;
+    if (!game || game.status === "ended" || aiBusy || aiInFlightRef.current) return;
+    const parallelPending = parallelAIPendingActions(game);
+    if (parallelPending.length >= 2) {
+      await stepAIParallel(parallelPending);
+      return;
+    }
     const pending = game.pendingActions.find((action) => game.players.find((player) => player.id === action.seatId)?.controller !== "human");
     if (!pending) {
       setAiStepStatus("当前没有 AI 待处理动作。");
       return;
     }
+    const actionKey = aiPendingKey(game, pending);
+    aiInFlightRef.current = actionKey;
     if (aiMode === "mock") {
-      const next = applyMockStep(game);
-      setGame(next);
-      setAiStepStatus(`${seatName(game, pending.seatId)} 已完成 ${pendingLabel(pending)}。`);
-      clearStreamingOutput();
-      const publicText = officialOutputForPending(next, pending, humanPlayerId);
-      if (publicText) streamOfficialOutput(publicText, pending.seatId);
-      pauseAfterReadableAIOutput(pending, publicText, next, game.phase.label);
+      try {
+        const next = applyMockStep(game);
+        commitGame(next);
+        setAiStepStatus(`${seatName(game, pending.seatId)} 已完成 ${pendingLabel(pending)}。`);
+        clearStreamingOutput();
+        const publicText = officialOutputForPending(next, pending, humanPlayerId);
+        if (publicText) streamOfficialOutput(publicText);
+        if (!pauseAfterReadableAIOutput(pending, undefined, publicText, next, game.phase.label)) {
+          pauseAfterTransitionEvents(game, next, game.phase.label);
+        }
+      } finally {
+        window.setTimeout(() => {
+          if (aiInFlightRef.current === actionKey) aiInFlightRef.current = null;
+        }, 0);
+      }
       return;
     }
 
@@ -392,6 +467,7 @@ export function App(): JSX.Element {
     const persona = config.personas.find((item) => item.id === pendingPlayer?.personaId) ?? config.personas[0] ?? DEFAULT_PERSONAS[0];
     const provider = config.providers.find((item) => item.id === persona.defaultProviderId && item.enabled);
     if (provider && !provider.baseUrl.startsWith("mock://") && !providerApiKeys[provider.id]?.trim()) {
+      aiInFlightRef.current = null;
       setAutoRun(false);
       setIsPaused(true);
       setAiStepStatus(`${provider.name} 缺少本机 API Key / Access Token。请在管理控制台填写后继续。`);
@@ -421,6 +497,7 @@ export function App(): JSX.Element {
     }, 1000);
     try {
       const result = await requestAIDecision(game, pending.seatId, requestId, providerApiKeys, effectiveContextCompression);
+      if (aiInFlightRef.current !== actionKey) return;
       if (!result.ok || !result.command) {
         setAiStepStatus(result.error ? `自动处理失败：${result.error}` : "自动处理失败，请稍后重试。");
         return;
@@ -430,56 +507,196 @@ export function App(): JSX.Element {
           if (status) setAiProgress(status);
         })
         .catch(() => undefined);
-      setGame((current) => {
-        if (!current) return current;
-        let next = applyCommand(current, result.command as GameCommand);
-        if (result.memoryUpdate) {
-          next = applyAgentMemoryUpdate(next, pending.seatId, result.memoryUpdate as AgentMemoryUpdate);
-        }
-        if (result.llmCall) next.llmCalls.push(result.llmCall as LLMCallLog);
-        return next;
-      });
-      const publicText = officialOutputForCommand(game, pending, result.command, humanPlayerId);
-      if (publicText) streamOfficialOutput(publicText, pending.seatId);
-      setAiStepStatus(result.fallback ? "真实模型未返回可用动作，已用规则兜底继续。" : `${seatName(game, pending.seatId)} 已完成 ${pendingLabel(pending)}。`);
-      if (result.command) {
-        const nextState = applyCommand(game, result.command as GameCommand);
-        pauseAfterReadableAIOutput(pending, publicText, nextState, game.phase.label);
+      const latestGame = gameRef.current;
+      if (!latestGame || latestGame.id !== game.id) return;
+      const latestPending = findMatchingPending(latestGame, pending);
+      if (!latestPending) {
+        setAiStepStatus(`${seatName(game, pending.seatId)} 的 ${pendingLabel(pending)} 已不再等待，忽略旧 AI 返回。`);
+        return;
+      }
+      let nextState = applyCommand(latestGame, result.command as GameCommand);
+      if (result.memoryUpdate) {
+        nextState = applyAgentMemoryUpdate(nextState, latestPending.seatId, result.memoryUpdate as AgentMemoryUpdate);
+      }
+      if (result.llmCall) nextState.llmCalls.push(result.llmCall as LLMCallLog);
+      commitGame(nextState);
+      const publicText = officialOutputForCommand(latestGame, latestPending, result.command, humanPlayerId);
+      if (publicText) streamOfficialOutput(publicText);
+      setAiStepStatus(
+        result.fallback
+          ? `真实模型未返回可用动作，已用规则兜底继续。${fallbackDetailText(result) ? `原因：${fallbackDetailText(result)}` : ""}`
+          : `${seatName(latestGame, latestPending.seatId)} 已完成 ${pendingLabel(latestPending)}。`
+      );
+      if (!pauseAfterReadableAIOutput(latestPending, result.command as GameCommand, publicText, nextState, latestGame.phase.label)) {
+        pauseAfterTransitionEvents(latestGame, nextState, latestGame.phase.label);
       }
     } catch (error) {
       setAiStepStatus(error instanceof Error ? `自动处理失败：${error.message}` : "自动处理失败，请稍后重试。");
     } finally {
       window.clearInterval(pollTimer);
       setAiBusy(false);
+      if (aiInFlightRef.current === actionKey) aiInFlightRef.current = null;
     }
   }
 
-  function pauseAfterReadableAIOutput(pending: PendingAction, publicText: string, nextState: GameState, phaseLabel: string): void {
-    if (!humanPlayerId) return;
-    const human = nextState.players.find((player) => player.id === humanPlayerId);
-    if (human && !human.alive) return;
+  async function stepAIParallel(pendingBatch: PendingAction[]): Promise<void> {
+    if (!game || game.status === "ended" || aiBusy || aiInFlightRef.current) return;
+    const batchKey = aiPendingBatchKey(game, pendingBatch);
+    const batchLabel = parallelBatchLabel(pendingBatch[0]);
+    aiInFlightRef.current = batchKey;
+    if (aiMode === "mock") {
+      try {
+        let next = game;
+        for (let index = 0; index < pendingBatch.length; index += 1) {
+          next = applyMockStep(next);
+        }
+        commitGame(next);
+        clearStreamingOutput();
+        setAiStepStatus(`${pendingBatch.length} 名 AI 已并行完成${batchLabel}。`);
+        pauseAfterTransitionEvents(game, next, game.phase.label);
+      } finally {
+        window.setTimeout(() => {
+          if (aiInFlightRef.current === batchKey) aiInFlightRef.current = null;
+        }, 0);
+      }
+      return;
+    }
+
+    const missingProvider = firstMissingProviderForBatch(game, pendingBatch, config, providerApiKeys);
+    if (missingProvider) {
+      aiInFlightRef.current = null;
+      setAutoRun(false);
+      setIsPaused(true);
+      setAiStepStatus(`${missingProvider.name} 缺少本机 API Key / Access Token。请在管理控制台填写后继续。`);
+      return;
+    }
+
+    setAiBusy(true);
+    clearStreamingOutput();
+    const snapshot = game;
+    const batchId = `ai_batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const startedAt = new Date().toISOString();
+    setAiProgress({
+      requestId: batchId,
+      status: "provider_request",
+      phase: snapshot.phase.label,
+      message: `${pendingBatch.length} 名 AI 正在并行${batchLabel}。`,
+      startedAt,
+      updatedAt: startedAt
+    });
+    setAiStepStatus(`${pendingBatch.length} 名 AI 正在并行${batchLabel}。`);
+
+    try {
+      const results = await Promise.all(
+        pendingBatch.map(async (pending): Promise<ParallelAIDecisionResult> => {
+          const requestId = `${batchId}_${pending.seatId}`;
+          try {
+            const result = await requestAIDecision(snapshot, pending.seatId, requestId, providerApiKeys, effectiveContextCompression);
+            return { pending, requestId, result };
+          } catch (error) {
+            return { pending, requestId, error: error instanceof Error ? error.message : "AI 决策请求失败" };
+          }
+        })
+      );
+      if (aiInFlightRef.current !== batchKey) return;
+      const successes = results.filter((item) => item.result?.ok && item.result.command);
+      const failures = results.filter((item) => !item.result?.ok || !item.result.command);
+      const latestGame = gameRef.current;
+      if (!latestGame || latestGame.id !== snapshot.id) return;
+      let nextState = latestGame;
+      const appliedSuccesses: ParallelAIDecisionResult[] = [];
+
+      if (successes.length > 0) {
+        for (const item of successes) {
+          const result = item.result;
+          if (!result?.command) continue;
+          const latestPending = findMatchingPending(nextState, item.pending);
+          if (!latestPending) continue;
+          nextState = applyCommand(nextState, result.command as GameCommand);
+          if (result.memoryUpdate) {
+            nextState = applyAgentMemoryUpdate(nextState, latestPending.seatId, result.memoryUpdate as AgentMemoryUpdate);
+          }
+          if (result.llmCall) nextState.llmCalls.push(result.llmCall as LLMCallLog);
+          appliedSuccesses.push(item);
+        }
+        if (appliedSuccesses.length > 0) commitGame(nextState);
+      }
+
+      const fallbackCount = appliedSuccesses.filter((item) => item.result?.fallback).length;
+      const fallbackReason = appliedSuccesses.map((item) => (item.result ? fallbackDetailText(item.result) : "")).find(Boolean);
+      const finishedAt = new Date().toISOString();
+      setAiProgress({
+        requestId: batchId,
+        status: failures.length > 0 ? "failed" : fallbackCount > 0 ? "fallback" : "completed",
+        phase: snapshot.phase.label,
+        message:
+          failures.length > 0
+            ? `${appliedSuccesses.length} 名 AI 已完成，${failures.length} 名失败，已暂停等待处理。`
+            : `${appliedSuccesses.length} 名 AI 已并行完成${batchLabel}${fallbackCount > 0 ? `，其中 ${fallbackCount} 名使用兜底${fallbackReason ? `：${fallbackReason}` : ""}` : ""}。`,
+        startedAt,
+        updatedAt: finishedAt
+      });
+      if (failures.length > 0) {
+        setAutoRun(false);
+        setIsPaused(true);
+        const failedSeats = failures.map((item) => seatName(snapshot, item.pending.seatId)).join("、");
+        const errorText = parallelFailureReason(failures);
+        setAiStepStatus(`${appliedSuccesses.length} 名 AI 已完成${batchLabel}，${failedSeats} 失败，已暂停。${errorText ? `原因：${errorText}` : ""}`);
+      } else {
+        setAiStepStatus(`${appliedSuccesses.length} 名 AI 已并行完成${batchLabel}${fallbackCount > 0 ? `，其中 ${fallbackCount} 名使用兜底${fallbackReason ? `：${fallbackReason}` : ""}` : ""}。`);
+        if (appliedSuccesses.length > 0) {
+          pauseAfterTransitionEvents(latestGame, nextState, latestGame.phase.label);
+        }
+      }
+    } finally {
+      setAiBusy(false);
+      if (aiInFlightRef.current === batchKey) aiInFlightRef.current = null;
+    }
+  }
+
+  function pauseAfterReadableAIOutput(pending: PendingAction, command: GameCommand | undefined, publicText: string, nextState: GameState, phaseLabel: string): boolean {
+    if (!humanPlayerId) return false;
     const hasReadableSpeech = Boolean(publicText) && (pending.kind === "speech" || pending.kind === "wolf_discussion");
-    if (!hasReadableSpeech) return;
-    setReadableOutputPause({ seatId: pending.seatId, phaseLabel, publicText });
+    const hasReadableWithdrawal = Boolean(publicText) && isWithdrawalOutputCommand(command);
+    const hasReadableWithdrawalRound = Boolean(publicText) && pending.kind === "sheriff_withdrawal";
+    const labels = readableOutputPauseLabels(pending, command);
+    const canPause = hasReadableSpeech || hasReadableWithdrawal || hasReadableWithdrawalRound;
+    if (!canPause) return false;
+    setReadableOutputPause({ seatId: pending.seatId, phaseLabel, publicText, ...labels });
     setAutoRun(false);
     setIsPaused(true);
-    setAiStepStatus(`${seatName(nextState, pending.seatId)} 发言结束，点击继续进入下一位。`);
+    setAiStepStatus(`${seatName(nextState, pending.seatId)} ${labels.doneLabel}`);
+    return true;
+  }
+
+  function pauseAfterTransitionEvents(previous: GameState, nextState: GameState, phaseLabel: string): boolean {
+    if (!humanPlayerId) return false;
+    const notice = transitionNoticeForNewEvents(previous, nextState, humanPlayerId);
+    if (!notice) return false;
+    clearStreamingOutput();
+    setReadableOutputPause({ phaseLabel, ...notice });
+    setAutoRun(false);
+    setIsPaused(true);
+    setAiStepStatus(notice.doneLabel ?? "事件已结算，点击继续进入下一步。");
+    return true;
   }
 
   function submitHumanAction(): void {
-    if (!game || !humanPending) return;
-    const command = buildHumanCommand(game, humanPending, selectedTarget, speechText, wolfAgree, sheriffRun);
+    const currentGame = gameRef.current ?? game;
+    const currentHumanPending = currentGame?.pendingActions.find((action) => currentGame.players.find((player) => player.id === action.seatId)?.controller === "human");
+    if (!currentGame || !currentHumanPending || (readableOutputPause && isPaused)) return;
+    const command = buildHumanCommand(currentGame, currentHumanPending, selectedTarget, speechText, witchSave, witchPoisonTarget, wolfAgree, sheriffRun);
     if (!command) return;
-    const next = applyCommand(game, command);
-    setGame(next);
-    const publicText = officialOutputForCommand(game, humanPending, command, humanPlayerId);
-    if (publicText && (humanPending.kind === "speech" || humanPending.kind === "wolf_discussion")) {
-      setReadableOutputPause({ seatId: humanPending.seatId, phaseLabel: game.phase.label, publicText });
-      setAutoRun(false);
-      setIsPaused(true);
-      setAiStepStatus(`${seatName(game, humanPending.seatId)} 发言结束，点击继续进入下一位。`);
-    } else {
-      setReadableOutputPause(null);
+    const next = applyCommand(currentGame, command);
+    commitGame(next);
+    clearStreamingOutput();
+    setReadableOutputPause(null);
+    const skipTransitionNotice = currentHumanPending.kind === "speech" || currentHumanPending.kind === "wolf_discussion";
+    const pausedForNotice = skipTransitionNotice ? false : pauseAfterTransitionEvents(currentGame, next, currentGame.phase.label);
+    if (!pausedForNotice) {
+      setIsPaused(false);
+      setAutoRun(true);
+      setAiStepStatus(`${seatName(currentGame, currentHumanPending.seatId)} 已提交 ${pendingLabel(currentHumanPending)}，自动流程继续。`);
     }
   }
 
@@ -487,10 +704,14 @@ export function App(): JSX.Element {
     if (!game || !humanPlayerId || !canWithdrawSheriff(game, humanPlayerId)) return;
     const pending = game.pendingActions.find((action) => action.seatId === humanPlayerId);
     if (pending?.kind === "sheriff_withdrawal") {
-      setGame(applyCommand(game, { type: "SubmitSheriffWithdrawalDecision", seatId: humanPlayerId, withdraw: true, privateReason: "真人投票前退水。" }));
+      const next = applyCommand(game, { type: "SubmitSheriffWithdrawalDecision", seatId: humanPlayerId, withdraw: true, privateReason: "真人投票前退水。" });
+      commitGame(next);
+      pauseAfterTransitionEvents(game, next, game.phase.label);
       return;
     }
-    setGame(applyCommand(game, { type: "WithdrawSheriffCandidacy", seatId: humanPlayerId, privateReason: "真人警上退水。" }));
+    const next = applyCommand(game, { type: "WithdrawSheriffCandidacy", seatId: humanPlayerId, privateReason: "真人警上退水。" });
+    commitGame(next);
+    pauseAfterTransitionEvents(game, next, game.phase.label);
   }
 
   function submitWolfSelfExplosion(): void {
@@ -500,7 +721,7 @@ export function App(): JSX.Element {
       seatId: humanPlayerId,
       privateReason: "真人狼人选择自爆，结束当前回合并直接进入夜晚。"
     });
-    setGame(next);
+    commitGame(next);
     setAutoRun(true);
     setIsPaused(false);
     clearStreamingOutput();
@@ -533,8 +754,9 @@ export function App(): JSX.Element {
     const file = input.files?.[0];
     if (!file) return;
     try {
+      aiInFlightRef.current = null;
       const restored = restoreSnapshotFixture(JSON.parse(await file.text()));
-      setGame(restored);
+      commitGame(restored);
       setSetup(restored.setup);
       setAutoRun(true);
       setBatchResult(null);
@@ -554,15 +776,17 @@ export function App(): JSX.Element {
   }
 
   function forceKillPlayer(seatId: PlayerId): void {
-    setGame((current) =>
-      current
+    setGame((current) => {
+      const next = current
         ? applyCommand(current, {
             type: "DebugForceKill",
             seatId,
             reason: "手动调试强制死亡。"
           })
-        : current
-    );
+        : current;
+      gameRef.current = next;
+      return next;
+    });
   }
 
   function runMockBatchFromCurrentSetup(): void {
@@ -587,13 +811,11 @@ export function App(): JSX.Element {
       streamingTimerRef.current = undefined;
     }
     setStreamingSpeech("");
-    setStreamingSpeechSeatId(undefined);
   }
 
-  function streamOfficialOutput(text: string, seatId: PlayerId): void {
+  function streamOfficialOutput(text: string): void {
     let index = 0;
     clearStreamingOutput();
-    setStreamingSpeechSeatId(seatId);
     streamingTimerRef.current = window.setInterval(() => {
       index += 3;
       setStreamingSpeech(text.slice(0, index));
@@ -719,6 +941,8 @@ export function App(): JSX.Element {
         <GameRoom
           game={game}
           visibleEvents={visibleEvents}
+          config={config}
+          aiMode={aiMode}
           sideTab={tab}
           setSideTab={setTab}
           autoRun={autoRun}
@@ -730,12 +954,15 @@ export function App(): JSX.Element {
           contextCompression={effectiveContextCompression}
           onContextCompressionChange={setGameContextCompression}
           streamingSpeech={streamingSpeech}
-          streamingSpeechSeatId={streamingSpeechSeatId}
           readableOutputPause={readableOutputPause}
           humanPlayerId={humanPlayerId}
           humanPending={humanPending}
           selectedTarget={selectedTarget}
           setSelectedTarget={setSelectedTarget}
+          witchSave={witchSave}
+          setWitchSave={setWitchSave}
+          witchPoisonTarget={witchPoisonTarget}
+          setWitchPoisonTarget={setWitchPoisonTarget}
           speechText={speechText}
           setSpeechText={setSpeechText}
           wolfAgree={wolfAgree}
@@ -772,9 +999,10 @@ export function App(): JSX.Element {
           onRestart={restartGame}
           onOpenAdmin={() => setScreen("admin")}
           onNewGame={() => {
+            aiInFlightRef.current = null;
             setAutoRun(false);
             setIsPaused(false);
-            setGame(null);
+            commitGame(null);
             setSetup((current) => ({ ...current, seed: createRandomSeed() }));
             setGameContextCompression(undefined);
             setReadableOutputPause(null);
@@ -1023,6 +1251,25 @@ function isRealProvider(provider: ProviderAccount): boolean {
   return !provider.baseUrl.startsWith("mock://") && provider.type !== "codex_cli_local";
 }
 
+function isDeepSeekProvider(provider: ProviderAccount): boolean {
+  return provider.baseUrl.includes("api.deepseek.com");
+}
+
+function providerSupportsReasoningEffort(provider: ProviderAccount): boolean {
+  return provider.supportsReasoningEffort || isDeepSeekProvider(provider);
+}
+
+function providerThinkingMode(provider: ProviderAccount): ThinkingMode {
+  return provider.thinkingMode ?? (isDeepSeekProvider(provider) ? "enabled" : "auto");
+}
+
+function providerReasoningEffort(provider: ProviderAccount): ReasoningEffort {
+  if (isDeepSeekProvider(provider)) {
+    return provider.reasoningEffort === "max" ? "max" : "high";
+  }
+  return provider.reasoningEffort ?? "medium";
+}
+
 function hasProviderSecret(provider: ProviderAccount, apiKeys: LocalProviderApiKeys): boolean {
   return Boolean(apiKeys[provider.id]?.trim() || provider.apiKeyEncrypted?.trim());
 }
@@ -1076,6 +1323,8 @@ function providerModelOptions(config: AIConfigStore, providerId: string): ModelC
 function GameRoom({
   game,
   visibleEvents,
+  config,
+  aiMode,
   sideTab,
   setSideTab,
   autoRun,
@@ -1087,12 +1336,15 @@ function GameRoom({
   contextCompression,
   onContextCompressionChange,
   streamingSpeech,
-  streamingSpeechSeatId,
   readableOutputPause,
   humanPlayerId,
   humanPending,
   selectedTarget,
   setSelectedTarget,
+  witchSave,
+  setWitchSave,
+  witchPoisonTarget,
+  setWitchPoisonTarget,
   speechText,
   setSpeechText,
   wolfAgree,
@@ -1122,6 +1374,8 @@ function GameRoom({
 }: {
   game: GameState;
   visibleEvents: ReturnType<typeof getVisibleEvents>;
+  config: AIConfigStore;
+  aiMode: "mock" | "llm";
   sideTab: GameSideTab;
   setSideTab: (tab: GameSideTab) => void;
   autoRun: boolean;
@@ -1133,12 +1387,15 @@ function GameRoom({
   contextCompression: ContextCompressionConfig;
   onContextCompressionChange: (config: ContextCompressionConfig) => void;
   streamingSpeech: string;
-  streamingSpeechSeatId?: PlayerId;
   readableOutputPause: ReadableOutputPause | null;
   humanPlayerId?: PlayerId;
   humanPending?: PendingAction;
   selectedTarget: PlayerId | "abstain" | "skip" | "destroy";
   setSelectedTarget: (value: PlayerId | "abstain" | "skip" | "destroy") => void;
+  witchSave: boolean;
+  setWitchSave: (value: boolean) => void;
+  witchPoisonTarget: PlayerId | "skip";
+  setWitchPoisonTarget: (value: PlayerId | "skip") => void;
   speechText: string;
   setSpeechText: (value: string) => void;
   wolfAgree: boolean;
@@ -1171,8 +1428,11 @@ function GameRoom({
   const humanPlayer = humanPlayerId ? game.players.find((player) => player.id === humanPlayerId) : undefined;
   const shouldShowFlowNotices = Boolean(humanPlayer?.alive);
   const isWaitingReadableOutputAck = Boolean(readableOutputPause && isPaused);
+  const interactiveHumanPending = isWaitingReadableOutputAck ? undefined : humanPending;
+  const interactiveCanWithdrawSheriff = isWaitingReadableOutputAck ? false : canWithdrawSheriff;
   const displayPhaseLabel = readableOutputPause && isPaused ? readableOutputPause.phaseLabel : visiblePhaseLabel(game, humanPlayerId);
-  const displayPhaseProgress = readableOutputPause && isPaused ? `${seatName(game, readableOutputPause.seatId)} 已发言` : visiblePhaseProgress(game, humanPlayerId);
+  const displayPhaseProgress =
+    readableOutputPause && isPaused ? `${seatName(game, readableOutputPause.seatId)} ${readableOutputPause.progressLabel ?? "已发言"}` : visiblePhaseProgress(game, humanPlayerId);
   const sheriffNotice = useMemo(() => buildSheriffElectionNotice(game), [game.events.length, game.id]);
   const showSheriffNotice = shouldShowFlowNotices && !isWaitingReadableOutputAck && Boolean(sheriffNotice && sheriffNotice.seq > dismissedNoticeSeq);
   const flowNotice = useMemo(
@@ -1242,18 +1502,19 @@ function GameRoom({
         <SeatPanel game={game} humanPlayerId={humanPlayerId} readableOutputPause={readableOutputPause} onOpenRecords={() => setSideTab("records")} />
         <CenterPanel
           game={game}
+          config={config}
+          aiMode={aiMode}
           visibleEvents={visibleEvents}
           aiBusy={aiBusy}
           aiElapsedSeconds={aiElapsedSeconds}
           aiProgress={aiProgress}
           aiStepStatus={aiStepStatus}
           streamingSpeech={streamingSpeech}
-          streamingSpeechSeatId={streamingSpeechSeatId}
           readableOutputPause={readableOutputPause}
           isPaused={isPaused}
           autoRun={autoRun}
           humanPlayerId={humanPlayerId}
-          humanPending={humanPending}
+          humanPending={interactiveHumanPending}
           onTogglePause={onTogglePause}
         />
         <aside className="right-panel room-side">
@@ -1262,16 +1523,20 @@ function GameRoom({
             <ActionPanel
               game={game}
               visibleEvents={visibleEvents}
-              humanPending={humanPending}
+              humanPending={interactiveHumanPending}
               selectedTarget={selectedTarget}
               setSelectedTarget={setSelectedTarget}
+              witchSave={witchSave}
+              setWitchSave={setWitchSave}
+              witchPoisonTarget={witchPoisonTarget}
+              setWitchPoisonTarget={setWitchPoisonTarget}
               speechText={speechText}
               setSpeechText={setSpeechText}
               wolfAgree={wolfAgree}
               setWolfAgree={setWolfAgree}
               sheriffRun={sheriffRun}
               setSheriffRun={setSheriffRun}
-              canWithdrawSheriff={canWithdrawSheriff}
+              canWithdrawSheriff={interactiveCanWithdrawSheriff}
               onSubmitHuman={onSubmitHuman}
               onWithdrawSheriff={onWithdrawSheriff}
             />
@@ -1298,25 +1563,6 @@ function GameRoom({
           {sideTab === "rules" && <RulesPanel />}
         </aside>
       </div>
-      <footer className="room-dock">
-        <button className="primary-button" onClick={() => setSideTab("chat")}>
-          <FileText size={17} />
-          发言/行动
-        </button>
-        <button className="ghost-button" onClick={() => setSideTab("votes")}>
-          <Vote size={17} />
-          投票
-        </button>
-        <button className="ghost-button" onClick={() => setSideTab("records")}>
-          <FileText size={17} />
-          记录
-        </button>
-        <button className="ghost-button" onClick={() => setSideTab("exposure")}>
-          <Eye size={17} />
-          暴露模式
-        </button>
-        <div className="dock-status">{isPaused ? "AI 自动行动已暂停" : "AI 自动行动已开启"}</div>
-      </footer>
       {activeNotice && humanPlayerId && (
         <div className="notice-backdrop" role="dialog" aria-modal="true" aria-label={activeNotice.kicker}>
           <div className="notice-dialog">
@@ -1445,7 +1691,7 @@ function SeatPanel({
   const steps = ["夜晚行动", "警长竞选", "白天发言", "投票放逐", "游戏结束"];
   const activeStep = game.status === "ended" ? 4 : game.phase.type.startsWith("night") ? 0 : game.phase.type.startsWith("sheriff") ? 1 : game.phase.type.includes("vote") ? 3 : 2;
   const phaseLabel = readableOutputPause ? readableOutputPause.phaseLabel : visiblePhaseLabel(game, humanPlayerId);
-  const phaseProgress = readableOutputPause ? `${seatName(game, readableOutputPause.seatId)} 已发言` : visiblePhaseProgress(game, humanPlayerId);
+  const phaseProgress = readableOutputPause ? `${seatName(game, readableOutputPause.seatId)} ${readableOutputPause.progressLabel ?? "已发言"}` : visiblePhaseProgress(game, humanPlayerId);
   return (
     <aside className="seat-panel room-left">
       <section className="identity-card hero-identity">
@@ -1519,13 +1765,14 @@ function SeatPanel({
 
 function CenterPanel({
   game,
+  config,
+  aiMode,
   visibleEvents,
   aiBusy,
   aiElapsedSeconds,
   aiProgress,
   aiStepStatus,
   streamingSpeech,
-  streamingSpeechSeatId,
   readableOutputPause,
   isPaused,
   autoRun,
@@ -1534,13 +1781,14 @@ function CenterPanel({
   onTogglePause
 }: {
   game: GameState;
+  config: AIConfigStore;
+  aiMode: "mock" | "llm";
   visibleEvents: ReturnType<typeof getVisibleEvents>;
   aiBusy: boolean;
   aiElapsedSeconds: number;
   aiProgress: AIDecisionStatus | null;
   aiStepStatus: string;
   streamingSpeech: string;
-  streamingSpeechSeatId?: PlayerId;
   readableOutputPause: ReadableOutputPause | null;
   isPaused: boolean;
   autoRun: boolean;
@@ -1549,14 +1797,28 @@ function CenterPanel({
   onTogglePause: () => void;
 }): JSX.Element {
   const aiPending = game.pendingActions.find((action) => game.players.find((player) => player.id === action.seatId)?.controller !== "human");
+  const parallelPending = parallelAIPendingActions(game);
+  const parallelSeatIds = new Set(parallelPending.map((action) => action.seatId));
+  const isParallelThinking = aiBusy && parallelPending.length >= 2;
   const visibleActingSeat = visibleActingSeatId(game, humanPlayerId);
-  const displayActingSeat = readableOutputPause && isPaused ? readableOutputPause.seatId : visibleActingSeat;
-  const actingPlayer = displayActingSeat ? game.players.find((player) => player.id === displayActingSeat) : undefined;
+  const displayActingSeat = readableOutputPause && isPaused ? readableOutputPause.seatId : isParallelThinking ? undefined : visibleActingSeat;
   const activePending = displayActingSeat ? game.pendingActions.find((action) => action.seatId === displayActingSeat) : undefined;
   const activePendingExpectsSpeech =
     activePending?.kind === "speech" || activePending?.kind === "wolf_discussion" || activePending?.kind === "sheriff_candidacy";
+  const activePendingWaitingText = activePending ? pendingWaitingText(activePending) : "等待当前玩家发言。";
+  const activePlayer = displayActingSeat ? game.players.find((player) => player.id === displayActingSeat) : undefined;
+  const coreSeatLabel = isParallelThinking ? `${parallelPending.length}名 AI` : activePlayer ? `${activePlayer.seatNumber}号玩家` : "当前流程";
+  const coreActionLabel = isParallelThinking
+    ? "并行思考中"
+    : centerActionLabel(activePlayer, activePending, {
+        aiBusy,
+        autoRun,
+        humanPending,
+        isPaused,
+        readableOutputPause,
+        streamingSpeech
+      });
   const activeStreamingSpeech = streamingSpeech;
-  const streamingSpeakerName = streamingSpeechSeatId ? seatName(game, streamingSpeechSeatId) : "";
   const latestActingSpeech =
     displayActingSeat === undefined || readableOutputPause || activePendingExpectsSpeech
       ? undefined
@@ -1571,59 +1833,50 @@ function CenterPanel({
     readableOutputPause && isPaused
       ? aiStepStatus
       : buildActionStatusText(game, humanPlayerId, humanPending, aiPending, aiBusy, aiElapsedSeconds, aiProgress, isPaused, autoRun, aiStepStatus);
-  const speechLabel = aiBusy
-    ? thinkingLabel(aiProgress, aiElapsedSeconds)
-    : activeStreamingSpeech
-      ? `${streamingSpeakerName || "玩家"}流式输出`
-      : readableOutputPause
-        ? "刚刚发言"
-      : latestActingSpeech
-        ? "最近发言"
-        : "当前玩家发言";
-  const phaseLabel = readableOutputPause && isPaused ? readableOutputPause.phaseLabel : visiblePhaseLabel(game, humanPlayerId);
-  const phaseProgress = readableOutputPause && isPaused ? `${seatName(game, readableOutputPause.seatId)} 已发言` : visiblePhaseProgress(game, humanPlayerId);
   return (
     <section className="center-panel table-panel">
       <div className="table-scene">
         <div className="moonlit-table">
           {game.players.map((player, index) => {
-            const angle = -90 + (360 / game.players.length) * index;
-            const active = displayActingSeat === player.id;
+            const placement = tableSeatPlacement(index, game.players.length);
+            const active = displayActingSeat === player.id || (isParallelThinking && parallelSeatIds.has(player.id));
+            const runtime = aiRuntimeStatus(game, player, aiMode, config);
             return (
               <div
-                className={`table-seat ${active ? "active" : ""} ${!player.alive ? "dead" : ""}`}
-                style={{ "--seat-angle": `${angle}deg` } as CSSProperties}
+                className={`table-seat side-${placement.side} ${active ? "active" : ""} ${!player.alive ? "dead" : ""}`}
+                style={{ "--seat-x": `${placement.x}%`, "--seat-y": `${placement.y}%` } as CSSProperties}
                 key={player.id}
               >
                 <div className="seat-orbit-card">
                   <span className="seat-number">{player.seatNumber}</span>
                   <div className="avatar portrait">{publicPlayerAvatar(player)}</div>
-                  {player.id === displayActingSeat && (
+                  {active && (
                     <span className={`thinking-dot ${aiBusy ? "thinking" : ""}`}>
-                      {seatActivityLabel(player, humanPending, aiBusy, isPaused, autoRun)}
+                      {isParallelThinking && parallelSeatIds.has(player.id) ? "并行思考" : seatActivityLabel(player, humanPending, aiBusy, isPaused, autoRun)}
                     </span>
                   )}
-                  <strong>{publicPlayerLabel(player)}</strong>
-                  <p>{player.alive ? "存活" : deathReasonForViewer(game, player, humanPlayerId)}</p>
+                  <strong>{publicPlayerLabel(player, config, aiMode, game)}</strong>
+                  <p>{player.alive ? `存活${runtime ? ` · ${runtime.label}` : ""}` : deathReasonForViewer(game, player, humanPlayerId)}</p>
                   {player.isSheriff && <Award size={15} className="sheriff-icon" />}
                 </div>
               </div>
             );
           })}
           <div className="table-core">
-            <StatusBadge game={game} />
-            <h2>{phaseLabel}</h2>
-            <strong>
-              {actingPlayer
-                ? `${seatName(game, actingPlayer.id)} · ${seatActivityLabel(actingPlayer, humanPending, aiBusy, isPaused, autoRun)}`
-                : phaseProgress}
-            </strong>
+            <div className="table-core-meta">
+              <span className="core-meta-pill core-meta-seat">{coreSeatLabel}</span>
+              <StatusBadge game={game} />
+              <span className="core-meta-pill core-meta-action">{coreActionLabel}</span>
+            </div>
             <div className="table-speech">
-              <span>{speechLabel}</span>
               <p>
                 {activeStreamingSpeech ||
                   readableOutputPause?.publicText ||
-                  (latestActingSpeech ? eventSummary(game, latestActingSpeech.type, latestActingSpeech.payload, latestActingSpeech.seatId) : "等待当前玩家发言。")}
+                  (latestActingSpeech
+                    ? eventSummary(game, latestActingSpeech.type, latestActingSpeech.payload, latestActingSpeech.seatId)
+                    : isParallelThinking
+                      ? `${parallelPending.length} 名 AI 正在${parallelBatchLabel(parallelPending[0])}。`
+                      : activePendingWaitingText)}
               </p>
             </div>
           </div>
@@ -1631,7 +1884,7 @@ function CenterPanel({
         <div className="speech-stream">
           <span>系统状态</span>
           <p>{statusText}</p>
-          {isPaused && aiPending && !humanPending && (
+          {isPaused && readableOutputPause && (
             <button className="primary-button continue-button" onClick={onTogglePause}>
               <StepForward size={16} />
               继续下一位
@@ -1656,6 +1909,155 @@ function seatActivityLabel(
   return "行动中";
 }
 
+function parallelAIPendingActions(game: GameState): PendingAction[] {
+  const aiActions = game.pendingActions.filter((action) => game.players.find((player) => player.id === action.seatId)?.controller !== "human");
+  const batch = aiActions.filter((action) => isParallelThinkingAction(game, action));
+  if (batch.length < 2 || batch.length !== aiActions.length) return [];
+  const signature = parallelActionSignature(batch[0]);
+  if (batch.some((action) => parallelActionSignature(action) !== signature)) return [];
+  return [...batch].sort((left, right) => seatNumberFor(game, left.seatId) - seatNumberFor(game, right.seatId));
+}
+
+function isParallelThinkingAction(game: GameState, action: PendingAction): boolean {
+  if (game.phase.type === "sheriff_candidacy") return action.kind === "sheriff_candidacy";
+  if (game.phase.type === "sheriff_withdrawal") return action.kind === "sheriff_withdrawal";
+  if (game.phase.type === "sheriff_vote" || game.phase.type === "sheriff_pk_vote") {
+    return action.kind === "vote" && (action.voteType === "sheriff" || action.voteType === "sheriff_pk");
+  }
+  if (game.phase.type === "day_vote" || game.phase.type === "day_pk_vote") {
+    return action.kind === "vote" && (action.voteType === "day" || action.voteType === "day_pk");
+  }
+  return false;
+}
+
+function parallelActionSignature(action: PendingAction): string {
+  if (action.kind === "vote") return `${action.kind}:${action.voteType}`;
+  if (action.kind === "sheriff_withdrawal") return `${action.kind}:${action.voteType}`;
+  return action.kind;
+}
+
+function parallelBatchLabel(action: PendingAction): string {
+  if (action.kind === "sheriff_candidacy") return "判断是否上警";
+  if (action.kind === "sheriff_withdrawal") return action.voteType === "sheriff_pk" ? "判断 PK 是否退水" : "判断是否退水";
+  if (action.kind === "vote" && action.voteType === "sheriff") return "进行警长投票";
+  if (action.kind === "vote" && action.voteType === "sheriff_pk") return "进行警长 PK 投票";
+  if (action.kind === "vote" && action.voteType === "day_pk") return "进行放逐 PK 投票";
+  return "进行白天放逐投票";
+}
+
+function firstMissingProviderForBatch(
+  game: GameState,
+  pendingBatch: PendingAction[],
+  config: AIConfigStore,
+  providerApiKeys: LocalProviderApiKeys
+): ProviderAccount | undefined {
+  for (const pending of pendingBatch) {
+    const player = game.players.find((item) => item.id === pending.seatId);
+    const persona = config.personas.find((item) => item.id === player?.personaId) ?? config.personas[0] ?? DEFAULT_PERSONAS[0];
+    const provider = config.providers.find((item) => item.id === persona.defaultProviderId && item.enabled);
+    if (provider && isRealProvider(provider) && !providerApiKeys[provider.id]?.trim()) return provider;
+  }
+  return undefined;
+}
+
+function parallelFailureReason(failures: ParallelAIDecisionResult[]): string | undefined {
+  return failures.find((item) => item.error)?.error ?? failures.find((item) => item.result?.error)?.result?.error;
+}
+
+function fallbackDetailText(result: AIDecisionResult): string {
+  const raw = result.error || result.llmCall?.error || "";
+  return fallbackReasonLabel(raw);
+}
+
+function fallbackReasonLabel(raw: string | undefined): string {
+  const text = (raw ?? "").trim();
+  if (!text) return "";
+  if (/未配置真实供应商|Mock 兜底|mock:\/\//i.test(text)) return "未配置真实供应商";
+  if (/context_overflow|上下文|预算/i.test(text)) return "上下文超限";
+  if (/成本保护|费用|cost/i.test(text)) return "成本保护";
+  if (/API Key|Access Token|密钥|缺少/i.test(text)) return "缺少密钥";
+  if (/timeout|aborted|network|fetch failed|LLM request failed/i.test(text)) return "请求失败";
+  return text.length > 30 ? `${text.slice(0, 30)}...` : text;
+}
+
+function aiPendingKey(game: GameState, pending: PendingAction): string {
+  return [game.id, game.phase.type, game.phase.day, game.phase.actingSeatId ?? "", pendingActionSignature(pending), game.events.length].join(":");
+}
+
+function aiPendingBatchKey(game: GameState, pendingBatch: PendingAction[]): string {
+  return [
+    game.id,
+    game.phase.type,
+    game.phase.day,
+    pendingBatch.map((pending) => `${pending.seatId}/${pendingActionSignature(pending)}`).join("|"),
+    game.events.length
+  ].join(":");
+}
+
+function findMatchingPending(game: GameState, pending: PendingAction): PendingAction | undefined {
+  const signature = pendingActionSignature(pending);
+  return game.pendingActions.find((action) => action.seatId === pending.seatId && pendingActionSignature(action) === signature);
+}
+
+function pendingActionSignature(pending: PendingAction): string {
+  if (pending.kind === "vote") return `${pending.kind}:${pending.voteType}:${pending.legalTargets.join(",")}`;
+  if (pending.kind === "sheriff_withdrawal") return `${pending.kind}:${pending.voteType}`;
+  if (pending.kind === "speech") return `${pending.kind}:${pending.speechType}`;
+  if (pending.kind === "wolf_discussion") return `${pending.kind}:${pending.round}:${pending.currentProposal ?? ""}`;
+  return pending.kind;
+}
+
+function seatNumberFor(game: GameState, seatId: PlayerId): number {
+  return game.players.find((player) => player.id === seatId)?.seatNumber ?? Number.MAX_SAFE_INTEGER;
+}
+
+function centerActionLabel(
+  player: GameState["players"][number] | undefined,
+  pending: PendingAction | undefined,
+  options: {
+    aiBusy: boolean;
+    autoRun: boolean;
+    humanPending?: PendingAction;
+    isPaused: boolean;
+    readableOutputPause: ReadableOutputPause | null;
+    streamingSpeech: string;
+  }
+): string {
+  if (options.readableOutputPause && options.isPaused) return options.readableOutputPause.progressLabel ?? "等待确认";
+  if (options.streamingSpeech) return "正在发表言论";
+  if (options.humanPending && player?.controller === "human") return "等待你操作";
+  if (options.aiBusy && player?.controller !== "human") return "正在思考";
+  if (options.isPaused) return "已暂停";
+  if (!pending) return options.autoRun ? "等待自动行动" : "等待继续";
+  if (pending.kind === "speech" || pending.kind === "wolf_discussion" || pending.kind === "sheriff_candidacy") return "准备发言";
+  if (pending.kind.includes("vote")) return "等待投票";
+  return `等待${pendingLabel(pending)}`;
+}
+
+type TableSeatSide = "top" | "right" | "bottom" | "left";
+
+function tableSeatPlacement(index: number, total: number): { x: number; y: number; side: TableSeatSide } {
+  const angle = Math.PI + (Math.PI * 2 * index) / Math.max(total, 1);
+  const dx = Math.cos(angle);
+  const dy = Math.sin(angle);
+  const halfWidth = 42;
+  const halfHeight = 36;
+  const xScale = Math.abs(dx) < 0.001 ? Number.POSITIVE_INFINITY : halfWidth / Math.abs(dx);
+  const yScale = Math.abs(dy) < 0.001 ? Number.POSITIVE_INFINITY : halfHeight / Math.abs(dy);
+  const scale = Math.min(xScale, yScale);
+  const x = 50 + dx * scale;
+  const y = 50 + dy * scale;
+  const side =
+    Math.abs(dx) > Math.abs(dy)
+      ? dx > 0
+        ? "right"
+        : "left"
+      : dy > 0
+        ? "bottom"
+        : "top";
+  return { x: Math.max(8, Math.min(92, x)), y: Math.max(12, Math.min(88, y)), side };
+}
+
 function buildActionStatusText(
   game: GameState,
   humanPlayerId: PlayerId | undefined,
@@ -1670,9 +2072,17 @@ function buildActionStatusText(
 ): string {
   if (game.status === "ended") return "对局已结束，可重启或退出房间。";
   if (humanPending) {
+    if (humanPending.kind === "witch_action") return "轮到你进行女巫行动：先查看今晚刀口，再决定是否使用解药和毒药。没有倒计时限制。";
     return `轮到你进行${pendingLabel(humanPending)}，请在右侧提交发言或目标。没有倒计时限制。`;
   }
   if (isPaused) return "已暂停。AI 自动行动已停止，点击继续后恢复。";
+  const parallelPending = parallelAIPendingActions(game);
+  if (aiBusy && parallelPending.length >= 2) {
+    const elapsed = aiElapsedSeconds > 0 ? `，已等待 ${aiElapsedSeconds}s` : "";
+    const progress = aiProgress ? `当前状态：${displayAIProgressMessage(aiProgress)}` : "当前状态：等待 AI 返回。";
+    const stuck = thinkingWatchdogText(aiProgress, aiElapsedSeconds);
+    return `${parallelPending.length} 名 AI 正在并行${parallelBatchLabel(parallelPending[0])}${elapsed}。${progress}${stuck} 结果会一起写入。`;
+  }
   if (aiBusy && aiPending) {
     const elapsed = aiElapsedSeconds > 0 ? `，已等待 ${aiElapsedSeconds}s` : "";
     const progress = aiProgress ? `当前状态：${displayAIProgressMessage(aiProgress)}` : "当前状态：等待 AI 返回。";
@@ -1687,6 +2097,12 @@ function buildActionStatusText(
   if (aiPending && autoRun) return `${seatName(game, aiPending.seatId)} 即将自动进行${pendingLabel(aiPending)}。`;
   if (aiPending) return `${seatName(game, aiPending.seatId)} 等待 AI 处理，继续后会自动行动。`;
   return aiStepStatus;
+}
+
+function pendingWaitingText(pending: PendingAction): string {
+  if (pending.kind === "speech" || pending.kind === "wolf_discussion" || pending.kind === "sheriff_candidacy") return "等待当前玩家发言。";
+  if (pending.kind === "witch_action") return "等待当前玩家决定是否使用解药和毒药。";
+  return "等待当前玩家提交行动。";
 }
 
 function displayAIProgressMessage(progress: AIDecisionStatus): string {
@@ -1747,15 +2163,6 @@ function canViewerSeeNightPhase(
   return actingSeatId === human.id;
 }
 
-function thinkingLabel(progress: AIDecisionStatus | null, elapsedSeconds: number): string {
-  const elapsed = elapsedSeconds > 0 ? ` · ${elapsedSeconds}s` : "";
-  if (!progress) return `AI 思考中${elapsed}`;
-  if (progress.status === "building_prompt") return `整理可见信息${elapsed}`;
-  if (progress.status === "provider_request") return `模型思考中${elapsed}`;
-  if (progress.status === "repairing") return `格式校验中${elapsed}`;
-  return `AI 思考中${elapsed}`;
-}
-
 function thinkingWatchdogText(progress: AIDecisionStatus | null, elapsedSeconds: number): string {
   const elapsedMs = elapsedSeconds * 1000;
   const expectedMs = progress?.expectedThinkingMs ?? (progress?.timeoutMs ? Math.floor(progress.timeoutMs * 0.7) : undefined);
@@ -1789,6 +2196,10 @@ function ActionPanel({
   humanPending,
   selectedTarget,
   setSelectedTarget,
+  witchSave,
+  setWitchSave,
+  witchPoisonTarget,
+  setWitchPoisonTarget,
   speechText,
   setSpeechText,
   wolfAgree,
@@ -1804,6 +2215,10 @@ function ActionPanel({
   humanPending?: PendingAction;
   selectedTarget: PlayerId | "abstain" | "skip" | "destroy";
   setSelectedTarget: (value: PlayerId | "abstain" | "skip" | "destroy") => void;
+  witchSave: boolean;
+  setWitchSave: (value: boolean) => void;
+  witchPoisonTarget: PlayerId | "skip";
+  setWitchPoisonTarget: (value: PlayerId | "skip") => void;
   speechText: string;
   setSpeechText: (value: string) => void;
   wolfAgree: boolean;
@@ -1872,11 +2287,22 @@ function ActionPanel({
             {(humanPending.kind === "speech" || humanPending.kind === "wolf_discussion") && (
               <textarea value={speechText} onChange={(event) => setSpeechText(event.target.value)} rows={5} />
             )}
-            {legal.length > 0 && (
+            {humanPending.kind === "guard_protect" && (
+              <div className="guard-skip-control">
+                <Toggle label="本晚空守" checked={selectedTarget === "skip"} onChange={(checked) => setSelectedTarget(checked ? "skip" : legal[0])} />
+                <p className="muted">开启后今晚不守任何人，用于规避连续机械守护或守救冲突。</p>
+              </div>
+            )}
+            {legal.length > 0 && humanPending.kind !== "witch_action" && (
               <label>
                 目标
-                <select value={selectedTarget} onChange={(event) => setSelectedTarget(event.target.value as PlayerId)}>
+                <select
+                  value={selectedTarget}
+                  disabled={humanPending.kind === "guard_protect" && selectedTarget === "skip"}
+                  onChange={(event) => setSelectedTarget(event.target.value as PlayerId | "abstain" | "skip" | "destroy")}
+                >
                   {humanPending.kind === "vote" && allowAbstain && <option value="abstain">弃票</option>}
+                  {humanPending.kind === "guard_protect" && <option value="skip">空守</option>}
                   {humanPending.kind === "hunter_shot" && <option value="skip">不开枪</option>}
                   {humanPending.kind === "badge_decision" && <option value="destroy">撕毁警徽</option>}
                   {legal.map((id) => (
@@ -1888,8 +2314,46 @@ function ActionPanel({
               </label>
             )}
             {humanPending.kind === "witch_action" && (
-              <div className="toggle-grid compact">
-                <Toggle label="使用解药" checked={selectedTarget === "abstain"} onChange={(value) => setSelectedTarget(value ? "abstain" : legal[0] ?? "abstain")} />
+              <div className="witch-action-flow">
+                <div className="witch-step">
+                  <span>1</span>
+                  <div>
+                    <strong>今晚刀口</strong>
+                    <p>{humanPending.wolfTarget ? `狼人今晚击杀：${seatName(game, humanPending.wolfTarget)}。` : "今晚没有狼人刀口。"}</p>
+                  </div>
+                </div>
+                <div className="witch-step">
+                  <span>2</span>
+                  <div>
+                    <strong>解药</strong>
+                    {humanPending.canSave && humanPending.wolfTarget ? (
+                      <Toggle label={`使用解药救 ${seatName(game, humanPending.wolfTarget)}`} checked={witchSave} onChange={setWitchSave} />
+                    ) : (
+                      <p className="muted">{humanPending.wolfTarget ? "当前不能使用解药。" : "没有刀口，不需要使用解药。"}</p>
+                    )}
+                  </div>
+                </div>
+                <div className="witch-step">
+                  <span>3</span>
+                  <div>
+                    <strong>毒药</strong>
+                    {humanPending.canPoison && (!witchSave || game.rulePreset.witchRules.allowSaveAndPoisonSameNight) ? (
+                      <label>
+                        毒药目标
+                        <select value={witchPoisonTarget} onChange={(event) => setWitchPoisonTarget(event.target.value as PlayerId | "skip")}>
+                          <option value="skip">不使用毒药</option>
+                          {legal.map((id) => (
+                            <option value={id} key={id}>
+                              {seatName(game, id)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : (
+                      <p className="muted">{witchSave && !game.rulePreset.witchRules.allowSaveAndPoisonSameNight ? "本规则下同晚不能同时使用解药和毒药。" : "毒药已不可用。"}</p>
+                    )}
+                  </div>
+                </div>
               </div>
             )}
             {humanPending.kind === "wolf_discussion" && (
@@ -2128,13 +2592,20 @@ function ApiAccessPanel({
   onOpenRules: () => void;
 }): JSX.Element {
   const [selectedProviderId, setSelectedProviderId] = useState(() => preferredProviderId(config.providers));
+  const didAutoSelectRealProvider = useRef(false);
   const selectedProvider = config.providers.find((provider) => provider.id === selectedProviderId) ?? config.providers[0];
   const apiSummary = buildApiAccessSummary(readinessConfig, providerApiKeys, providerTestResults);
   const testedProviders = config.providers.filter((provider) => providerTestResults[provider.id]);
 
   useEffect(() => {
+    const preferred = preferredProviderId(config.providers);
     if (!selectedProvider || !config.providers.some((provider) => provider.id === selectedProviderId)) {
-      setSelectedProviderId(preferredProviderId(config.providers));
+      setSelectedProviderId(preferred);
+      return;
+    }
+    if (!didAutoSelectRealProvider.current && !isRealProvider(selectedProvider) && preferred && preferred !== selectedProvider.id) {
+      didAutoSelectRealProvider.current = true;
+      setSelectedProviderId(preferred);
     }
   }, [config.providers, selectedProvider, selectedProviderId]);
 
@@ -2171,6 +2642,10 @@ function ApiAccessPanel({
 
   const selectedProviderModels = selectedProvider ? providerModelOptions(config, selectedProvider.id) : [];
   const selectedModelInList = Boolean(selectedProvider && selectedProviderModels.some((model) => model.name === selectedProvider.defaultModel));
+  const selectedThinkingMode = selectedProvider ? providerThinkingMode(selectedProvider) : "auto";
+  const selectedReasoningEffort = selectedProvider ? providerReasoningEffort(selectedProvider) : "medium";
+  const showDeepSeekThinkingNote = Boolean(selectedProvider && isDeepSeekProvider(selectedProvider));
+  const reasoningEffortOptions = showDeepSeekThinkingNote ? DEEPSEEK_REASONING_EFFORT_OPTIONS : REASONING_EFFORT_OPTIONS;
 
   return (
     <div className="api-access-layout">
@@ -2272,6 +2747,41 @@ function ApiAccessPanel({
                     />
                   </div>
                 </label>
+                <label>
+                  thinking
+                  <select
+                    value={selectedThinkingMode}
+                    onChange={(event) => updateProvider(selectedProvider.id, { thinkingMode: event.target.value as ThinkingMode })}
+                    disabled={!isRealProvider(selectedProvider)}
+                  >
+                    {THINKING_MODE_OPTIONS.map((option) => (
+                      <option value={option.value} key={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  reasoning_effort
+                  <select
+                    value={selectedReasoningEffort}
+                    onChange={(event) => updateProvider(selectedProvider.id, { reasoningEffort: event.target.value as ReasoningEffort })}
+                    disabled={!providerSupportsReasoningEffort(selectedProvider)}
+                  >
+                    {reasoningEffortOptions.map((option) => (
+                      <option value={option.value} key={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="field-note api-form-note">
+                  {showDeepSeekThinkingNote
+                    ? "DeepSeek 支持 thinking=enabled/disabled；reasoning_effort 只提供官方 high/max。开启 thinking 会产生 reasoning tokens。"
+                    : providerSupportsReasoningEffort(selectedProvider)
+                      ? "reasoning_effort 会随真实模型请求发送；thinking=auto 表示由模型或供应商默认策略处理。"
+                      : "当前供应商未声明支持 reasoning_effort；该值会保存，但真实请求不会发送。"}
+                </p>
               </div>
               <div className="api-action-row">
                 <button className="primary-button" onClick={() => onTestProvider(selectedProvider)} disabled={!selectedProvider.enabled}>
@@ -2383,6 +2893,14 @@ function ApiAccessPanel({
           <div className="help-row">
             <strong>默认模型</strong>
             <p>填写你要用于跑局的模型名，例如 deepseek-chat。</p>
+          </div>
+          <div className="help-row">
+            <strong>thinking</strong>
+            <p>控制供应商是否启用思考参数；DeepSeek 开启后会产生 reasoning tokens，关闭时不发送 reasoning_effort。</p>
+          </div>
+          <div className="help-row">
+            <strong>reasoning_effort</strong>
+            <p>控制支持该参数的模型推理强度；如果与 thinking 冲突，请求层会优先避免接口报错。</p>
           </div>
         </section>
         <section className="api-panel">
@@ -2520,30 +3038,49 @@ function DebugPanel({
         {game.llmCalls.length === 0 ? (
           <p className="muted">暂无真实模型调用。DeepSeek 或其他真实供应商测试后会显示调用、解析结果和脱敏 prompt。</p>
         ) : (
-          game.llmCalls.slice(-8).map((call) => (
-            <details className="call-detail" key={call.id}>
-              <summary>
-                <span>{seatName(game, call.seatId)}</span>
-                <strong>{call.phase} · {call.provider} · {call.model}</strong>
-              </summary>
-              <p>{call.privateRationale || "暂无私有推理摘要。"}</p>
-              <div className="call-metrics">
-                <span>输入 {call.inputTokens}</span>
-                <span>输出 {call.outputTokens}</span>
-                <span>推理 {call.reasoningTokens}</span>
-                <span>缓存 {call.cachedTokens}</span>
-                <span>费用 {call.estimatedCost.toFixed(6)}</span>
-                <span>耗时 {call.latencyMs}ms</span>
-                <span>重试 {call.retryCount}</span>
-                {call.promptCompressionLevel && <span>上下文 {call.promptCompressionLevel}</span>}
-                {call.estimatedInputTokens !== undefined && <span>估算 {call.estimatedInputTokens}/{call.promptBudgetTokens ?? "-"}</span>}
-                <span>Prompt {call.promptHash}</span>
-              </div>
-              {call.error && <p className="call-error">{call.error}</p>}
-              <pre>{JSON.stringify(call.parsedJson, null, 2)}</pre>
-              {call.promptTextRedacted && <pre>{call.promptTextRedacted}</pre>}
-            </details>
-          ))
+          game.llmCalls.slice(-8).map((call) => {
+            const reasoningTrace = extractReasoningTrace(call.rawResponse);
+            return (
+              <details className="call-detail" key={call.id}>
+                <summary>
+                  <span>{seatName(game, call.seatId)}</span>
+                  <strong>{call.phase} · {call.provider} · {call.model}</strong>
+                </summary>
+                <p>{call.privateRationale || "暂无私有推理摘要。"}</p>
+                <div className="call-metrics">
+                  <span>输入 {call.inputTokens}</span>
+                  <span>输出 {call.outputTokens}</span>
+                  <span>推理 {call.reasoningTokens}</span>
+                  <span>缓存 {call.cachedTokens}</span>
+                  <span>费用 {call.estimatedCost.toFixed(6)}</span>
+                  <span>耗时 {call.latencyMs}ms</span>
+                  <span>重试 {call.retryCount}</span>
+                  {call.promptCompressionLevel && <span>上下文 {call.promptCompressionLevel}</span>}
+                  {call.estimatedInputTokens !== undefined && <span>估算 {call.estimatedInputTokens}/{call.promptBudgetTokens ?? "-"}</span>}
+                  <span>Prompt {call.promptHash}</span>
+                </div>
+                {call.error && <p className="call-error">{call.error}</p>}
+                <div className="reasoning-trace">
+                  <strong>模型 thinking / reasoning_content</strong>
+                  {reasoningTrace ? <pre>{reasoningTrace}</pre> : <p className="muted">本次响应没有返回 thinking / reasoning_content。</p>}
+                </div>
+                <strong className="call-block-title">解析结果</strong>
+                <pre>{JSON.stringify(call.parsedJson, null, 2)}</pre>
+                {call.promptTextRedacted && (
+                  <>
+                    <strong className="call-block-title">Prompt 预览</strong>
+                    <pre>{call.promptTextRedacted}</pre>
+                  </>
+                )}
+                {call.rawResponse && (
+                  <details className="raw-response-detail">
+                    <summary>原始返回</summary>
+                    <pre>{call.rawResponse}</pre>
+                  </details>
+                )}
+              </details>
+            );
+          })
         )}
       </section>
       <section className="control-group">
@@ -2866,15 +3403,152 @@ function toPublicViewState(state: GameState): GameState {
 }
 
 function officialOutputForPending(state: GameState, pending: PendingAction, viewerId?: PlayerId): string {
-  if (pending.kind !== "speech" && pending.kind !== "wolf_discussion") return "";
   if (pending.kind === "wolf_discussion") return canViewerSeeWolfChat(state, viewerId) ? latestEventText(state, ["WolfDiscussionMessage"]) : "";
+  if (pending.kind === "sheriff_withdrawal") return latestWithdrawalText(state, pending.seatId);
+  if (pending.kind !== "speech") return "";
+  if (pending.speechType === "sheriff" && state.phase.type === "sheriff_speech") {
+    const withdrawalText = latestWithdrawalText(state, pending.seatId);
+    if (withdrawalText) return withdrawalText;
+  }
   return latestEventText(state, ["SpeechPublished", "LastWordsPublished"]);
 }
 
 function officialOutputForCommand(state: GameState, pending: PendingAction, command: GameCommand, viewerId?: PlayerId): string {
+  if (isWithdrawalOutputCommand(command)) return `${seatName(state, command.seatId)} 退水。`;
   if (pending.kind === "speech" && "text" in command) return command.text;
   if (pending.kind === "wolf_discussion" && "messageToWolves" in command && canViewerSeeWolfChat(state, viewerId)) return command.messageToWolves;
   return "";
+}
+
+function latestWithdrawalText(state: GameState, seatId: PlayerId): string {
+  const event = [...state.events].reverse().find((item) => item.type === "SheriffCandidateWithdrawn" && item.seatId === seatId);
+  return event ? `${seatName(state, seatId)} 退水。` : "";
+}
+
+function extractReasoningTrace(rawResponse: string): string {
+  if (!rawResponse.trim()) return "";
+  try {
+    const parsed = JSON.parse(rawResponse) as unknown;
+    const found = collectReasoningFields(parsed);
+    return found.join("\n\n").trim();
+  } catch {
+    return "";
+  }
+}
+
+function collectReasoningFields(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value)) return value.flatMap(collectReasoningFields);
+  const record = value as Record<string, unknown>;
+  const current = ["reasoning_content", "reasoningContent", "reasoning", "thinking"]
+    .map((key) => record[key])
+    .flatMap((item) => {
+      if (typeof item === "string") return item.trim() ? [item.trim()] : [];
+      if (item && typeof item === "object") {
+        const text = JSON.stringify(item, null, 2);
+        return text.trim() ? [text] : [];
+      }
+      return [];
+    });
+  const nested = Object.entries(record)
+    .filter(([key]) => !["reasoning_content", "reasoningContent", "reasoning", "thinking"].includes(key))
+    .flatMap(([, item]) => collectReasoningFields(item));
+  return [...current, ...nested];
+}
+
+function isWithdrawalOutputCommand(command: GameCommand | undefined): boolean {
+  if (!command) return false;
+  if (command.type === "WithdrawSheriffCandidacy") return true;
+  return command.type === "SubmitSheriffWithdrawalDecision" && command.withdraw;
+}
+
+function readableOutputPauseLabels(
+  pending: PendingAction,
+  command: GameCommand | undefined
+): { outputLabel: string; progressLabel: string; doneLabel: string } {
+  if (isWithdrawalOutputCommand(command) || pending.kind === "sheriff_withdrawal") {
+    return {
+      outputLabel: "退水提示",
+      progressLabel: "已退水",
+      doneLabel: "退水完成，点击继续进入下一位。"
+    };
+  }
+  return {
+    outputLabel: "刚刚发言",
+    progressLabel: "已发言",
+    doneLabel: "发言结束，点击继续进入下一位。"
+  };
+}
+
+function transitionNoticeForNewEvents(
+  previous: GameState,
+  nextState: GameState,
+  viewerId: PlayerId
+): Pick<ReadableOutputPause, "seatId" | "publicText" | "outputLabel" | "progressLabel" | "doneLabel"> | undefined {
+  const newPublicEvents = nextState.events.slice(previous.events.length).filter((event) => event.visibility === "public" && event.type !== "PhaseStarted");
+  if (newPublicEvents.length === 0) return undefined;
+  const fallbackSeatId = viewerId || nextState.players[0]?.id;
+  const noticeFrom = (
+    events: Array<GameState["events"][number]>,
+    outputLabel: string,
+    progressLabel: string,
+    doneLabel: string
+  ) => {
+    if (events.length === 0 || !fallbackSeatId) return undefined;
+    return {
+      seatId: events[0].seatId ?? fallbackSeatId,
+      publicText: events.map((event) => eventSummary(nextState, event.type, event.payload, event.seatId)).filter(Boolean).join("\n"),
+      outputLabel,
+      progressLabel,
+      doneLabel
+    };
+  };
+
+  const hunterEvents = newPublicEvents.filter((event) => event.type === "HunterShotResolved" || event.type === "HunterShotSkipped");
+  const hunterNotice = noticeFrom(hunterEvents, "猎人结算", "猎人已行动", "猎人开枪结算完成，点击继续进入下一步。");
+  if (hunterNotice) return hunterNotice;
+
+  const badgeEvents = newPublicEvents.filter((event) => event.type === "BadgePassed" || event.type === "BadgeDestroyed");
+  const badgeNotice = noticeFrom(badgeEvents, "警徽结算", "警徽已处理", "警徽处理完成，点击继续进入下一步。");
+  if (badgeNotice) return badgeNotice;
+
+  const withdrawalEvents = newPublicEvents.filter((event) => event.type === "SheriffCandidateWithdrawn");
+  if (withdrawalEvents.length > 0) {
+    const related = newPublicEvents.filter(
+      (event) => event.type === "SheriffCandidateWithdrawn" || event.type === "SheriffElected" || event.type === "SheriffSkipped" || event.type === "NightDeathsAnnounced"
+    );
+    const withdrawalNotice = noticeFrom(related, "退水提示", "已退水", "退水信息已确认，点击继续进入投票或下一步。");
+    if (withdrawalNotice) return withdrawalNotice;
+  }
+
+  const voteEvents = newPublicEvents.filter(
+    (event) =>
+      event.type === "SheriffVoteResolved" ||
+      event.type === "DayVoteResolved" ||
+      event.type === "SheriffElected" ||
+      event.type === "SheriffSkipped" ||
+      event.type === "PlayerExiled" ||
+      event.type === "NoExile" ||
+      event.type === "NightDeathsAnnounced"
+  );
+  const voteNotice = noticeFrom(voteEvents, "投票结算", "投票已结算", "投票结果已结算，点击继续进入下一步。");
+  if (voteNotice) return voteNotice;
+
+  const candidacyEvents = newPublicEvents.filter(
+    (event) => event.type === "SheriffCandidatesAnnounced" || event.type === "SheriffElected" || event.type === "SheriffSkipped" || event.type === "NightDeathsAnnounced"
+  );
+  const candidacyNotice = noticeFrom(candidacyEvents, "上警名单", "上警名单已公布", "上警名单已公布，点击继续进入警上发言。");
+  if (candidacyNotice) return candidacyNotice;
+
+  const deathEvents = newPublicEvents.filter((event) => event.type === "NightDeathsAnnounced");
+  const deathNotice = noticeFrom(deathEvents, "夜晚死亡", "死亡已公布", "夜晚死亡已公布，点击继续进入下一步。");
+  if (deathNotice) return deathNotice;
+
+  const selfExplosionEvents = newPublicEvents.filter((event) => event.type === "WolfSelfExploded");
+  const selfExplosionNotice = noticeFrom(selfExplosionEvents, "狼人自爆", "自爆已结算", "自爆已结算，点击继续进入夜晚。");
+  if (selfExplosionNotice) return selfExplosionNotice;
+
+  return undefined;
 }
 
 function latestEventText(state: GameState, types: string[]): string {
@@ -2899,10 +3573,11 @@ function StatusBadge({ game }: { game: GameState }): JSX.Element {
       </div>
     );
   }
+  const isNight = game.phase.type.startsWith("night");
   return (
-    <div className="status-badge running">
-      <Moon size={16} />
-      进行中
+    <div className={`status-badge ${isNight ? "night" : "day"}`}>
+      {isNight ? <Moon size={16} /> : <Sun size={16} />}
+      {isNight ? "夜晚" : "白天"}
     </div>
   );
 }
@@ -2940,12 +3615,41 @@ function syncRoleAssignedEventNames(state: GameState): void {
   }
 }
 
-function publicPlayerLabel(player: GameState["players"][number]): string {
-  return player.controller === "human" ? player.name : "玩家";
+function publicPlayerLabel(player: GameState["players"][number], config: AIConfigStore, aiMode: "mock" | "llm", game?: GameState): string {
+  if (player.controller === "human") return player.name;
+  if (aiMode === "mock") return "Mock";
+  const latestCall = game ? latestCallForSeat(game, player.id) : undefined;
+  if (latestCall?.model) return latestCall.model;
+  const persona = config.personas.find((item) => item.id === player.personaId) ?? DEFAULT_PERSONAS.find((item) => item.id === player.personaId);
+  const provider =
+    config.providers.find((item) => item.id === persona?.defaultProviderId && item.enabled) ??
+    config.providers.find((item) => item.id === persona?.defaultProviderId);
+  return persona?.defaultModel || provider?.defaultModel || player.name;
+}
+
+function latestCallForSeat(game: GameState, seatId: PlayerId): LLMCallLog | undefined {
+  return [...game.llmCalls].reverse().find((call) => call.seatId === seatId);
+}
+
+function aiRuntimeStatus(game: GameState, player: GameState["players"][number], aiMode: "mock" | "llm", config: AIConfigStore): { label: string } | undefined {
+  if (player.controller === "human") return undefined;
+  if (aiMode === "mock") return { label: "MockAI" };
+  const latestCall = latestCallForSeat(game, player.id);
+  if (latestCall) {
+    if (latestCall.provider === "fallback") return { label: `兜底AI${latestCall.error ? ` · ${fallbackReasonLabel(latestCall.error)}` : ""}` };
+    if (latestCall.provider === "mock") return { label: "MockAI" };
+    if (latestCall.error) return { label: "失败" };
+    return { label: "真实AI" };
+  }
+  const persona = config.personas.find((item) => item.id === player.personaId) ?? DEFAULT_PERSONAS.find((item) => item.id === player.personaId);
+  const provider =
+    config.providers.find((item) => item.id === persona?.defaultProviderId && item.enabled) ??
+    config.providers.find((item) => item.id === persona?.defaultProviderId);
+  return { label: provider && !isRealProvider(provider) ? "MockAI" : "真实AI" };
 }
 
 function publicPlayerAvatar(player: GameState["players"][number]): string {
-  return player.controller === "human" ? player.avatar : String(player.seatNumber);
+  return player.name;
 }
 
 function chooseWeightedPersona(personas: AIPersona[], rng: () => number): AIPersona {
@@ -2984,11 +3688,13 @@ function buildHumanCommand(
   pending: PendingAction,
   selectedTarget: PlayerId | "abstain" | "skip" | "destroy",
   speechText: string,
+  witchSave: boolean,
+  witchPoisonTarget: PlayerId | "skip",
   wolfAgree: boolean,
   sheriffRun: boolean
 ): GameCommand | undefined {
   if (pending.kind === "guard_protect" || pending.kind === "seer_check") {
-    const targetId = selectedTarget !== "abstain" && selectedTarget !== "skip" ? selectedTarget : pending.legalTargets[0];
+    const targetId = pending.kind === "guard_protect" && selectedTarget === "skip" ? "skip" : selectedTarget !== "abstain" && selectedTarget !== "skip" ? selectedTarget : pending.legalTargets[0];
     return {
       type: "SubmitNightAction",
       seatId: pending.seatId,
@@ -2998,8 +3704,9 @@ function buildHumanCommand(
     };
   }
   if (pending.kind === "witch_action") {
-    const save = selectedTarget === "abstain" && pending.canSave;
-    const poisonTargetId = selectedTarget !== "abstain" && selectedTarget !== "skip" ? selectedTarget : undefined;
+    const save = pending.canSave && witchSave;
+    const canUsePoison = pending.canPoison && (!save || game.rulePreset.witchRules.allowSaveAndPoisonSameNight);
+    const poisonTargetId = canUsePoison && witchPoisonTarget !== "skip" ? witchPoisonTarget : undefined;
     return { type: "SubmitWitchAction", seatId: pending.seatId, save, poisonTargetId, privateReason: "真人女巫行动。" };
   }
   if (pending.kind === "wolf_discussion") {
@@ -3167,14 +3874,13 @@ function buildSheriffElectionNotice(game: GameState): SheriffElectionNotice | un
   const votes = votePayload?.votes as Record<PlayerId, PlayerId | "abstain"> | undefined;
   const tally = votePayload?.tally as Record<PlayerId, number> | undefined;
   const winner = conclusionPayload.sheriffId as PlayerId | undefined;
+  const summary = votePayload ? formatVoteResolutionHeader("SheriffVoteResolved", votePayload) : undefined;
   return {
     seq: conclusion.seq,
     title: winner ? `${seatName(game, winner)} 当选警长` : "本局无警长",
-    voteRows: votes
-      ? Object.entries(votes).map(([voterId, targetId]) => `${seatName(game, voterId)} ${targetId === "abstain" ? "弃票" : `投给 ${seatName(game, targetId)}`}`)
-      : [],
-    tallyRows: tally ? Object.entries(tally).map(([targetId, count]) => `${seatName(game, targetId)} ${count}票`) : [],
-    result: winner ? `最终警徽给到 ${seatName(game, winner)}。` : `结果：${String(conclusionPayload.reason ?? "无人当选")}。`
+    voteRows: formatGroupedVoteRows(game, votes, tally),
+    tallyRows: tallyChips(game, tally),
+    result: `${summary ? `${summary}。` : ""}${winner ? `最终警徽给到 ${seatName(game, winner)}。` : `结果：${String(conclusionPayload.reason ?? "无人当选")}。`}`
   };
 }
 
@@ -3196,9 +3902,8 @@ function buildFlowNotice(
   dismissedKeys: string[]
 ): FlowNotice | undefined {
   if (!humanPlayerId) return undefined;
-  const phaseKeys = new Set<string>();
   for (const event of visibleEvents) {
-    const notice = flowNoticeForEvent(game, event, humanPlayerId, phaseKeys);
+    const notice = flowNoticeForEvent(game, event, humanPlayerId);
     if (notice && !dismissedKeys.includes(notice.key)) return notice;
   }
   return undefined;
@@ -3207,11 +3912,10 @@ function buildFlowNotice(
 function flowNoticeForEvent(
   game: GameState,
   event: ReturnType<typeof getVisibleEvents>[number],
-  humanPlayerId: PlayerId,
-  phaseKeys: Set<string>
+  humanPlayerId: PlayerId
 ): FlowNotice | undefined {
   const data = event.payload as Record<string, unknown>;
-  if (event.type === "PhaseStarted") return phaseNotice(game, event, humanPlayerId, phaseKeys);
+  if (event.type === "PhaseStarted") return undefined;
   if (event.type === "NightDeathsAnnounced") {
     const deaths = (data.deaths as PlayerId[] | undefined) ?? [];
     return {
@@ -3234,65 +3938,40 @@ function flowNoticeForEvent(
     };
   }
   if (event.type === "NightActionSubmitted" && event.seatId === humanPlayerId) {
-    const action = String(data.action ?? "");
-    return {
-      key: event.id,
-      kicker: "你的夜间行动",
-      title: action === "guard_protect" ? "守护已确认" : "夜间行动已确认",
-      body: data.targetId ? `你本晚选择了 ${seatName(game, data.targetId as PlayerId)}。` : "你的夜间行动已提交。",
-      rows: [],
-      chips: []
-    };
+    return undefined;
   }
   if (event.type === "WitchActionSubmitted" && event.seatId === humanPlayerId) {
-    const rows = [
-      data.wolfTarget ? `今晚刀口：${seatName(game, data.wolfTarget as PlayerId)}` : "今晚没有刀口信息",
-      data.save ? "你选择使用解药" : "你选择不使用解药",
-      data.poisonTargetId ? `毒药目标：${seatName(game, data.poisonTargetId as PlayerId)}` : "未使用毒药"
-    ];
-    return {
-      key: event.id,
-      kicker: "你的夜间行动",
-      title: "女巫行动已确认",
-      body: "你的用药选择已记录，其他玩家不会看到你的药况。",
-      rows,
-      chips: []
-    };
+    return undefined;
   }
   if (event.type === "WolfKillLocked") {
-    return {
-      key: event.id,
-      kicker: "狼人夜间结果",
-      title: "刀口已确认",
-      body: `狼队今晚的刀口是 ${seatName(game, data.targetId as PlayerId)}。`,
-      rows: [],
-      chips: []
-    };
+    return undefined;
   }
   if (event.type === "SheriffVoteResolved") {
     const top = (data.top as PlayerId[] | undefined) ?? [];
     const voteType = String(data.voteType ?? "");
     if (voteType !== "sheriff" || top.length <= 1) return undefined;
-    const votes = formatVoteRows(game, data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined);
+    const votes = data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined;
+    const tally = data.tally as Record<PlayerId, number> | undefined;
     const tiedPlayers = top.map((id) => seatName(game, id)).join("、");
     return {
       key: event.id,
       kicker: "警长投票结果",
       title: "首轮平票，进入 PK",
-      body: tiedPlayers ? `平票玩家：${tiedPlayers}。进入警长 PK 发言。` : "首轮警长投票平票，进入 PK 发言。",
-      rows: votes ? [votes] : [],
-      chips: tallyChips(game, data.tally as Record<PlayerId, number> | undefined)
+      body: `${formatVoteResolutionHeader(event.type, data)}。${tiedPlayers ? `平票玩家：${tiedPlayers}。进入警长 PK 发言。` : "首轮警长投票平票，进入 PK 发言。"}`,
+      rows: formatGroupedVoteRows(game, votes, tally),
+      chips: tallyChips(game, tally)
     };
   }
   if (event.type === "DayVoteResolved") {
-    const votes = formatVoteRows(game, data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined);
+    const votes = data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined;
+    const tally = data.tally as Record<PlayerId, number> | undefined;
     return {
       key: event.id,
       kicker: "投票结果",
       title: String(data.voteType ?? "") === "day_pk" ? "PK 投票结束" : "白天投票结束",
-      body: votes || "投票已经结算。",
-      rows: [],
-      chips: tallyChips(game, data.tally as Record<PlayerId, number> | undefined)
+      body: formatVoteResolutionHeader(event.type, data),
+      rows: formatGroupedVoteRows(game, votes, tally),
+      chips: tallyChips(game, tally)
     };
   }
   if (event.type === "NoExile") {
@@ -3368,86 +4047,6 @@ function flowNoticeForEvent(
   return undefined;
 }
 
-function phaseNotice(
-  game: GameState,
-  event: ReturnType<typeof getVisibleEvents>[number],
-  humanPlayerId: PlayerId,
-  phaseKeys: Set<string>
-): FlowNotice | undefined {
-  const data = event.payload as Record<string, unknown>;
-  const phase = String(data.phase ?? "");
-  const day = Number(data.day ?? game.day);
-  const actingSeatId = typeof data.actingSeatId === "string" ? data.actingSeatId : undefined;
-  const key = phaseNoticeKey(phase, day, actingSeatId === humanPlayerId);
-  if (!key || phaseKeys.has(key)) return undefined;
-  phaseKeys.add(key);
-
-  if (phase === "night_hidden") {
-    return {
-      key,
-      kicker: "夜晚阶段",
-      title: "天黑请闭眼",
-      body: day === 0 ? "首夜开始，夜间行动将按规则顺序进行。" : `第 ${day + 1} 夜开始，夜间行动将按规则顺序进行。`,
-      rows: [],
-      chips: []
-    };
-  }
-  if (phase === "night_guard" && actingSeatId === humanPlayerId) {
-    return { key, kicker: "夜晚阶段", title: "守卫行动", body: "请选择今晚要守护的玩家。", rows: [], chips: [] };
-  }
-  if (phase === "night_wolves" && canViewerSeeWolfChat(game, humanPlayerId)) {
-    return { key, kicker: "夜晚阶段", title: "狼人夜聊", body: "狼队可以讨论并确认今晚刀口。", rows: [], chips: [] };
-  }
-  if (phase === "night_seer" && actingSeatId === humanPlayerId) {
-    return { key, kicker: "夜晚阶段", title: "预言家查验", body: "请选择今晚要查验的玩家，提交后会显示查验结果。", rows: [], chips: [] };
-  }
-  if (phase === "night_witch" && actingSeatId === humanPlayerId) {
-    return { key, kicker: "夜晚阶段", title: "女巫行动", body: "请根据今晚刀口和药量选择是否用药。", rows: [], chips: [] };
-  }
-  if (phase === "sheriff_candidacy") {
-    return { key, kicker: "警长竞选", title: "是否上警", body: "请选择是否参与警长竞选；这一步不是正式警上发言。", rows: [], chips: [] };
-  }
-  if (phase === "sheriff_speech" || phase === "sheriff_pk_speech") {
-    return { key, kicker: "警长竞选", title: phase === "sheriff_pk_speech" ? "警长 PK 发言" : "警上发言开始", body: "候选人依次发言，可以在投票前退水。", rows: [], chips: [] };
-  }
-  if (phase === "sheriff_withdrawal") {
-    return { key, kicker: "警长竞选", title: "投票前退水确认", body: "上警玩家听完发言后可选择留警或退水。", rows: [], chips: [] };
-  }
-  if (phase === "sheriff_vote" || phase === "sheriff_pk_vote") {
-    return { key, kicker: "警长竞选", title: "警长投票", body: "警下玩家投票决定警长归属。", rows: [], chips: [] };
-  }
-  if (phase === "last_words") {
-    return { key, kicker: "死亡发言", title: "遗言阶段", body: "出局玩家依次发表遗言。", rows: [], chips: [] };
-  }
-  if (phase === "day_speech" || phase === "day_pk_speech") {
-    return { key, kicker: "白天阶段", title: phase === "day_pk_speech" ? "放逐 PK 发言" : "白天发言开始", body: "所有存活玩家按顺序发言，请根据公开信息判断。", rows: [], chips: [] };
-  }
-  if (phase === "day_vote" || phase === "day_pk_vote") {
-    return { key, kicker: "投票阶段", title: phase === "day_pk_vote" ? "PK 投票" : "投票放逐", body: "请根据发言、票型和公开信息投票。", rows: [], chips: [] };
-  }
-  if (phase === "hunter_shot") {
-    return { key, kicker: "猎人开枪", title: "猎人行动", body: "猎人可以选择是否开枪带走一名玩家。", rows: [], chips: [] };
-  }
-  if (phase === "badge_decision") {
-    return { key, kicker: "警徽移交", title: "警长死亡", body: "警长需要选择移交警徽或撕毁警徽。", rows: [], chips: [] };
-  }
-  if (phase === "ended") {
-    return { key, kicker: "游戏结束", title: game.winner === "wolves" ? "狼人胜利" : "好人胜利", body: game.endReason ?? "对局结束。", rows: [], chips: [] };
-  }
-  return undefined;
-}
-
-function phaseNoticeKey(phase: string, day: number, isHumanActor: boolean): string | undefined {
-  if (phase === "death_announcement" || phase === "night_resolve") return undefined;
-  if (phase === "night_hidden") return `phase:night:${day}`;
-  if (phase === "night_guard" || phase === "night_seer" || phase === "night_witch") return isHumanActor ? `phase:${phase}:${day}` : `phase:night:${day}`;
-  if (phase === "night_wolves") return `phase:night:${day}:wolves`;
-  if (phase === "sheriff_speech" || phase === "sheriff_pk_speech") return `phase:${phase}:${day}`;
-  if (phase === "day_speech" || phase === "day_pk_speech") return `phase:${phase}:${day}`;
-  if (phase) return `phase:${phase}:${day}`;
-  return undefined;
-}
-
 function eventSummary(game: GameState, type: string, payload: unknown, seatId?: PlayerId): string {
   const data = payload as Record<string, unknown>;
   if (type === "GameStarted") {
@@ -3465,7 +4064,10 @@ function eventSummary(game: GameState, type: string, payload: unknown, seatId?: 
   }
   if (type === "SheriffCandidateWithdrawn") return `${seatName(game, seatId)} 退水`;
   if (type === "SheriffSkipped") return `本局无警长：${String(data.reason ?? "")}`;
-  if (type === "NightActionSubmitted") return `${seatName(game, seatId)} 已提交夜间行动：${seatName(game, data.targetId as PlayerId)}`;
+  if (type === "NightActionSubmitted") {
+    if (data.action === "guard_protect" && !data.targetId) return `${seatName(game, seatId)} 空守`;
+    return `${seatName(game, seatId)} 已提交夜间行动：${seatName(game, data.targetId as PlayerId)}`;
+  }
   if (type === "NightActionPrivateReason") return "后台理由已记录，可在导出记录中追溯。";
   if (type === "SeerChecked") return `${seatName(game, seatId)} 查验 ${seatName(game, data.targetId as PlayerId)}：${data.result === "werewolf" ? "狼人" : "好人"}`;
   if (type === "SeerCheckPrivateReason") return "后台理由已记录，可在导出记录中追溯。";
@@ -3479,9 +4081,10 @@ function eventSummary(game: GameState, type: string, payload: unknown, seatId?: 
   if (type === "WolfKillLockedPrivateReason") return "后台理由已记录，可在导出记录中追溯。";
   if (type === "WolfDiscussionPrivateReason") return "后台理由已记录，可在导出记录中追溯。";
   if (type === "DayVoteResolved" || type === "SheriffVoteResolved") {
-    const votes = formatVoteRows(game, data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined);
+    const votes = data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined;
     const tally = formatTally(game, data.tally as Record<PlayerId, number> | undefined);
-    return `${type === "DayVoteResolved" ? "白天投票" : "警长投票"}结算：${votes ? `${votes}；` : ""}票型：${tally}`;
+    const rows = formatGroupedVoteRows(game, votes, data.tally as Record<PlayerId, number> | undefined);
+    return `${formatVoteResolutionHeader(type, data)}${rows.length > 0 ? `\n${rows.join("\n")}` : ""}\n票数统计：${tally}`;
   }
   if (type === "SpeechPublished" || type === "LastWordsPublished") return `${seatName(game, seatId)}：${String(data.text ?? "")}`;
   if (type === "WolfDiscussionMessage") return `${seatName(game, seatId)}：${String(data.messageToWolves ?? "")}`;
@@ -3519,21 +4122,102 @@ function sanitizeEventPayload(payload: unknown): unknown {
 
 function formatTally(game: GameState, tally: Record<PlayerId, number> | undefined): string {
   if (!tally) return "暂无票型";
-  return Object.entries(tally)
-    .map(([id, count]) => `${seatName(game, id)} ${count}票`)
+  return sortedTallyEntries(game, tally)
+    .map(([id, count]) => `${seatName(game, id)} ${formatVoteCount(count)}票`)
     .join("，");
 }
 
 function tallyChips(game: GameState, tally: Record<PlayerId, number> | undefined): string[] {
   if (!tally) return [];
-  return Object.entries(tally).map(([id, count]) => `${seatName(game, id)} ${count}票`);
+  return sortedTallyEntries(game, tally).map(([id, count]) => `${seatName(game, id)} ${formatVoteCount(count)}票`);
 }
 
-function formatVoteRows(game: GameState, votes: Record<PlayerId, PlayerId | "abstain"> | undefined): string {
-  if (!votes) return "";
-  return Object.entries(votes)
-    .map(([voterId, targetId]) => `${seatName(game, voterId)}${targetId === "abstain" ? "弃票" : `投给${seatName(game, targetId)}`}`)
-    .join("，");
+function formatVoteResolutionHeader(type: string, data: Record<string, unknown>): string {
+  const votes = data.votes as Record<PlayerId, PlayerId | "abstain"> | undefined;
+  const tally = data.tally as Record<PlayerId, number> | undefined;
+  const voteCount = votes ? Object.keys(votes).length : 0;
+  const abstainCount = votes ? Object.values(votes).filter((targetId) => targetId === "abstain").length : 0;
+  const candidateCount = tally ? Object.keys(tally).length : 0;
+  if (type === "SheriffVoteResolved") {
+    const title = String(data.voteType ?? "") === "sheriff_pk" ? "警长 PK 投票结算" : "警长投票结算";
+    return `${title}（最终候选 ${candidateCount} 人，警下投票 ${voteCount} 人，弃权 ${abstainCount} 人，退水玩家不可投票）`;
+  }
+  if (String(data.voteType ?? "") === "day_pk") {
+    return `PK 投票结算（最终候选 ${candidateCount} 人，投票 ${voteCount} 人，弃权 ${abstainCount} 人）`;
+  }
+  return `白天投票结算（投票 ${voteCount} 人，弃权 ${abstainCount} 人）`;
+}
+
+function formatGroupedVoteRows(
+  game: GameState,
+  votes: Record<PlayerId, PlayerId | "abstain"> | undefined,
+  tally: Record<PlayerId, number> | undefined
+): string[] {
+  if (!votes) return [];
+  const grouped = new Map<PlayerId | "abstain", PlayerId[]>();
+  for (const [voterId, targetId] of Object.entries(votes)) {
+    const voters = grouped.get(targetId) ?? [];
+    voters.push(voterId);
+    grouped.set(targetId, voters);
+  }
+  for (const voters of grouped.values()) {
+    voters.sort((left, right) => seatNumberFor(game, left) - seatNumberFor(game, right));
+  }
+
+  const rows: string[] = [];
+  const targetIds = sortedVoteTargets(game, grouped, tally);
+  for (const targetId of targetIds) {
+    const voters = grouped.get(targetId) ?? [];
+    const count = tally?.[targetId] ?? voters.length;
+    if (count === 0 && voters.length === 0) continue;
+    rows.push(`${compactSeatName(game, targetId)}（${formatVoteCount(count)}票）：${formatCompactSeatList(game, voters)}`);
+  }
+  const abstainVoters = grouped.get("abstain") ?? [];
+  if (abstainVoters.length > 0) {
+    rows.push(`弃票（${abstainVoters.length}票）：${formatCompactSeatList(game, abstainVoters)}`);
+  }
+  return rows;
+}
+
+function sortedVoteTargets(
+  game: GameState,
+  grouped: Map<PlayerId | "abstain", PlayerId[]>,
+  tally: Record<PlayerId, number> | undefined
+): PlayerId[] {
+  const targetIds = new Set<PlayerId>();
+  if (tally) {
+    for (const targetId of Object.keys(tally)) targetIds.add(targetId);
+  }
+  for (const targetId of grouped.keys()) {
+    if (targetId !== "abstain") targetIds.add(targetId);
+  }
+  return [...targetIds].sort((left, right) => {
+    const countDiff = (tally?.[right] ?? grouped.get(right)?.length ?? 0) - (tally?.[left] ?? grouped.get(left)?.length ?? 0);
+    if (countDiff !== 0) return countDiff;
+    return seatNumberFor(game, left) - seatNumberFor(game, right);
+  });
+}
+
+function sortedTallyEntries(game: GameState, tally: Record<PlayerId, number>): Array<[PlayerId, number]> {
+  return Object.entries(tally).sort(([leftId, leftCount], [rightId, rightCount]) => {
+    const countDiff = rightCount - leftCount;
+    if (countDiff !== 0) return countDiff;
+    return seatNumberFor(game, leftId) - seatNumberFor(game, rightId);
+  });
+}
+
+function formatCompactSeatList(game: GameState, seatIds: PlayerId[]): string {
+  return seatIds.length > 0 ? seatIds.map((id) => compactSeatName(game, id)).join("、") : "无";
+}
+
+function compactSeatName(game: GameState, id: PlayerId): string {
+  const player = game.players.find((item) => item.id === id);
+  return player ? `${player.seatNumber}号` : seatName(game, id);
+}
+
+function formatVoteCount(count: number): string {
+  if (Number.isInteger(count)) return String(count);
+  return count.toFixed(1).replace(/\.0$/, "");
 }
 
 function seatName(game: GameState, id?: PlayerId): string {
@@ -3650,7 +4334,7 @@ function ensureDefaultModelRecord(config: AIConfigStore, provider: ProviderAccou
         inputPricePerMillion: 0,
         outputPricePerMillion: 0,
         supportsStructuredOutput: true,
-        supportsReasoningEffort: provider.supportsReasoningEffort,
+        supportsReasoningEffort: providerSupportsReasoningEffort(provider),
         supportsCachedTokens: false,
         enabled: true,
         notes: "由 API 接入页默认模型自动创建。"

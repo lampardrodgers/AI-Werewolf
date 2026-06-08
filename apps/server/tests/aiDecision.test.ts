@@ -43,6 +43,7 @@ describe("AI decision service", () => {
     if (!("legalTargets" in pending)) throw new Error("expected target action");
     const legalTarget = pending.legalTargets[0];
     const config = withRealProvider();
+    config.providers[0].retryCount = 2;
     let calls = 0;
     const adapter = fakeAdapter(async () => {
       calls += 1;
@@ -100,7 +101,7 @@ describe("AI decision service", () => {
           message_to_wolves: "使用浏览器临时密钥完成一次合法动作。",
           proposed_target: legalTarget,
           agree_current_proposal: true,
-          private_reason: "验证服务端不读取持久化密钥。"
+          private_reason: "结合首夜狼人讨论阶段和当前合法刀口，验证服务端只把浏览器临时密钥传给真实供应商。"
         },
         raw: {},
         usage: { inputTokens: 100, outputTokens: 20 },
@@ -117,6 +118,40 @@ describe("AI decision service", () => {
 
     expect(response.ok).toBe(true);
     expect(receivedApiKey).toBe("browser-only-key");
+  });
+
+  it("accepts guard skip protection from a real model response", async () => {
+    const state = createGame({
+      totalPlayers: 10,
+      humanPlayers: 0,
+      aiPlayers: 10,
+      seed: "ai-decision-guard-skip",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions.find((action) => action.kind === "guard_protect");
+    if (!pending || pending.kind !== "guard_protect") throw new Error("expected guard pending action");
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        target_id: "skip",
+        private_reason: "本轮没有明确高收益守护目标，选择空守以规避守救冲突和机械守护。"
+      },
+      raw: {},
+      usage: { inputTokens: 100, outputTokens: 12 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({
+      type: "SubmitNightAction",
+      action: "guard_protect",
+      targetId: "skip"
+    });
   });
 
   it("honors an explicit model decision to skip sheriff candidacy", async () => {
@@ -139,6 +174,108 @@ describe("AI decision service", () => {
     expect(response.ok).toBe(true);
     expect(response.fallback).toBe(false);
     expect(response.command).toMatchObject({ type: "SubmitSheriffCandidacy", runForSheriff: false });
+  });
+
+  it("uses wolf night sheriff plan and rejects a wolf who agreed to stay down", async () => {
+    const state = createGame({
+      totalPlayers: 12,
+      humanPlayers: 0,
+      aiPlayers: 12,
+      seed: "ai-decision-wolf-sheriff-plan",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const seat = (seatNumber: number) => {
+      const player = state.players.find((item) => item.seatNumber === seatNumber);
+      if (!player) throw new Error(`missing seat ${seatNumber}`);
+      return player;
+    };
+    for (const player of state.players) player.role = "villager";
+    for (const seatNumber of [1, 6, 9, 12]) seat(seatNumber).role = "werewolf";
+    const seat6 = seat(6);
+    state.day = 1;
+    state.phase = { type: "sheriff_candidacy", day: 1, label: "警长竞选 · 是否上警" };
+    state.pendingActions = [{ kind: "sheriff_candidacy", seatId: seat6.id }];
+    const createdAt = new Date().toISOString();
+    state.events.push(
+      {
+        id: "event_wolf_plan_runner",
+        gameId: state.id,
+        seq: state.events.length + 1,
+        type: "WolfDiscussionMessage",
+        visibility: "private",
+        seatId: seat(1).id,
+        payload: {
+          seatId: seat(1).id,
+          round: 1,
+          messageToWolves: "我来一波自刀，骗一个银水，然后悍跳预言家，大家警下投我，你们都别上警我来上。",
+          proposedTarget: seat(1).id,
+          agreeCurrentProposal: true
+        },
+        createdAt
+      },
+      {
+        id: "event_wolf_plan_seat6_stay_down",
+        gameId: state.id,
+        seq: state.events.length + 2,
+        type: "WolfDiscussionMessage",
+        visibility: "private",
+        seatId: seat6.id,
+        payload: {
+          seatId: seat6.id,
+          round: 1,
+          messageToWolves: "我同意1号自刀悍跳的方案。我明天不上警，警下直接冲票。",
+          proposedTarget: seat(1).id,
+          agreeCurrentProposal: true
+        },
+        createdAt
+      }
+    );
+
+    const config = withRealProvider();
+    let objectCalls = 0;
+    let textCalls = 0;
+    const prompts: string[] = [];
+    const adapter = fakeAdapter(async (request) => {
+      objectCalls += 1;
+      prompts.push(request.prompt);
+      return {
+        text: "{}",
+        object: {
+          run_for_sheriff: true,
+          public_speech: "我选择上警，警上正式发言再展开。",
+          private_reason: "第一轮故意违背狼队夜聊安排，验证服务端会拒绝明确警下狼人继续上警。"
+        },
+        raw: { objectCalls },
+        usage: { inputTokens: 100, outputTokens: 22 },
+        latencyMs: 3
+      };
+    });
+    adapter.generateText = async (request) => {
+      textCalls += 1;
+      prompts.push(request.prompt);
+      return {
+        text: JSON.stringify({
+          run_for_sheriff: false,
+          public_speech: "我不上警，警下听发言和投票。",
+          private_reason: "狼队夜聊已经明确安排我警下保票支持1号悍跳，我不上警可以保留关键警下票。"
+        }),
+        raw: { textCalls },
+        usage: { inputTokens: 80, outputTokens: 28 },
+        latencyMs: 4
+      };
+    };
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({ type: "SubmitSheriffCandidacy", seatId: seat6.id, runForSheriff: false });
+    expect(objectCalls).toBe(1);
+    expect(textCalls).toBe(1);
+    expect(prompts[0]).toContain("狼队夜聊警上计划");
+    expect(prompts[0]).toContain("我明天不上警");
+    expect(response.llmCall?.retryCount).toBe(1);
   });
 
   it("infers sheriff candidacy intent from public speech when the boolean field is omitted", async () => {
@@ -282,6 +419,60 @@ describe("AI decision service", () => {
     expect(capturedPrompt).not.toContain("上下文压缩：COMPACT");
   });
 
+  it("highlights the AI player's own prior vote before public speech", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-own-vote-speech",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const speaker = state.players[5];
+    const target = state.players[3];
+    state.day = 1;
+    state.phase = { type: "day_speech", day: 1, label: "第 1 天 · 白天发言", actingSeatId: speaker.id };
+    state.pendingActions = [{ kind: "speech", seatId: speaker.id, speechType: "day" }];
+    state.events.push({
+      id: "event_own_vote_before_speech",
+      gameId: state.id,
+      seq: Math.max(...state.events.map((event) => event.seq), 0) + 1,
+      type: "VoteCast",
+      visibility: "admin",
+      seatId: speaker.id,
+      payload: {
+        voteType: "sheriff",
+        targetId: target.id,
+        privateReason: "测试自己的警长投票会进入后续发言提示。",
+        confidence: 0.7
+      },
+      createdAt: new Date().toISOString()
+    });
+    const config = withRealProvider();
+    let capturedPrompt = "";
+    const adapter = fakeAdapter(async (request) => {
+      capturedPrompt = request.prompt;
+      return {
+        text: "{}",
+        object: {
+          public_speech: `我先承认刚才警长票投给${target.seatNumber}号，现在继续围绕这张票和警上发言解释。`,
+          private_reason: "公开发言先对齐自己上一张警长票，再继续根据公开票型和警上发言展开。",
+          memory_update: {}
+        },
+        raw: {},
+        usage: { inputTokens: 100, outputTokens: 24 },
+        latencyMs: 3
+      };
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(capturedPrompt).toContain("你的最近一次真实投票");
+    expect(capturedPrompt).toContain(`警长投票中投给${target.seatNumber}号`);
+  });
+
   it("uses compact public context when automatic compression exceeds the prompt budget", async () => {
     const state = createGame({
       totalPlayers: 8,
@@ -328,7 +519,7 @@ describe("AI decision service", () => {
     expect(capturedPrompt).toContain("公开索引 #");
   });
 
-  it("falls back without calling the adapter when compression is disabled and full prompt overflows", async () => {
+  it("fails without fallback or adapter calls when compression is disabled and full prompt overflows", async () => {
     const state = createGame({
       totalPlayers: 8,
       humanPlayers: 0,
@@ -351,11 +542,144 @@ describe("AI decision service", () => {
 
     const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
 
-    expect(response.ok).toBe(true);
-    expect(response.fallback).toBe(true);
+    expect(response.ok).toBe(false);
+    expect(response.fallback).toBe(false);
     expect(response.error).toContain("context_overflow");
-    expect(response.llmCall?.promptCompressionLevel).toBe("OVERFLOW_FALLBACK");
+    expect(response.error).toContain("已关闭上下文压缩");
+    expect(response.command).toBeUndefined();
+    expect(response.llmCall).toBeUndefined();
     expect(calls).toBe(0);
+  });
+
+  it("fails without fallback when automatic compression still exceeds the prompt budget", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-context-auto-overflow",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    appendPublicSpeechFlood(state, 180);
+    const config = withRealProvider();
+    config.contextCompression = DEFAULT_CONTEXT_COMPRESSION;
+    config.models[0].contextWindow = 2048;
+    config.models[0].maxOutputTokens = 800;
+    config.personas = config.personas.map((persona) => ({ ...persona, contextLimit: 2048, maxOutputTokens: 800 }));
+    let calls = 0;
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      throw new Error("adapter should not be called after compact context overflow");
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(false);
+    expect(response.fallback).toBe(false);
+    expect(response.error).toContain("context_overflow");
+    expect(response.error).toContain("COMPACT");
+    expect(response.error).toContain("上下文窗口=2048");
+    expect(response.error).toContain("压缩模式=auto");
+    expect(response.command).toBeUndefined();
+    expect(response.llmCall).toBeUndefined();
+    expect(calls).toBe(0);
+  });
+
+  it("uses the configured model context window instead of capping by persona contextLimit", async () => {
+    const state = createGame({
+      totalPlayers: 12,
+      humanPlayers: 0,
+      aiPlayers: 12,
+      seed: "ai-decision-model-context-window",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions[0];
+    if (!pending || pending.kind !== "guard_protect") throw new Error("expected guard pending action");
+    appendPublicSpeechFlood(state, 3500);
+    const config = withRealProvider();
+    config.models[0].name = "deepseek-v4-flash";
+    config.models[0].contextWindow = 1_000_000;
+    config.models[0].maxOutputTokens = 384_000;
+    config.personas = config.personas.map((persona) => ({
+      ...persona,
+      defaultModel: "deepseek-v4-flash",
+      contextLimit: 16_000,
+      maxOutputTokens: 900
+    }));
+    let calls = 0;
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      return {
+        text: "{}",
+        object: {
+          target_id: pending.legalTargets[0],
+          private_reason: "测试模型上下文窗口优先级，persona contextLimit 只有 16000，但模型窗口足够容纳长局公开记录。"
+        },
+        raw: {},
+        usage: { inputTokens: 1000, outputTokens: 50 },
+        latencyMs: 3
+      };
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.llmCall?.promptCompressionLevel).toBe("FULL");
+    expect(response.llmCall?.promptBudgetTokens).toBeGreaterThan(800_000);
+    expect(response.llmCall?.estimatedInputTokens).toBeGreaterThan(16_000);
+    expect(calls).toBe(1);
+  });
+
+  it("keeps compact public context bounded when a large model still cannot fit the full prompt", async () => {
+    const state = createGame({
+      totalPlayers: 12,
+      humanPlayers: 0,
+      aiPlayers: 12,
+      seed: "ai-decision-compact-bounded-index",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions[0];
+    if (!pending || pending.kind !== "guard_protect") throw new Error("expected guard pending action");
+    appendPublicSpeechFlood(state, 18_000);
+    const config = withRealProvider();
+    config.models[0].name = "deepseek-v4-flash";
+    config.models[0].contextWindow = 1_000_000;
+    config.models[0].maxOutputTokens = 384_000;
+    config.personas = config.personas.map((persona) => ({
+      ...persona,
+      defaultModel: "deepseek-v4-flash",
+      contextLimit: 16_000,
+      maxOutputTokens: 900
+    }));
+    let capturedPrompt = "";
+    let calls = 0;
+    const adapter = fakeAdapter(async (request) => {
+      calls += 1;
+      capturedPrompt = request.prompt;
+      return {
+        text: "{}",
+        object: {
+          target_id: pending.legalTargets[0],
+          private_reason: "测试超长公开记录下的折叠压缩索引，压缩后仍保留玩家发言索引和关键事实账本。"
+        },
+        raw: {},
+        usage: { inputTokens: 1000, outputTokens: 50 },
+        latencyMs: 3
+      };
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.llmCall?.promptCompressionLevel).toBe("COMPACT");
+    expect(response.llmCall?.estimatedInputTokens).toBeLessThan(response.llmCall?.promptBudgetTokens ?? 0);
+    expect(capturedPrompt).toContain("已按玩家折叠");
+    expect(capturedPrompt).toContain("公开发言索引");
+    expect(calls).toBe(1);
   });
 
   it("honors a per-request full-only context override without changing global config", async () => {
@@ -386,10 +710,12 @@ describe("AI decision service", () => {
       () => adapter
     );
 
-    expect(response.ok).toBe(true);
-    expect(response.fallback).toBe(true);
+    expect(response.ok).toBe(false);
+    expect(response.fallback).toBe(false);
     expect(response.error).toContain("context_overflow");
-    expect(response.llmCall?.promptCompressionLevel).toBe("OVERFLOW_FALLBACK");
+    expect(response.error).toContain("已关闭上下文压缩");
+    expect(response.command).toBeUndefined();
+    expect(response.llmCall).toBeUndefined();
     expect(config.contextCompression).toEqual(DEFAULT_CONTEXT_COMPRESSION);
     expect(calls).toBe(0);
   });
@@ -453,7 +779,7 @@ describe("AI decision service", () => {
     expect(response.command).toMatchObject({ type: "SubmitWolfDiscussionMessage", proposedTargetId: legalTarget });
   });
 
-  it("falls back after repeated model output failures", async () => {
+  it("fails without fallback after real model output failures", async () => {
     const state = createGame({
       totalPlayers: 8,
       humanPlayers: 0,
@@ -469,14 +795,13 @@ describe("AI decision service", () => {
 
     const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
 
-    expect(response.ok).toBe(true);
-    expect(response.fallback).toBe(true);
-    expect(response.llmCall?.provider).toBe("fallback");
-    expect(response.llmCall?.retryCount).toBe(5);
+    expect(response.ok).toBe(false);
+    expect(response.fallback).toBe(false);
+    expect(response.llmCall).toBeUndefined();
     expect(response.error).toContain("真实 AI 输出连续失败");
   });
 
-  it("uses compact repair attempts even when provider retryCount is zero", async () => {
+  it("caps real provider retries when provider retryCount is zero", async () => {
     const state = createGame({
       totalPlayers: 8,
       humanPlayers: 0,
@@ -501,14 +826,12 @@ describe("AI decision service", () => {
 
     const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
 
-    expect(response.ok).toBe(true);
-    expect(response.fallback).toBe(true);
-    expect(calls).toBe(6);
-    expect(response.llmCall?.retryCount).toBe(5);
-    expect(prompts[2]).toContain("### Compact Output Repair");
-    expect(prompts[2]).not.toContain("JSON Schema");
-    expect(temperatures[2]).toBeLessThanOrEqual(0.2);
-    expect(outputLimits[2]).toBeLessThanOrEqual(600);
+    expect(response.ok).toBe(false);
+    expect(response.fallback).toBe(false);
+    expect(calls).toBe(1);
+    expect(prompts[0]).toContain("JSON Schema");
+    expect(temperatures[0]).toBeDefined();
+    expect(outputLimits[0]).toBeDefined();
   });
 
   it("accepts common model field aliases without spending a retry", async () => {
@@ -580,6 +903,7 @@ describe("AI decision service", () => {
     state.phase = { type: "day_speech", day: 1, label: "白天发言", actingSeatId: seatId };
     state.pendingActions = [{ kind: "speech", seatId, speechType: "day" }];
     const config = withRealProvider();
+    config.providers[0].retryCount = 2;
     let calls = 0;
     const adapter = fakeAdapter(async () => {
       calls += 1;
@@ -623,6 +947,254 @@ describe("AI decision service", () => {
     expect(calls).toBe(2);
   });
 
+  it("repairs public speech that repeats a recent player verbatim", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-duplicate-public-speech",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const previousSeatId = state.players[0].id;
+    const seatId = state.players[1].id;
+    const duplicateSpeech = "1号坚持自刀，我虽然觉得风险大，但既然他这么坚决，我同意。警上安排：1号悍跳预言家，发我8号金水，警徽流留6号。";
+    state.day = 1;
+    state.phase = { type: "day_speech", day: 1, label: "白天发言", actingSeatId: seatId };
+    state.pendingActions = [{ kind: "speech", seatId, speechType: "day" }];
+    state.events.push({
+      id: "event_duplicate_previous_speech",
+      gameId: state.id,
+      seq: 999,
+      type: "SpeechPublished",
+      visibility: "public",
+      seatId: previousSeatId,
+      payload: { speechType: "day", text: duplicateSpeech },
+      createdAt: new Date().toISOString()
+    });
+    const config = withRealProvider();
+    let objectCalls = 0;
+    let textCalls = 0;
+    const adapter = fakeAdapter(async () => {
+      objectCalls += 1;
+      return {
+        text: "{}",
+        object: {
+          public_speech: duplicateSpeech,
+          private_reason: "第一轮故意完整复读上一位发言，验证服务端会拒绝重复内容。",
+          memory_update: {}
+        },
+        raw: { objectCalls },
+        usage: { inputTokens: 100, outputTokens: 24 },
+        latencyMs: 3
+      };
+    });
+    adapter.generateText = async () => {
+      textCalls += 1;
+      return {
+        text: JSON.stringify({
+          public_speech: "我不照抄前置观点。现在我更在意警上安排和刀口逻辑是否一致，先压前置给出的6号警徽流理由。",
+          private_reason: "修复请求根据重复错误换成不同角度，围绕警徽流和刀口逻辑重新组织公开发言。",
+          memory_update: {}
+        }),
+        raw: { textCalls },
+        usage: { inputTokens: 80, outputTokens: 28 },
+        latencyMs: 4
+      };
+    };
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({
+      type: "SubmitSpeech",
+      text: "我不照抄前置观点。现在我更在意警上安排和刀口逻辑是否一致，先压前置给出的6号警徽流理由。"
+    });
+    expect(objectCalls).toBe(1);
+    expect(textCalls).toBe(1);
+    expect(response.llmCall?.retryCount).toBe(1);
+  });
+
+  it("repairs wolf discussion that repeats a teammate verbatim", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-duplicate-wolf-chat",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions[0];
+    if (!("legalTargets" in pending) || pending.kind !== "wolf_discussion") throw new Error("expected wolf discussion action");
+    const teammate = state.players.find((player) => player.role === "werewolf" && player.id !== pending.seatId);
+    if (!teammate) throw new Error("expected wolf teammate");
+    const legalTarget = pending.legalTargets[0];
+    const duplicateMessage = "我同意先刀1号，自刀能制造银水和警徽压力，明天1号悍跳预言家，队友警下倒钩看票型。";
+    state.events.push({
+      id: "event_duplicate_wolf_message",
+      gameId: state.id,
+      seq: 999,
+      type: "WolfDiscussionMessage",
+      visibility: "private",
+      seatId: teammate.id,
+      payload: { round: 1, messageToWolves: duplicateMessage, proposedTarget: legalTarget, agreeCurrentProposal: true },
+      createdAt: new Date().toISOString()
+    });
+    const config = withRealProvider();
+    let objectCalls = 0;
+    let textCalls = 0;
+    const adapter = fakeAdapter(async () => {
+      objectCalls += 1;
+      return {
+        text: "{}",
+        object: {
+          message_to_wolves: duplicateMessage,
+          proposed_target: legalTarget,
+          agree_current_proposal: true,
+          private_reason: "第一轮故意完整复读队友夜聊发言，验证服务端会拒绝重复内容。"
+        },
+        raw: { objectCalls },
+        usage: { inputTokens: 100, outputTokens: 24 },
+        latencyMs: 3
+      };
+    });
+    adapter.generateText = async () => {
+      textCalls += 1;
+      return {
+        text: JSON.stringify({
+          message_to_wolves: "我不复述前置。刀口我仍建议压关键位置，但明天我走倒钩路线，优先观察警上谁接预言家身份。",
+          proposed_target: legalTarget,
+          agree_current_proposal: true,
+          private_reason: "修复请求换成不同狼队分工，明确自己负责倒钩和观察警上身份。"
+        }),
+        raw: { textCalls },
+        usage: { inputTokens: 80, outputTokens: 28 },
+        latencyMs: 4
+      };
+    };
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({
+      type: "SubmitWolfDiscussionMessage",
+      messageToWolves: "我不复述前置。刀口我仍建议压关键位置，但明天我走倒钩路线，优先观察警上谁接预言家身份。"
+    });
+    expect(objectCalls).toBe(1);
+    expect(textCalls).toBe(1);
+    expect(response.llmCall?.retryCount).toBe(1);
+  });
+
+  it("retries when public speech references a non-existent seat number", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-invalid-seat-in-speech",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const seatId = state.players[7].id;
+    state.phase = { type: "sheriff_speech", day: 1, label: "警长竞选 · 上警发言", actingSeatId: seatId };
+    state.pendingActions = [{ kind: "speech", seatId, speechType: "sheriff" }];
+    const config = withRealProvider();
+    config.providers[0].retryCount = 2;
+    let calls = 0;
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      return {
+        text: "{}",
+        object:
+          calls === 1
+            ? {
+                public_speech: "我先上警抢发言视角。警徽流先5后9，9号是警下压力位。",
+                private_reason: "第一轮故意引用八人局不存在的九号，验证服务端会要求模型重新输出。",
+                memory_update: {}
+              }
+            : {
+                public_speech: "我先上警抢发言视角。警徽流先5后7，后面重点听5号和7号解释站边。",
+                private_reason: "第二轮只引用本局存在座位，警徽流也限定在八人局合法座位内。",
+                memory_update: {}
+              },
+        raw: { calls },
+        usage: { inputTokens: 100, outputTokens: 24 },
+        latencyMs: 3
+      };
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({
+      type: "SubmitSpeech",
+      text: "我先上警抢发言视角。警徽流先5后7，后面重点听5号和7号解释站边。"
+    });
+    expect(response.llmCall?.retryCount).toBe(1);
+    expect(calls).toBe(2);
+  });
+
+  it("repairs public speech that misstates the current sheriff", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-wrong-sheriff-claim",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const sheriff = state.players[0];
+    const speaker = state.players[5];
+    state.sheriffSeatId = sheriff.id;
+    for (const player of state.players) player.isSheriff = player.id === sheriff.id;
+    state.phase = { type: "day_speech", day: 1, label: "第 2 天 · 白天发言", actingSeatId: speaker.id };
+    state.pendingActions = [{ kind: "speech", seatId: speaker.id, speechType: "day" }];
+    const config = withRealProvider();
+    let objectCalls = 0;
+    let textCalls = 0;
+    const adapter = fakeAdapter(async () => {
+      objectCalls += 1;
+      return {
+        text: "{}",
+        object: {
+          public_speech: "6号是警长，今天应该由6号归票。",
+          private_reason: "第一轮故意错误声称6号持有警徽，验证服务端会拒绝警长归属幻觉。",
+          memory_update: {}
+        },
+        raw: { objectCalls },
+        usage: { inputTokens: 100, outputTokens: 24 },
+        latencyMs: 3
+      };
+    });
+    adapter.generateText = async () => {
+      textCalls += 1;
+      return {
+        text: JSON.stringify({
+          public_speech: "当前警长是1号，我会听1号归票，但仍要对6号上一轮发言单独评估。",
+          private_reason: "修复后只承认真实警长1号，并把6号作为普通发言对象分析。",
+          memory_update: {}
+        }),
+        raw: { textCalls },
+        usage: { inputTokens: 80, outputTokens: 28 },
+        latencyMs: 4
+      };
+    };
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(false);
+    expect(response.command).toMatchObject({
+      type: "SubmitSpeech",
+      text: "当前警长是1号，我会听1号归票，但仍要对6号上一轮发言单独评估。"
+    });
+    expect(objectCalls).toBe(1);
+    expect(textCalls).toBe(1);
+    expect(response.llmCall?.retryCount).toBe(1);
+  });
+
   it("retries when a wolf public speech leaks private wolf identity facts", async () => {
     const state = createGame({
       totalPlayers: 8,
@@ -638,6 +1210,7 @@ describe("AI decision service", () => {
     state.phase = { type: "day_speech", day: 1, label: "白天发言", actingSeatId: seatId };
     state.pendingActions = [{ kind: "speech", seatId, speechType: "day" }];
     const config = withRealProvider();
+    config.providers[0].retryCount = 2;
     let calls = 0;
     const adapter = fakeAdapter(async () => {
       calls += 1;
@@ -766,7 +1339,7 @@ describe("AI decision service", () => {
     expect(textCalls).toBe(1);
   });
 
-  it("retries real text repair before using deterministic fallback", async () => {
+  it("stops after one real text repair failure without deterministic fallback", async () => {
     const state = createGame({
       totalPlayers: 8,
       humanPlayers: 0,
@@ -810,16 +1383,13 @@ describe("AI decision service", () => {
 
     const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
 
-    expect(response.ok).toBe(true);
+    expect(response.ok).toBe(false);
     expect(response.fallback).toBe(false);
-    expect(response.command).toMatchObject({
-      type: "SubmitSpeech",
-      text: "我继续按公开发言和票型推进，优先看站边摇摆和跟票位置。"
-    });
-    expect(response.llmCall?.provider).toBe("Real Provider");
-    expect(response.llmCall?.retryCount).toBe(2);
-    expect(objectCalls).toBe(2);
-    expect(textCalls).toBe(2);
+    expect(response.command).toBeUndefined();
+    expect(response.llmCall).toBeUndefined();
+    expect(response.error).toContain("真实 AI 输出连续失败");
+    expect(objectCalls).toBe(1);
+    expect(textCalls).toBe(1);
   });
 
   it("retries when private reason is too vague for replay", async () => {
@@ -835,6 +1405,7 @@ describe("AI decision service", () => {
     if (!("legalTargets" in pending)) throw new Error("expected target action");
     const legalTarget = pending.legalTargets[0];
     const config = withRealProvider();
+    config.providers[0].retryCount = 2;
     let calls = 0;
     const adapter = fakeAdapter(async () => {
       calls += 1;
@@ -955,7 +1526,7 @@ describe("AI decision service", () => {
     expect(response.llmCall?.retryCount).toBe(0);
   });
 
-  it("passes persona sampling settings and supported reasoning effort to the adapter", async () => {
+  it("passes persona sampling settings and provider reasoning effort to the adapter", async () => {
     const state = createGame({
       totalPlayers: 8,
       humanPlayers: 0,
@@ -969,6 +1540,7 @@ describe("AI decision service", () => {
     const legalTarget = pending.legalTargets[0];
     const config = withRealProvider();
     config.providers[0].supportsReasoningEffort = true;
+    config.providers[0].reasoningEffort = "low";
     config.costControls = { enabled: true, maxGameCost: 1, maxSeatCost: 1, maxOutputTokensPerCall: 123 };
     config.personas[0].topP = 0.72;
     config.personas[0].reasoningEffort = "high";
@@ -999,7 +1571,7 @@ describe("AI decision service", () => {
 
     expect(response.ok).toBe(true);
     expect(capturedTopP).toBe(0.72);
-    expect(capturedReasoningEffort).toBe("high");
+    expect(capturedReasoningEffort).toBe("low");
     expect(capturedMaxOutputTokens).toBe(123);
     expect(capturedTimeoutMs).toBe(0);
   });
@@ -1499,7 +2071,7 @@ describe("AI decision service", () => {
     const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
 
     expect(response.ok).toBe(true);
-    expect(response.llmCall?.promptVersion).toBe("werewolf-system-v10");
+    expect(response.llmCall?.promptVersion).toBe("werewolf-system-v11");
     expect(capturedPrompt).toContain("信息确认边界");
     expect(capturedPrompt).toContain("死亡、出局、被投票和遗言不会自动公开真实身份");
     expect(capturedPrompt).toContain("没有警下票型、PK 票型、死亡信息、对跳或站边时，禁止把这些内容编成依据");
@@ -1663,7 +2235,7 @@ describe("AI decision service", () => {
     expect(response.llmCall?.retryCount).toBe(0);
   });
 
-  it("uses fallback when cost protection has already reached the game budget", async () => {
+  it("fails without fallback when cost protection has already reached the game budget", async () => {
     const state = createGame({
       totalPlayers: 8,
       humanPlayers: 0,
@@ -1702,9 +2274,10 @@ describe("AI decision service", () => {
 
     const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
 
-    expect(response.ok).toBe(true);
-    expect(response.fallback).toBe(true);
+    expect(response.ok).toBe(false);
+    expect(response.fallback).toBe(false);
     expect(response.error).toContain("成本保护");
+    expect(response.llmCall).toBeUndefined();
     expect(calls).toBe(0);
   });
 });

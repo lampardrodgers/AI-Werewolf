@@ -13,7 +13,7 @@ export interface LLMTextRequest {
   temperature?: number;
   topP?: number;
   maxOutputTokens?: number;
-  reasoningEffort?: "minimal" | "low" | "medium" | "high";
+  reasoningEffort?: "minimal" | "low" | "medium" | "high" | "max";
   apiKey?: string;
   timeoutMs?: number;
 }
@@ -110,7 +110,7 @@ class OpenAIResponsesAdapter implements LLMProviderAdapter {
         temperature: req.temperature,
         top_p: req.topP,
         max_output_tokens: req.maxOutputTokens,
-        reasoning: req.reasoningEffort ? { effort: req.reasoningEffort } : undefined
+        reasoning: requestReasoningEffort(req) ? { effort: requestReasoningEffort(req) } : undefined
       })
     }, req.timeoutMs ?? req.provider.timeoutMs);
     const raw = (await response.json()) as OpenAIResponsePayload;
@@ -138,7 +138,7 @@ class OpenAIResponsesAdapter implements LLMProviderAdapter {
         temperature: req.temperature,
         top_p: req.topP,
         max_output_tokens: req.maxOutputTokens,
-        reasoning: req.reasoningEffort ? { effort: req.reasoningEffort } : undefined,
+        reasoning: requestReasoningEffort(req) ? { effort: requestReasoningEffort(req) } : undefined,
         text: req.provider.supportsJsonSchema ? { format: jsonSchemaTextFormat(req.schema) } : undefined
       })
     }, req.timeoutMs ?? req.provider.timeoutMs);
@@ -171,6 +171,8 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
 
   async generateText(req: LLMTextRequest): Promise<LLMTextResponse> {
     const started = Date.now();
+    const thinking = deepSeekThinkingOption(req.provider);
+    const reasoningEffort = requestReasoningEffort(req);
     const response = await fetchWithTimeout(`${req.provider.baseUrl || this.defaultBaseUrl}/chat/completions`, {
       method: "POST",
       headers: { ...authHeaders(req.apiKey), "Content-Type": "application/json" },
@@ -180,18 +182,15 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
         temperature: req.temperature,
         top_p: req.topP,
         max_tokens: req.maxOutputTokens,
-        reasoning_effort: req.reasoningEffort,
-        thinking: deepSeekThinkingOption(req.provider)
+        reasoning_effort: thinking?.type === "disabled" ? undefined : reasoningEffort,
+        thinking
       })
     }, req.timeoutMs ?? req.provider.timeoutMs);
     const raw = (await response.json()) as ChatCompletionPayload;
     return {
       text: extractChatCompletionText(raw, { allowReasoningJson: true }),
       raw,
-      usage: {
-        inputTokens: raw.usage?.prompt_tokens ?? 0,
-        outputTokens: raw.usage?.completion_tokens ?? 0
-      },
+      usage: chatCompletionUsage(raw),
       latencyMs: Date.now() - started
     };
   }
@@ -199,6 +198,8 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
   async generateObject<TObject>(req: LLMObjectRequest): Promise<LLMObjectResponse<TObject>> {
     const started = Date.now();
     const responseFormat = responseFormatForObjectRequest(req.provider, req.schema);
+    const thinking = deepSeekThinkingOption(req.provider);
+    const reasoningEffort = requestReasoningEffort(req);
     const response = await fetchWithTimeout(`${req.provider.baseUrl || this.defaultBaseUrl}/chat/completions`, {
       method: "POST",
       headers: { ...authHeaders(req.apiKey), "Content-Type": "application/json" },
@@ -208,8 +209,8 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
         temperature: req.temperature,
         top_p: req.topP,
         max_tokens: req.maxOutputTokens,
-        reasoning_effort: req.reasoningEffort,
-        thinking: deepSeekThinkingOption(req.provider),
+        reasoning_effort: thinking?.type === "disabled" ? undefined : reasoningEffort,
+        thinking,
         response_format: responseFormat
       })
     }, req.timeoutMs ?? req.provider.timeoutMs);
@@ -218,10 +219,7 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
     return parseObjectResponse<TObject>({
       text,
       raw,
-      usage: {
-        inputTokens: raw.usage?.prompt_tokens ?? 0,
-        outputTokens: raw.usage?.completion_tokens ?? 0
-      },
+      usage: chatCompletionUsage(raw),
       latencyMs: Date.now() - started
     });
   }
@@ -346,7 +344,13 @@ interface OpenAIResponsePayload {
 
 interface ChatCompletionPayload {
   choices?: Array<{ message?: { content?: string | null; reasoning_content?: string | null } }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_cache_hit_tokens?: number;
+    prompt_cache_miss_tokens?: number;
+    completion_tokens_details?: { reasoning_tokens?: number };
+  };
 }
 
 interface AnthropicPayload {
@@ -383,8 +387,34 @@ function firstParseableJsonObjectText(text: string): string | undefined {
   return undefined;
 }
 
-function deepSeekThinkingOption(provider: ProviderAccount): { type: "disabled" } | undefined {
-  return provider.baseUrl.includes("api.deepseek.com") ? { type: "disabled" } : undefined;
+function chatCompletionUsage(raw: ChatCompletionPayload): LLMTextResponse["usage"] {
+  return {
+    inputTokens: raw.usage?.prompt_tokens ?? 0,
+    outputTokens: raw.usage?.completion_tokens ?? 0,
+    reasoningTokens: raw.usage?.completion_tokens_details?.reasoning_tokens ?? 0,
+    cachedTokens: raw.usage?.prompt_cache_hit_tokens ?? 0
+  };
+}
+
+function deepSeekThinkingOption(provider: ProviderAccount): { type: "enabled" | "disabled" } | undefined {
+  if (!isDeepSeekProvider(provider)) return undefined;
+  const mode = provider.thinkingMode ?? "enabled";
+  if (mode === "enabled") return { type: "enabled" };
+  if (mode === "disabled") return { type: "disabled" };
+  return undefined;
+}
+
+function requestReasoningEffort(req: LLMTextRequest): "minimal" | "low" | "medium" | "high" | "max" | undefined {
+  if (isDeepSeekProvider(req.provider)) {
+    if ((req.provider.thinkingMode ?? "enabled") === "disabled") return undefined;
+    return req.reasoningEffort === "max" ? "max" : req.reasoningEffort ? "high" : undefined;
+  }
+  if (!req.provider.supportsReasoningEffort) return undefined;
+  return req.reasoningEffort === "max" ? "high" : req.reasoningEffort;
+}
+
+function isDeepSeekProvider(provider: ProviderAccount): boolean {
+  return provider.baseUrl.includes("api.deepseek.com");
 }
 
 function authHeaders(apiKey?: string): Record<string, string> {
@@ -434,7 +464,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs?: numb
   if (!timeoutMs || timeoutMs <= 0) {
     const response = await fetch(url, init);
     if (!response.ok) {
-      throw new Error(`LLM request failed: ${response.status} ${response.statusText}`);
+      throw new Error(await formatHttpError(response));
     }
     return response;
   }
@@ -443,12 +473,27 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs?: numb
   try {
     const response = await fetch(url, { ...init, signal: controller.signal });
     if (!response.ok) {
-      throw new Error(`LLM request failed: ${response.status} ${response.statusText}`);
+      throw new Error(await formatHttpError(response));
     }
     return response;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function formatHttpError(response: Response): Promise<string> {
+  let detail = "";
+  try {
+    detail = (await response.text()).trim();
+  } catch {
+    detail = "";
+  }
+  const suffix = detail ? `: ${previewErrorBody(detail)}` : "";
+  return `LLM request failed: ${response.status} ${response.statusText}${suffix}`;
+}
+
+function previewErrorBody(text: string): string {
+  return text.replace(/\s+/g, " ").slice(0, 500);
 }
 
 function parseJsonObject<TObject>(text: string): TObject {

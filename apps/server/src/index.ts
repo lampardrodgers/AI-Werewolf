@@ -137,8 +137,31 @@ function normalizeIncomingConfig(next: AIConfigStore): AIConfigStore {
     ...next,
     costControls: next.costControls ?? DEFAULT_COST_CONTROLS,
     contextCompression: next.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION,
-    providers: next.providers.map((provider) => ({ ...provider, apiKeyEncrypted: undefined }))
+    models: next.models.map(normalizeModelConfig),
+    providers: next.providers.map((provider) => {
+      const normalized = { ...provider, apiKeyEncrypted: undefined };
+      if (normalized.baseUrl.includes("api.deepseek.com") && (normalized.reasoningEffort ?? "minimal") === "minimal") {
+        normalized.thinkingMode = "enabled";
+        normalized.reasoningEffort = "high";
+      }
+      return normalized;
+    })
   };
+}
+
+function normalizeModelConfig(model: AIConfigStore["models"][number]): AIConfigStore["models"][number] {
+  const normalized = { ...model };
+  if (normalized.providerId === "deepseek-provider" || normalized.name.startsWith("deepseek-v4-")) {
+    if (normalized.id === "model-deepseek-v4-pro") {
+      normalized.name = "deepseek-v4-pro";
+      normalized.displayName = "DeepSeek V4 Pro";
+    }
+    if (normalized.name === "deepseek-v4-flash" || normalized.name === "deepseek-v4-pro") {
+      normalized.contextWindow = 1_000_000;
+      normalized.maxOutputTokens = 384_000;
+    }
+  }
+  return normalized;
 }
 
 function withConfigDefaults(config: AIConfigStore): AIConfigStore {
