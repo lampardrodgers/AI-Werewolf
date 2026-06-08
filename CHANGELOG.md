@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.5 - 2026-06-08
+
+- Added Chinese and English README files with installation, usage, AI configuration, feature, and project structure notes.
+- Aligned root package metadata with the new documentation release version.
+
 ## v0.1.4 - 2026-06-08
 
 - Changed real AI failures, cost limits, and context overflow handling to pause with explicit errors instead of silently falling back to mock decisions.
