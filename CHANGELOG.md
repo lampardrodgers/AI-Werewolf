@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.6 - 2026-06-11
+
+- Added unique LLM call log IDs for concurrent AI decisions created from the same game snapshot.
+- Expanded AI decision tests to cover concurrent call ID generation.
+- Added repository instructions for commit attribution and review scope.
+
 ## v0.1.5 - 2026-06-08
 
 - Added Chinese and English README files with installation, usage, AI configuration, feature, and project structure notes.

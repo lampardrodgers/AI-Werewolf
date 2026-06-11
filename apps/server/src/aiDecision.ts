@@ -1,6 +1,7 @@
 import { AgentMemoryUpdate, GameCommand, GameState, PendingAction, canWolfSelfExplode, createMockDecision, getPlayerVisibleEvents } from "@langrensha/engine";
 import { LLMObjectParseError, LLMObjectResponse, LLMProviderAdapter, createProviderAdapter, parseObjectResponse } from "@langrensha/llm-gateway";
 import { OUTPUT_SCHEMAS, SYSTEM_PROMPT_VERSION, buildPromptPreview } from "@langrensha/prompts";
+import { randomUUID } from "node:crypto";
 import {
   AIConfigStore,
   AIPersona,
@@ -1601,7 +1602,7 @@ function createCallLog(
 ): LLMCallLog {
   const promptMeta = promptPackage ?? promptMetadataForPrompt(prompt, 0, "FULL");
   return {
-    id: `call_${state.llmCalls.length + 1}`,
+    id: createLLMCallId(state),
     gameId: state.id,
     phase: state.phase.type,
     seatId: pending.seatId,
@@ -1651,7 +1652,7 @@ function createFallbackCallLog(
   const seatId = "seatId" in command ? command.seatId : undefined;
   const fallbackPromptText = `真实 AI 决策不可用，已使用 Mock 兜底。原因：${reason}`;
   return {
-    id: `call_${state.llmCalls.length + 1}`,
+    id: createLLMCallId(state),
     gameId: state.id,
     phase: state.phase.type,
     seatId,
@@ -1678,6 +1679,10 @@ function createFallbackCallLog(
     promptPreviewTruncated: promptPackage?.promptPreviewTruncated,
     error: reason
   };
+}
+
+function createLLMCallId(state: GameState): string {
+  return `call_${state.llmCalls.length + 1}_${randomUUID()}`;
 }
 
 function truncatePromptPreview(prompt: string): string {

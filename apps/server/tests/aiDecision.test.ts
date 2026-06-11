@@ -120,6 +120,34 @@ describe("AI decision service", () => {
     expect(receivedApiKey).toBe("browser-only-key");
   });
 
+  it("generates unique call ids for concurrent decisions from the same snapshot", async () => {
+    const state = advanceToSheriffCandidacy("ai-decision-unique-call-ids");
+    const pendingBatch = state.pendingActions.slice(0, 2);
+    expect(pendingBatch).toHaveLength(2);
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        run_for_sheriff: false,
+        public_speech: "我不上警，警下听发言和票型。",
+        private_reason: "并行请求使用同一局面快照，验证每次调用日志都有唯一编号。"
+      },
+      raw: {},
+      usage: { inputTokens: 100, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const responses = await Promise.all(
+      pendingBatch.map((pending) =>
+        buildAIDecision({ ...requestWithKey(state), seatId: pending.seatId }, config, undefined, () => adapter)
+      )
+    );
+
+    expect(responses.every((response) => response.ok && response.llmCall?.id)).toBe(true);
+    const callIds = responses.map((response) => response.llmCall?.id);
+    expect(new Set(callIds).size).toBe(callIds.length);
+  });
+
   it("accepts guard skip protection from a real model response", async () => {
     const state = createGame({
       totalPlayers: 10,
