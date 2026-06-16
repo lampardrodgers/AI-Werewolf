@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.7 - 2026-06-16
+
+- Enforced the guard rule that the same target cannot be protected on consecutive nights.
+- Added AI prompt guidance so guard decisions explain the previous protected target restriction.
+- Updated mock guard decisions to skip protection when no legal guard target is available.
+- Expanded engine and AI decision tests for consecutive guard protection handling.
+
 ## v0.1.6 - 2026-06-11
 
 - Added unique LLM call log IDs for concurrent AI decisions created from the same game snapshot.

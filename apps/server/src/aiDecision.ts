@@ -916,11 +916,15 @@ function buildPhaseTask(state: GameState, pending: PendingAction): string {
   const seatBoundary = `本局总人数：${state.players.length}。合法座位号只有：${legalSeatNumbers}；公开发言、狼队私聊和推理理由禁止提到不存在的座位号。`;
   const identityBoundary =
     "信息边界：公开判断必须基于场上发言、公开票型、警徽流、公开事件和你的合法技能结果；死亡、出局、被投票、遗言和玩家自称不会自动验明真实身份，禁止读取其他玩家后台身份。";
+  const guardRepeatRule =
+    pending.kind === "guard_protect" && state.round.lastGuardTarget
+      ? `守卫连续守护限制：上一晚已守护${formatSeat(state, state.round.lastGuardTarget)}，本晚不能再次守护同一名玩家；该玩家已从合法目标中排除。`
+      : "";
   const selfExplosionRule = canWolfSelfExplode(state, pending.seatId)
     ? "狼人自爆：如果你是狼人且公开自爆能明确打断当前白天、保护队友或避免更大损失，可以输出 self_explode=true；自爆后你出局，本回合直接结束并进入夜晚。没有明确收益不要自爆。公开发言里禁止用普通发言泄露自己是狼、狼队友或狼队私聊；要认狼只能用 self_explode=true。"
     : "";
   const repeatBoundary = outputRepeatBoundary(state, pending);
-  const base = `当前阶段：${state.phase.label}。行动座位：${formatSeat(state, pending.seatId)}。合法目标：${legalTargets || "无"}。${targetRule}${seatBoundary}${identityBoundary}${repeatBoundary}`;
+  const base = `当前阶段：${state.phase.label}。行动座位：${formatSeat(state, pending.seatId)}。合法目标：${legalTargets || "无"}。${targetRule}${guardRepeatRule}${seatBoundary}${identityBoundary}${repeatBoundary}`;
   if (pending.kind === "guard_protect") return `${base} 请选择一名玩家守护，或在没有合适守护目标、需要避开连续机械守护/守救冲突风险时输出 target_id="skip" 表示空守。输出 target_id 和 private_reason。`;
   if (pending.kind === "seer_check") return `${base} 请选择一名玩家查验，输出 target_id 和 private_reason。`;
   if (pending.kind === "witch_action") {

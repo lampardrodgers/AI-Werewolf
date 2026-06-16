@@ -323,6 +323,41 @@ describe("werewolf engine", () => {
     expect((guardEvent?.payload as { targetId?: string } | undefined)?.targetId).toBeUndefined();
   });
 
+  it("prevents the guard from protecting the same target on consecutive nights", () => {
+    let state = createGame({
+      totalPlayers: 10,
+      humanPlayers: 0,
+      aiPlayers: 10,
+      seed: "guard-repeat-target",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const firstPending = state.pendingActions.find((action) => action.kind === "guard_protect");
+    if (!firstPending || firstPending.kind !== "guard_protect") throw new Error("expected guard pending action");
+    const firstTargetId = firstPending.seatId;
+
+    state = applyCommand(state, {
+      type: "SubmitNightAction",
+      seatId: firstPending.seatId,
+      action: "guard_protect",
+      targetId: firstTargetId,
+      privateReason: "测试首夜守卫自守。"
+    });
+
+    expect(state.round.lastGuardTarget).toBe(firstTargetId);
+
+    for (let index = 0; index < 300 && !(state.phase.type === "night_guard" && state.round.night?.nightNumber === 1); index += 1) {
+      state = applyMockStep(state);
+    }
+
+    expect(state.phase.type).toBe("night_guard");
+    expect(state.round.night?.nightNumber).toBe(1);
+    const secondPending = state.pendingActions.find((action) => action.kind === "guard_protect");
+    if (!secondPending || secondPending.kind !== "guard_protect") throw new Error("expected second guard pending action");
+    expect(secondPending.legalTargets).not.toContain(firstTargetId);
+    expect(secondPending.legalTargets.every((id) => state.players.find((player) => player.id === id)?.alive)).toBe(true);
+  });
+
   it("kills the wolf target when guard protection and witch save hit the same target", () => {
     let state = createGame({
       totalPlayers: 10,

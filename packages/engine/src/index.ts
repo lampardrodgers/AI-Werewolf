@@ -188,6 +188,7 @@ export interface GameState {
     lastWordsQueue: PlayerId[];
     lastWordsReturn?: "day_speech" | "night";
     lastDeaths: PlayerId[];
+    lastGuardTarget?: PlayerId;
     hunterReturn?: "last_words" | "after_day";
     pendingBadgeSeatId?: PlayerId;
   };
@@ -413,10 +414,10 @@ export function createMockDecision(state: GameState): MockDecision | undefined {
           type: "SubmitNightAction",
           seatId: player.id,
           action: "guard_protect",
-          targetId,
-          privateReason: `守卫优先保护疑似关键好人位，本轮选择${formatSeat(state, targetId)}。`
+          targetId: targetId ?? "skip",
+          privateReason: targetId ? `守卫优先保护疑似关键好人位，本轮选择${formatSeat(state, targetId)}。` : "本轮没有合法守护目标，守卫选择空守。"
         },
-        parsedJson: { target: targetId, private_reason: privateRationale },
+        parsedJson: { target: targetId ?? "skip", private_reason: privateRationale },
         privateRationale
       };
     }
@@ -1025,7 +1026,7 @@ function enterNightStep(state: GameState, step: ConfiguredNightStep): void {
       return;
     }
     setPhase(state, "night_guard", night.nightNumber, `夜晚 ${night.nightNumber} · 守卫行动`, guard.id);
-    state.pendingActions = [{ kind: "guard_protect", seatId: guard.id, legalTargets: aliveIds(state) }];
+    state.pendingActions = [{ kind: "guard_protect", seatId: guard.id, legalTargets: aliveIds(state).filter((id) => id !== state.round.lastGuardTarget) }];
     return;
   }
 
@@ -1119,6 +1120,7 @@ function handleNightAction(
   if (command.action === "guard_protect") {
     const targetId = command.targetId === "skip" ? undefined : ensureLegalTarget(command.targetId, pending.legalTargets);
     night.protectedTarget = targetId;
+    state.round.lastGuardTarget = targetId;
     actor.hasActed = true;
     pushEvent(
       state,
@@ -2199,7 +2201,7 @@ function chooseSpeechDirection(state: GameState, salt: string): boolean {
   return createRng(`${state.setup.seed}:${state.id}:${state.day}:${salt}`)() >= 0.5;
 }
 
-function chooseGuardTarget(state: GameState, legalTargets: PlayerId[]): PlayerId {
+function chooseGuardTarget(state: GameState, legalTargets: PlayerId[]): PlayerId | undefined {
   return choosePublicAttentionTarget(state, legalTargets, "guard") ?? legalTargets[0];
 }
 

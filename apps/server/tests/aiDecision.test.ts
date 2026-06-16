@@ -182,6 +182,47 @@ describe("AI decision service", () => {
     });
   });
 
+  it("tells an AI guard that last night's protected target is not legal tonight", async () => {
+    const state = createGame({
+      totalPlayers: 10,
+      humanPlayers: 0,
+      aiPlayers: 10,
+      seed: "ai-decision-guard-repeat-target-prompt",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions.find((action) => action.kind === "guard_protect");
+    if (!pending || pending.kind !== "guard_protect") throw new Error("expected guard pending action");
+    const blockedTarget = pending.legalTargets[0];
+    state.round.lastGuardTarget = blockedTarget;
+    pending.legalTargets = pending.legalTargets.filter((targetId) => targetId !== blockedTarget);
+    let capturedPrompt = "";
+    const legalTarget = pending.legalTargets[0] ?? "skip";
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async (request) => {
+      capturedPrompt = request.prompt;
+      return {
+        text: "{}",
+        object: {
+          target_id: legalTarget,
+          private_reason: "本晚遵守守卫不能连续两晚守护同一目标的限制，选择当前合法目标或空守。"
+        },
+        raw: {},
+        usage: { inputTokens: 100, outputTokens: 12 },
+        latencyMs: 3
+      };
+    });
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(capturedPrompt).toContain("守卫连续守护限制");
+    const blockedPlayer = state.players.find((player) => player.id === blockedTarget);
+    if (!blockedPlayer) throw new Error("expected blocked target player");
+    expect(capturedPrompt).toContain(`上一晚已守护${blockedPlayer.seatNumber}号${blockedPlayer.name}(${blockedPlayer.id})`);
+    expect(capturedPrompt).toContain("本晚不能再次守护同一名玩家");
+  });
+
   it("honors an explicit model decision to skip sheriff candidacy", async () => {
     const state = advanceToSheriffCandidacy("ai-decision-sheriff-explicit-pass");
     const config = withRealProvider();
