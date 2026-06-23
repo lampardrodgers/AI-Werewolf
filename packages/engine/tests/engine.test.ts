@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_DEBUG_MODE, STANDARD_PRESET, type RulePreset } from "@langrensha/shared";
+import { DEFAULT_DEBUG_MODE, STANDARD_PRESET, type RoleId, type RulePreset } from "@langrensha/shared";
 import { applyAgentMemoryUpdate, applyCommand, applyMockStep, canWolfSelfExplode, createGame, createMockDecision, createSnapshotFixture, generateMarkdownLog, getPlayerVisibleEvents, getVisibleEvents, restoreSnapshotFixture, runMockBatch, runUntilBlocked } from "../src/index";
 
 describe("werewolf engine", () => {
@@ -24,6 +24,36 @@ describe("werewolf engine", () => {
     expect(counts.witch).toBe(1);
     expect(counts.hunter).toBe(1);
     expect(counts.guard).toBe(1);
+  });
+
+  it("uses test role overrides in seat order when provided", () => {
+    const roleOverrides: RoleId[] = ["guard", "werewolf", "seer", "witch", "hunter", "villager"];
+    const state = createGame({
+      totalPlayers: 6,
+      humanPlayers: 6,
+      aiPlayers: 0,
+      seed: "test-role-overrides",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides
+    });
+
+    expect(state.players.map((player) => player.role)).toEqual(roleOverrides);
+    expect(state.events.some((event) => event.type === "RoleAssigned" && (event.payload as { role?: RoleId }).role === "guard")).toBe(true);
+  });
+
+  it("rejects test role overrides that do not match the player count", () => {
+    expect(() =>
+      createGame({
+        totalPlayers: 6,
+        humanPlayers: 1,
+        aiPlayers: 5,
+        seed: "bad-test-role-overrides",
+        rulePresetId: STANDARD_PRESET.id,
+        debugMode: DEFAULT_DEBUG_MODE,
+        roleOverrides: ["werewolf"]
+      })
+    ).toThrow("测试身份数量必须等于总人数");
   });
 
   it("can run a full all-AI game to an end state", () => {

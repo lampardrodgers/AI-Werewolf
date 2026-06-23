@@ -147,6 +147,31 @@ function createDefaultSetup(): GameSetup {
   };
 }
 
+const ROLE_PICKER_ORDER: RoleId[] = ["werewolf", "seer", "witch", "hunter", "guard", "villager"];
+
+function defaultRolesForTotal(totalPlayers: number): RoleId[] {
+  return [...(STANDARD_PRESET.roleTable[totalPlayers] ?? STANDARD_PRESET.roleTable[8])];
+}
+
+function normalizeRoleOverrides(totalPlayers: number, roles?: RoleId[]): RoleId[] {
+  const defaults = defaultRolesForTotal(totalPlayers);
+  return Array.from({ length: totalPlayers }, (_, index) => roles?.[index] ?? defaults[index] ?? "villager");
+}
+
+function normalizeSetupForGame(setup: GameSetup): GameSetup {
+  const totalPlayers = clampNumber(setup.totalPlayers, STANDARD_PRESET.minPlayers, STANDARD_PRESET.maxPlayers);
+  const humanPlayers = clampNumber(setup.humanPlayers, 0, totalPlayers);
+  const roleOverrides = setup.roleOverrides ? normalizeRoleOverrides(totalPlayers, setup.roleOverrides) : undefined;
+  return {
+    ...setup,
+    totalPlayers,
+    humanPlayers,
+    aiPlayers: totalPlayers - humanPlayers,
+    seed: setup.seed.trim() || createRandomSeed(),
+    roleOverrides
+  };
+}
+
 const PROVIDER_PRESETS: Record<ProviderType, Omit<ProviderAccount, "id" | "apiKeyEncrypted">> = {
   openai: {
     name: "OpenAI",
@@ -393,11 +418,7 @@ export function App(): JSX.Element {
 
   function startGame(): void {
     aiInFlightRef.current = null;
-    const normalized: GameSetup = {
-      ...setup,
-      aiPlayers: setup.totalPlayers - setup.humanPlayers,
-      seed: setup.seed.trim() || createRandomSeed()
-    };
+    const normalized = normalizeSetupForGame(setup);
     setSetup(normalized);
     commitGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
     setBatchResult(null);
@@ -415,11 +436,7 @@ export function App(): JSX.Element {
     aiInFlightRef.current = null;
     setIsPaused(false);
     setAutoRun(true);
-    const normalized: GameSetup = {
-      ...setup,
-      aiPlayers: setup.totalPlayers - setup.humanPlayers,
-      seed: setup.seed.trim() || createRandomSeed()
-    };
+    const normalized = normalizeSetupForGame(setup);
     commitGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
     clearStreamingOutput();
     setReadableOutputPause(null);
@@ -1606,11 +1623,20 @@ function SetupScreen({
   onStart: () => void;
 }): JSX.Element {
   const aiPlayers = setup.totalPlayers - setup.humanPlayers;
+  const customRoles = setup.roleOverrides ? normalizeRoleOverrides(setup.totalPlayers, setup.roleOverrides) : undefined;
 
   function patch(next: Partial<GameSetup>): void {
     const totalPlayers = clampNumber(next.totalPlayers ?? setup.totalPlayers, 6, 12);
     const humanPlayers = clampNumber(next.humanPlayers ?? setup.humanPlayers, 0, totalPlayers);
-    setSetup({ ...setup, ...next, totalPlayers, humanPlayers, aiPlayers: totalPlayers - humanPlayers });
+    const incomingRoles = next.roleOverrides !== undefined ? next.roleOverrides : setup.roleOverrides;
+    const roleOverrides = incomingRoles ? normalizeRoleOverrides(totalPlayers, incomingRoles) : undefined;
+    setSetup({ ...setup, ...next, totalPlayers, humanPlayers, aiPlayers: totalPlayers - humanPlayers, roleOverrides });
+  }
+
+  function setRoleOverride(index: number, role: RoleId): void {
+    const roles = normalizeRoleOverrides(setup.totalPlayers, setup.roleOverrides);
+    roles[index] = role;
+    patch({ roleOverrides: roles });
   }
 
   return (
@@ -1664,6 +1690,35 @@ function SetupScreen({
           <p>游戏房间默认隐藏其他玩家身份、AI 后台理由、prompt 和思考日志；测试时在右侧“暴露模式”查看。</p>
         </div>
         <Toggle label="允许暴露模式手动调试" checked={setup.debugMode.allowManualOverride} onChange={(value) => patch({ debugMode: { ...setup.debugMode, allowManualOverride: value } })} />
+        <Toggle
+          label="测试身份模式"
+          checked={Boolean(customRoles)}
+          onChange={(value) => patch({ roleOverrides: value ? normalizeRoleOverrides(setup.totalPlayers, setup.roleOverrides) : undefined })}
+        />
+        {customRoles && (
+          <div className="test-role-panel">
+            <div className="test-role-panel-header">
+              <strong>座位身份</strong>
+              <button type="button" className="ghost-button mini" onClick={() => patch({ roleOverrides: defaultRolesForTotal(setup.totalPlayers) })}>
+                标准配置
+              </button>
+            </div>
+            <div className="test-role-grid">
+              {customRoles.map((role, index) => (
+                <label key={index}>
+                  {index + 1}号
+                  <select aria-label={`测试身份 ${index + 1}号`} value={role} onChange={(event) => setRoleOverride(index, event.target.value as RoleId)}>
+                    {ROLE_PICKER_ORDER.map((roleId) => (
+                      <option key={roleId} value={roleId}>
+                        {ROLE_DEFINITIONS[roleId].name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
         <button className="primary-button large" onClick={onStart}>
           <Play size={18} />
           开始游戏

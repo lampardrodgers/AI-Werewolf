@@ -195,6 +195,7 @@ export interface GameSetup {
   seed: string;
   rulePresetId: string;
   debugMode: DebugMode;
+  roleOverrides?: RoleId[];
 }
 
 export interface PlayerProfile {

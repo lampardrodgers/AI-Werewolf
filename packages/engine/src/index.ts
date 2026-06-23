@@ -265,7 +265,7 @@ const AI_NAMES = ["青岚", "观棋", "白石", "夜航", "南枝", "北辰", "�
 export function createGame(setup: GameSetup, preset: RulePreset = STANDARD_PRESET): GameState {
   validateSetup(setup, preset);
   const rng = createRng(setup.seed);
-  const roles = shuffle([...preset.roleTable[setup.totalPlayers]], rng);
+  const roles = setup.roleOverrides ? [...setup.roleOverrides] : shuffle([...preset.roleTable[setup.totalPlayers]], rng);
   const players = roles.map((role, index): PlayerState => {
     const seatNumber = index + 1;
     const isHuman = seatNumber <= setup.humanPlayers;
@@ -961,6 +961,16 @@ function validateSetup(setup: GameSetup, preset: RulePreset): void {
   }
   if (!preset.roleTable[setup.totalPlayers]) {
     throw new Error("当前规则包没有对应人数的身份配置。");
+  }
+  if (setup.roleOverrides) {
+    if (setup.roleOverrides.length !== setup.totalPlayers) {
+      throw new Error("测试身份数量必须等于总人数。");
+    }
+    for (const role of setup.roleOverrides) {
+      if (!(role in ROLE_DEFINITIONS)) {
+        throw new Error(`未知测试身份：${role}`);
+      }
+    }
   }
 }
 

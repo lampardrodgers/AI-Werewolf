@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.8 - 2026-06-23
+
+- Added a test role mode that lets setup choose exact player roles by seat.
+- Added engine support for role overrides while preserving the standard shuffled roles by default.
+- Added validation for invalid test role override counts and role IDs.
+- Expanded engine tests for seat-ordered role override behavior.
+
 ## v0.1.7 - 2026-06-16
 
 - Enforced the guard rule that the same target cannot be protected on consecutive nights.

@@ -325,6 +325,36 @@ textarea {
   line-height: 1.5;
 }
 
+.test-role-panel {
+  border: 1px solid rgba(215, 168, 75, 0.28);
+  border-radius: 8px;
+  background: rgba(215, 168, 75, 0.06);
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.test-role-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.test-role-panel-header strong {
+  color: var(--accent);
+}
+
+.test-role-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.test-role-grid label {
+  min-width: 0;
+}
+
 .game-layout {
   max-width: 1580px;
   height: calc(100vh - 92px);
