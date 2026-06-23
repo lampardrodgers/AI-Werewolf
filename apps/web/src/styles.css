@@ -2,19 +2,27 @@
   color-scheme: dark;
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #101214;
+  background: #05080a;
   color: #f4f1e8;
-  --bg: #101214;
-  --panel: #191b1d;
-  --panel-2: #202326;
-  --line: #353a3f;
-  --muted: #aab0ae;
+  --scene-image: url("/assets/werewolf-council-bg.png");
+  --bg: #05080a;
+  --panel: rgba(12, 17, 19, 0.3);
+  --panel-2: rgba(21, 28, 30, 0.22);
+  --line: rgba(127, 222, 220, 0.2);
+  --line-strong: rgba(127, 222, 220, 0.34);
+  --muted: #b4bbb5;
   --text: #f4f1e8;
-  --accent: #d7a84b;
-  --accent-2: #6bb6a7;
+  --accent: #e2ad52;
+  --accent-2: #78d9d5;
   --danger: #d96c62;
   --good: #78c48b;
-  --shadow: 0 18px 48px rgba(0, 0, 0, 0.26);
+  --glass: rgba(7, 12, 15, 0.14);
+  --glass-strong: rgba(8, 12, 16, 0.34);
+  --glass-soft: rgba(20, 30, 31, 0.12);
+  --glass-warm: rgba(226, 173, 82, 0.08);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  --glass-blur: blur(12px) saturate(1.18);
+  --shadow: 0 18px 60px rgba(0, 0, 0, 0.34);
 }
 
 * {
@@ -25,10 +33,38 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background: #05080a var(--scene-image) center / cover fixed no-repeat;
+}
+
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+body::before {
+  z-index: 0;
   background:
-    linear-gradient(135deg, rgba(215, 168, 75, 0.1), transparent 32%),
-    radial-gradient(circle at 80% 12%, rgba(107, 182, 167, 0.14), transparent 30%),
-    var(--bg);
+    linear-gradient(90deg, rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.06) 24%, rgba(0, 0, 0, 0.08) 76%, rgba(0, 0, 0, 0.52)),
+    linear-gradient(180deg, rgba(3, 6, 8, 0.26), rgba(5, 8, 10, 0.52));
+}
+
+body::after {
+  z-index: 0;
+  opacity: 0.18;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 48px 48px, 48px 48px;
+  mask-image: linear-gradient(180deg, transparent, #000 22%, #000 78%, transparent);
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
 }
 
 button,
@@ -2162,6 +2198,424 @@ textarea {
   margin-top: 2px;
 }
 
+/* Glass game skin */
+.app-shell,
+.room-shell,
+.admin-shell {
+  background: transparent;
+}
+
+.setup-shell,
+.game-shell,
+.room-shell,
+.admin-shell {
+  color: var(--text);
+}
+
+.topbar,
+.room-topbar,
+.admin-topbar,
+.admin-sidebar,
+.setup-grid,
+.seat-panel,
+.right-panel,
+.center-panel,
+.hero-identity,
+.phase-card,
+.record-shortcut,
+.table-panel,
+.api-panel,
+.compact-table,
+.control-group,
+.identity-card,
+.rules-list,
+.prompt-preview,
+.chat-history,
+.notice-dialog {
+  border-color: var(--line);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.01) 42%, rgba(120, 217, 213, 0.025)),
+    var(--glass);
+  box-shadow: var(--glass-highlight), var(--shadow);
+}
+
+.topbar,
+.room-topbar,
+.admin-topbar,
+.admin-sidebar {
+  border: 1px solid rgba(127, 222, 220, 0.24);
+  border-radius: 8px;
+}
+
+.topbar {
+  padding: 12px 14px;
+}
+
+.room-topbar,
+.admin-topbar {
+  background:
+    linear-gradient(135deg, rgba(12, 19, 22, 0.28), rgba(10, 13, 18, 0.14)),
+    rgba(8, 12, 16, 0.16);
+}
+
+.admin-sidebar {
+  border-top: 0;
+  border-bottom: 0;
+  border-left: 0;
+  border-radius: 0;
+}
+
+.seat-panel,
+.right-panel,
+.center-panel,
+.setup-grid,
+.api-panel,
+.compact-table,
+.control-group,
+.identity-card,
+.rules-list,
+.prompt-preview,
+.chat-history {
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.setup-copy h2,
+.brand h1,
+.room-phase-head span,
+.panel-title,
+.phase-card > strong,
+.role-portrait strong {
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.55);
+}
+
+.setup-copy h2 {
+  color: #fff7df;
+}
+
+.brand svg,
+.panel-title svg {
+  filter: drop-shadow(0 0 12px rgba(226, 173, 82, 0.28));
+}
+
+input,
+select,
+textarea,
+.icon-button,
+.toggle,
+.switch-field,
+.admin-mode-switch {
+  border-color: rgba(127, 222, 220, 0.18);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.01)),
+    rgba(4, 8, 10, 0.22);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.075);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: rgba(120, 217, 213, 0.68);
+  box-shadow:
+    0 0 0 3px rgba(120, 217, 213, 0.13),
+    inset 0 1px 0 rgba(255, 255, 255, 0.09);
+}
+
+.primary-button {
+  border-color: rgba(255, 232, 169, 0.28);
+  background: linear-gradient(135deg, #e9bf64, #bd7b2b);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.26),
+    0 10px 26px rgba(141, 82, 24, 0.34);
+}
+
+.ghost-button,
+.danger-button {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.012)),
+    rgba(8, 13, 16, 0.16);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(12px) saturate(1.12);
+  -webkit-backdrop-filter: blur(12px) saturate(1.12);
+}
+
+.ghost-button {
+  border-color: rgba(127, 222, 220, 0.2);
+}
+
+.ghost-button:hover,
+.tabs button:hover,
+.icon-button:hover,
+.record-shortcut:hover {
+  color: #fff6dc;
+  border-color: rgba(226, 173, 82, 0.72);
+  background:
+    linear-gradient(180deg, rgba(226, 173, 82, 0.18), rgba(255, 255, 255, 0.02)),
+    rgba(12, 16, 19, 0.2);
+}
+
+.ghost-button.selected-action,
+.tabs button.selected,
+.admin-nav button.selected {
+  border-color: rgba(120, 217, 213, 0.52);
+  background:
+    linear-gradient(180deg, rgba(120, 217, 213, 0.18), rgba(120, 217, 213, 0.045)),
+    rgba(8, 14, 16, 0.24);
+  color: #e5fffb;
+}
+
+.danger-button {
+  border-color: rgba(217, 108, 98, 0.55);
+  background:
+    linear-gradient(180deg, rgba(217, 108, 98, 0.18), rgba(217, 108, 98, 0.045)),
+    rgba(12, 10, 10, 0.22);
+}
+
+.seat-card,
+.event-card,
+.provider-card,
+.readiness-panel,
+.stats-grid div,
+.rule-config-grid div,
+.role-config-card,
+.persona-slider,
+.call-detail pre,
+.memory-block,
+.wolf-channel,
+.wolf-allies,
+.setup-visibility-note,
+.test-role-panel,
+.guard-skip-control,
+.witch-step,
+.mode-choice-grid button,
+.provider-table,
+.notice-list,
+.speech-stream,
+.exposure-player {
+  border-color: rgba(127, 222, 220, 0.15);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.005)),
+    rgba(7, 11, 14, 0.14);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
+.seat-card.active,
+.control-group.active-action,
+.event-card.private,
+.exposure-primary {
+  border-color: rgba(226, 173, 82, 0.56);
+  background:
+    linear-gradient(145deg, rgba(226, 173, 82, 0.09), rgba(120, 217, 213, 0.014)),
+    rgba(8, 11, 14, 0.18);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 14px 34px rgba(0, 0, 0, 0.2);
+}
+
+.event-card.admin,
+.readiness-panel.ready {
+  border-color: rgba(120, 217, 213, 0.42);
+}
+
+.readiness-panel.pending {
+  border-color: rgba(226, 173, 82, 0.46);
+}
+
+.phase-strip {
+  background:
+    linear-gradient(135deg, rgba(226, 173, 82, 0.1), rgba(120, 217, 213, 0.045)),
+    rgba(8, 13, 16, 0.1);
+}
+
+.tabs {
+  background: rgba(2, 6, 8, 0.08);
+}
+
+.tabs button {
+  color: rgba(244, 241, 232, 0.68);
+}
+
+.table-panel {
+  background:
+    radial-gradient(ellipse at 50% 43%, rgba(120, 217, 213, 0.045), transparent 46%),
+    linear-gradient(180deg, rgba(10, 17, 21, 0.08), rgba(4, 7, 9, 0.12));
+}
+
+.moonlit-table {
+  border-color: rgba(226, 173, 82, 0.28);
+  background:
+    linear-gradient(90deg, rgba(226, 173, 82, 0.14) 0 1px, transparent 1px calc(100% - 1px), rgba(226, 173, 82, 0.14) calc(100% - 1px)),
+    linear-gradient(0deg, rgba(226, 173, 82, 0.14) 0 1px, transparent 1px calc(100% - 1px), rgba(226, 173, 82, 0.14) calc(100% - 1px)),
+    radial-gradient(ellipse at center, rgba(120, 217, 213, 0.08) 0 35%, rgba(11, 15, 19, 0.2) 36% 59%, rgba(7, 10, 13, 0.08) 60%),
+    rgba(5, 8, 10, 0.12);
+  box-shadow:
+    inset 0 0 54px rgba(0, 0, 0, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(5px) saturate(1.08);
+  -webkit-backdrop-filter: blur(5px) saturate(1.08);
+}
+
+.table-core {
+  border-color: rgba(226, 173, 82, 0.5);
+  background:
+    linear-gradient(150deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.012)),
+    rgba(6, 10, 13, 0.38);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.11),
+    0 16px 52px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(9px) saturate(1.14);
+  -webkit-backdrop-filter: blur(9px) saturate(1.14);
+}
+
+.avatar {
+  border: 1px solid rgba(255, 248, 220, 0.22);
+  background:
+    radial-gradient(circle at 30% 24%, rgba(255, 255, 255, 0.45), transparent 28%),
+    linear-gradient(145deg, rgba(226, 173, 82, 0.95), rgba(120, 217, 213, 0.78));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    0 10px 22px rgba(0, 0, 0, 0.32);
+}
+
+.provider-table-row:hover,
+.provider-table-row.selected {
+  background: rgba(226, 173, 82, 0.12);
+}
+
+.mode-choice-grid button.selected {
+  border-color: rgba(255, 232, 169, 0.42);
+  background: linear-gradient(135deg, #e9bf64, #bd7b2b);
+}
+
+.notice-backdrop {
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.58), rgba(0, 0, 0, 0.72)),
+    rgba(0, 0, 0, 0.46);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .topbar,
+  .room-topbar,
+  .admin-topbar,
+  .admin-sidebar,
+  .setup-grid,
+  .seat-panel,
+  .right-panel,
+  .center-panel,
+  .hero-identity,
+  .phase-card,
+  .record-shortcut,
+  .table-panel,
+  .api-panel,
+  .compact-table,
+  .control-group,
+  .identity-card,
+  .rules-list,
+  .prompt-preview,
+  .chat-history,
+  .notice-dialog {
+    background:
+      linear-gradient(145deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.012)),
+      var(--glass-strong);
+  }
+}
+
+/* Let the generated scene carry the game room instead of hiding it behind columns. */
+.room-layout {
+  gap: 14px;
+}
+
+.seat-panel.room-left,
+.right-panel.room-side,
+.center-panel.table-panel {
+  border-color: rgba(127, 222, 220, 0.14);
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.seat-panel.room-left {
+  overflow: visible;
+}
+
+.right-panel.room-side {
+  background:
+    linear-gradient(90deg, rgba(5, 8, 10, 0.04), rgba(5, 8, 10, 0.08));
+}
+
+.hero-identity,
+.phase-card,
+.record-shortcut,
+.right-panel .tab-content > section,
+.speech-stream {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.004)),
+    rgba(7, 12, 15, 0.08);
+  backdrop-filter: blur(8px) saturate(1.12);
+  -webkit-backdrop-filter: blur(8px) saturate(1.12);
+}
+
+.table-scene {
+  padding: 8px 10px 10px;
+}
+
+.moonlit-table {
+  width: 100%;
+  border-color: rgba(226, 173, 82, 0.38);
+  background:
+    linear-gradient(90deg, rgba(226, 173, 82, 0.18) 0 1px, transparent 1px calc(100% - 1px), rgba(226, 173, 82, 0.18) calc(100% - 1px)),
+    linear-gradient(0deg, rgba(226, 173, 82, 0.18) 0 1px, transparent 1px calc(100% - 1px), rgba(226, 173, 82, 0.18) calc(100% - 1px)),
+    radial-gradient(ellipse at center, rgba(120, 217, 213, 0.05) 0 27%, rgba(120, 217, 213, 0.015) 28% 52%, transparent 53%);
+  box-shadow:
+    inset 0 0 34px rgba(0, 0, 0, 0.14),
+    0 0 32px rgba(120, 217, 213, 0.05);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.table-core {
+  width: min(760px, 62%);
+  height: min(340px, 50%);
+  min-height: 220px;
+  max-height: 340px;
+  padding: 22px 24px;
+  background:
+    linear-gradient(150deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.004)),
+    rgba(6, 10, 13, 0.1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    0 12px 34px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(5px) saturate(1.1);
+  -webkit-backdrop-filter: blur(5px) saturate(1.1);
+}
+
+.table-core::before {
+  content: "";
+  position: absolute;
+  inset: -58px -90px;
+  z-index: -1;
+  border-radius: 50%;
+  background: radial-gradient(ellipse, rgba(120, 217, 213, 0.1), transparent 64%);
+  pointer-events: none;
+}
+
+.chat-history,
+.control-group,
+.compact-table {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.004)),
+    rgba(7, 12, 15, 0.08);
+}
+
+.control-group.active-action {
+  background:
+    linear-gradient(145deg, rgba(226, 173, 82, 0.075), rgba(120, 217, 213, 0.01)),
+    rgba(8, 11, 14, 0.11);
+}
+
 @media (max-height: 820px) and (min-width: 761px) {
   .room-topbar {
     padding: 8px 12px;
@@ -2178,7 +2632,7 @@ textarea {
   }
 
   .moonlit-table {
-    width: min(940px, 100%);
+    width: 100%;
     min-height: 380px;
   }
 
@@ -2201,9 +2655,9 @@ textarea {
   }
 
   .table-core {
-    width: min(500px, 54%);
-    height: min(34vh, 240px);
-    min-height: 220px;
+    width: min(640px, 62%);
+    height: min(240px, 29vh);
+    min-height: 170px;
     max-height: 240px;
     padding: 16px 20px;
   }
@@ -2253,15 +2707,17 @@ textarea {
   }
 
   .moonlit-table {
-    width: min(760px, 100%);
+    width: 100%;
     min-height: 440px;
   }
 
   .table-core {
-    width: min(430px, 52%);
-    height: 220px;
-    min-height: 200px;
-    max-height: 220px;
+    width: min(500px, 52%);
+    height: min(180px, 38%);
+    min-height: 150px;
+    max-height: 180px;
+    padding: 14px 16px;
+    gap: 8px;
   }
 
   .admin-shell {
@@ -2410,9 +2866,12 @@ textarea {
   }
 
   .table-core {
-    width: min(260px, 74%);
-    min-height: 168px;
-    padding: 12px;
+    width: min(220px, 56%);
+    height: min(148px, 35%);
+    min-height: 132px;
+    max-height: 148px;
+    padding: 10px;
+    gap: 7px;
   }
 
   .table-core-meta {
@@ -2424,7 +2883,8 @@ textarea {
   }
 
   .table-speech p {
-    font-size: 15px;
+    font-size: 14px;
+    padding-right: 4px;
   }
 
   .room-side {

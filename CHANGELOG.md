@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.0 - 2026-06-23
+
+- Added a werewolf council background image asset for the web client.
+- Refreshed the web interface with a glass-style scene skin, updated colors, overlays, and control states.
+- Improved visual treatment for setup, room, admin, panel, action, timeline, and debug surfaces.
+
 ## v0.1.8 - 2026-06-23
 
 - Added a test role mode that lets setup choose exact player roles by seat.
