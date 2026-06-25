@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.1 - 2026-06-25
+
+- Improved table speech overflow handling so long AI/player text stays within the play area.
+- Added consistent styled scrollbars for speech, chat history, and right-panel content.
+
 ## v0.2.0 - 2026-06-23
 
 - Added a werewolf council background image asset for the web client.
