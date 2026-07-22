@@ -1814,6 +1814,107 @@ describe("werewolf engine", () => {
     expect(killed.events.some((event) => event.type === "DebugForceKill" && event.visibility === "admin")).toBe(true);
   });
 
+  it("normalizes pending actors, targets, and queues after a debug force kill", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "debug-kill-normalizes-state",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: { ...DEFAULT_DEBUG_MODE, allowManualOverride: true }
+    });
+    for (let step = 0; step < 120 && state.phase.type !== "day_speech"; step += 1) state = applyMockStep(state);
+    expect(state.phase.type).toBe("day_speech");
+    const killedId = state.pendingActions[0]?.seatId;
+    if (!killedId) throw new Error("expected current speaker");
+    const previousRevision = state.revision;
+
+    state = applyCommand(state, { type: "DebugForceKill", seatId: killedId, reason: "test" });
+
+    expect(state.revision).toBe(previousRevision + 1);
+    expect(state.players.find((player) => player.id === killedId)?.alive).toBe(false);
+    expect(state.pendingActions.some((pending) => pending.seatId === killedId)).toBe(false);
+    expect(state.pendingActions.every((pending) => !("legalTargets" in pending) || !pending.legalTargets.includes(killedId))).toBe(true);
+    expect(state.round.day?.speechQueue).not.toContain(killedId);
+    expect(() => restoreSnapshotFixture(createSnapshotFixture(state))).not.toThrow();
+  });
+
+  it("removes a debug-killed vote target and keeps the snapshot recoverable", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "debug-kill-vote-target",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: { ...DEFAULT_DEBUG_MODE, allowManualOverride: true }
+    });
+    for (let step = 0; step < 180 && state.phase.type !== "day_vote"; step += 1) state = applyMockStep(state);
+    expect(state.phase.type).toBe("day_vote");
+    const vote = state.pendingActions.find((pending) => pending.kind === "vote");
+    if (!vote || vote.kind !== "vote") throw new Error("expected vote");
+    const killedId = vote.legalTargets[0];
+
+    state = applyCommand(state, { type: "DebugForceKill", seatId: killedId, reason: "test" });
+
+    expect(state.pendingActions.every((pending) => !("legalTargets" in pending) || !pending.legalTargets.includes(killedId))).toBe(true);
+    expect(() => restoreSnapshotFixture(createSnapshotFixture(state))).not.toThrow();
+  });
+
+  it("completes a current night actor with the timeout rule before a debug force kill", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "debug-kill-current-night-actor",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: { ...DEFAULT_DEBUG_MODE, allowManualOverride: true }
+    });
+    const killedId = state.pendingActions[0]?.seatId;
+    if (!killedId) throw new Error("expected current night actor");
+
+    state = applyCommand(state, { type: "DebugForceKill", seatId: killedId, reason: "test" });
+
+    expect(state.players.find((player) => player.id === killedId)?.alive).toBe(false);
+    expect(state.pendingActions.some((pending) => pending.seatId === killedId)).toBe(false);
+    expect(state.pendingActions.every((pending) => !("legalTargets" in pending) || !pending.legalTargets.includes(killedId))).toBe(true);
+    expect(() => restoreSnapshotFixture(createSnapshotFixture(state))).not.toThrow();
+  });
+
+  it("resumes the normalized phase after a debug-killed sheriff passes the badge", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "debug-kill-sheriff-resume",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: { ...DEFAULT_DEBUG_MODE, allowManualOverride: true }
+    });
+    const originalPhase = state.phase.type;
+    const sheriff = state.players.find((player) => player.id !== state.pendingActions[0]?.seatId);
+    if (!sheriff) throw new Error("expected sheriff target");
+    sheriff.isSheriff = true;
+    state.sheriffSeatId = sheriff.id;
+
+    state = applyCommand(state, { type: "DebugForceKill", seatId: sheriff.id, reason: "test" });
+    expect(state.phase.type).toBe("badge_decision");
+    const badgePending = state.pendingActions[0];
+    if (!badgePending || badgePending.kind !== "badge_decision") throw new Error("expected badge decision");
+    const recipientId = badgePending.legalTargets[0];
+
+    state = applyCommand(state, {
+      type: "SubmitBadgeDecision",
+      seatId: sheriff.id,
+      targetId: recipientId,
+      privateReason: "调试强制死亡后移交警徽并恢复原阶段。"
+    });
+
+    expect(state.phase.type).toBe(originalPhase);
+    expect(state.sheriffSeatId).toBe(recipientId);
+    expect(state.round.debugResume).toBeUndefined();
+    expect(state.pendingActions.every((pending) => pending.seatId !== sheriff.id)).toBe(true);
+    expect(() => restoreSnapshotFixture(createSnapshotFixture(state))).not.toThrow();
+  });
+
   it("lets a sheriff candidate withdraw and advances the election", () => {
     let state = createGame({
       totalPlayers: 8,

@@ -105,6 +105,7 @@ export function serializeGameSession(game: GameState, preferences: GameSessionPr
 export function compactGameForPersistence(game: GameState): GameState {
   return {
     id: game.id,
+    revision: game.revision,
     setup: game.setup,
     rulePreset: game.rulePreset,
     players: game.players,
@@ -124,6 +125,11 @@ export function compactGameForPersistence(game: GameState): GameState {
       parsedJson: {},
       publicSpeech: truncate(call.publicSpeech, 1200),
       privateRationale: truncate(call.privateRationale, 800),
+      attempts: call.attempts?.map((attempt) => ({
+        ...attempt,
+        promptTextRedacted: truncate(attempt.promptTextRedacted, 800) ?? "",
+        error: truncate(attempt.error, 500)
+      })),
       error: truncate(call.error, 500)
     })),
     resources: game.resources,

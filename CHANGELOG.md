@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.3 - 2026-07-22
+
+- Added persistent server-side AI configuration storage with validation and legacy configuration migration.
+- Added cost reservation and settlement tracking for AI provider attempts, including per-request attempt logs and cost-limit protection.
+- Hardened game snapshot revisions and debug force-kill recovery across pending actions, votes, night state, and sheriff decisions.
+- Improved AI request handling, web session state integration, and regression coverage for configuration, cost accounting, readiness, and engine behavior.
+- Added audit screenshots covering setup, room flow, sheriff election, day speech, exile results, and mobile layout.
+
 ## v0.2.2 - 2026-07-22
 
 - Fixed first-night death timing, sheriff-election voting eligibility, tie/abstention outcomes, witch self-save rules, timeout resolution, and wolf self-explosion phase handling.

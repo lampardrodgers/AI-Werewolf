@@ -97,6 +97,11 @@ function compactStateForAIDecision(state: GameState): GameState {
       parsedJson: {},
       publicSpeech: truncateText(call.publicSpeech, 600),
       privateRationale: truncateText(call.privateRationale, 400),
+      attempts: call.attempts?.map((attempt) => ({
+        ...attempt,
+        promptTextRedacted: "",
+        error: truncateText(attempt.error, 500)
+      })),
       error: truncateText(call.error, 500)
     }))
   };

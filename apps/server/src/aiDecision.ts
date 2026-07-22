@@ -5,6 +5,7 @@ import {
   LLMObjectResponse,
   LLMProviderAdapter,
   LLMTextRequest,
+  LLMTextResponse,
   createProviderAdapter,
   parseObjectResponse
 } from "@langrensha/llm-gateway";
@@ -18,13 +19,17 @@ import {
   DEFAULT_CONTEXT_COMPRESSION,
   DEFAULT_COST_CONTROLS,
   DEFAULT_PERSONAS,
+  LLMAttemptLog,
+  LLMAttemptOutcome,
   LLMCallLog,
+  LLMCostStatus,
   ModelConfig,
   PlayerId,
   ProviderAccount,
   ROLE_DEFINITIONS,
   createPromptHash
 } from "@langrensha/shared";
+import { CostLedger, CostLimitError, CostReservation } from "./costLedger";
 
 export interface AIDecisionRequest {
   state: GameState;
@@ -89,6 +94,7 @@ interface ProviderRateState {
 
 const PROVIDER_RATE_WINDOW_MS = 60_000;
 const providerRateStates = new Map<string, ProviderRateState>();
+const defaultCostLedger = new CostLedger();
 
 class ProviderRateLimitError extends Error {
   constructor(message: string) {
@@ -97,8 +103,163 @@ class ProviderRateLimitError extends Error {
   }
 }
 
+interface ModelPricing {
+  known: boolean;
+  inputPricePerMillion: number;
+  outputPricePerMillion: number;
+}
+
+class ProviderAttemptRecorder {
+  readonly attempts: LLMAttemptLog[] = [];
+
+  constructor(
+    private readonly state: GameState,
+    private readonly config: AIConfigStore,
+    private readonly pending: PendingAction,
+    private readonly provider: ProviderAccount,
+    private readonly model: string,
+    private readonly ledger: CostLedger
+  ) {}
+
+  get latest(): LLMAttemptLog | undefined {
+    return this.attempts.at(-1);
+  }
+
+  async run<TResponse extends LLMTextResponse>(
+    mode: LLMAttemptLog["mode"],
+    prompt: string,
+    maxOutputTokens: number,
+    invoke: () => Promise<TResponse>
+  ): Promise<TResponse> {
+    const pricing = modelPricing(this.config, this.provider.id, this.model);
+    const controls = this.config.costControls ?? DEFAULT_COST_CONTROLS;
+    if (controls.enabled && !pricing.known) {
+      throw new CostLimitError(
+        `成本保护：${this.provider.name} / ${this.model} 的输入、输出价格均为 0 或未配置，无法安全预留费用。请先在模型管理中填写价格。`
+      );
+    }
+
+    const reservedCost = pricing.known
+      ? calculateCost(pricing, estimatePromptTokens(prompt), Math.max(0, maxOutputTokens))
+      : 0;
+    let reservation: CostReservation | undefined;
+    if (controls.enabled) {
+      reservation = this.ledger.reserve(this.state.id, this.pending.seatId, reservedCost, controls);
+    }
+
+    const startedAt = Date.now();
+    try {
+      const response = await invoke();
+      const estimatedCost = pricing.known
+        ? calculateCost(pricing, response.usage.inputTokens, response.usage.outputTokens)
+        : 0;
+      if (reservation) this.ledger.settle(reservation, estimatedCost);
+      this.attempts.push(
+        createAttemptLog({
+          attempt: this.attempts.length,
+          mode,
+          provider: this.provider.name,
+          model: this.model,
+          prompt,
+          response,
+          estimatedCost,
+          costStatus: pricing.known ? "actual" : "unknown",
+          reservedCost,
+          outcome: "succeeded",
+          latencyMs: Math.max(response.latencyMs, Date.now() - startedAt)
+        })
+      );
+      return response;
+    } catch (error) {
+      if (error instanceof ProviderRateLimitError) {
+        if (reservation) this.ledger.release(reservation);
+        throw error;
+      }
+
+      const response = error instanceof LLMObjectParseError ? error.response : undefined;
+      const estimatedCost = response && pricing.known
+        ? calculateCost(pricing, response.usage.inputTokens, response.usage.outputTokens)
+        : reservedCost;
+      if (reservation) this.ledger.settle(reservation, estimatedCost);
+      this.attempts.push(
+        createAttemptLog({
+          attempt: this.attempts.length,
+          mode,
+          provider: this.provider.name,
+          model: this.model,
+          prompt,
+          response,
+          estimatedCost,
+          costStatus: pricing.known ? (response ? "actual" : "reserved") : "unknown",
+          reservedCost,
+          outcome: isAbortError(error) ? "cancelled" : error instanceof LLMObjectParseError ? "invalid_output" : "failed",
+          error: normalizeError(error).message,
+          latencyMs: Math.max(response?.latencyMs ?? 0, Date.now() - startedAt)
+        })
+      );
+      throw error;
+    }
+  }
+
+  markLatest(outcome: LLMAttemptOutcome, error?: string): void {
+    const latest = this.latest;
+    if (!latest) return;
+    latest.outcome = outcome;
+    if (error) latest.error = error;
+  }
+}
+
+function createAttemptLog({
+  attempt,
+  mode,
+  provider,
+  model,
+  prompt,
+  response,
+  estimatedCost,
+  costStatus,
+  reservedCost,
+  latencyMs,
+  outcome,
+  error
+}: {
+  attempt: number;
+  mode: LLMAttemptLog["mode"];
+  provider: string;
+  model: string;
+  prompt: string;
+  response?: LLMTextResponse;
+  estimatedCost: number;
+  costStatus: LLMCostStatus;
+  reservedCost: number;
+  latencyMs: number;
+  outcome: LLMAttemptOutcome;
+  error?: string;
+}): LLMAttemptLog {
+  return {
+    id: `attempt_${randomUUID()}`,
+    attempt,
+    mode,
+    provider,
+    model,
+    promptHash: createPromptHash(prompt),
+    promptTextRedacted: truncatePromptPreview(prompt),
+    inputTokens: response?.usage.inputTokens ?? 0,
+    outputTokens: response?.usage.outputTokens ?? 0,
+    reasoningTokens: response?.usage.reasoningTokens ?? 0,
+    cachedTokens: response?.usage.cachedTokens ?? 0,
+    estimatedCost,
+    costStatus,
+    reservedCost,
+    latencyMs,
+    outcome,
+    error
+  };
+}
+
 export function resetProviderRateLimitsForTests(): void {
   providerRateStates.clear();
+  defaultCostLedger.reset();
 }
 
 export async function buildAIDecision(
@@ -106,7 +267,8 @@ export async function buildAIDecision(
   config: AIConfigStore,
   apiKeyResolver: (provider: ProviderAccount, request: AIDecisionRequest) => string | undefined = resolveBrowserApiKey,
   adapterFactory: (provider: ProviderAccount) => LLMProviderAdapter = createProviderAdapter,
-  onProgress?: AIDecisionProgressCallback
+  onProgress?: AIDecisionProgressCallback,
+  costLedger: CostLedger = defaultCostLedger
 ): Promise<AIDecisionResponse> {
   const requestId = request.requestId;
   if (request.signal?.aborted) {
@@ -151,12 +313,6 @@ export async function buildAIDecision(
     return { ok: false, fallback: false, error: reason };
   }
 
-  const costLimitReason = checkCostLimit(request.state, pending.seatId, config.costControls);
-  if (costLimitReason) {
-    onProgress?.({ requestId, status: "failed", seatId: pending.seatId, phase: request.state.phase.label, provider: provider.name, model, message: costLimitReason, error: costLimitReason });
-    return { ok: false, fallback: false, error: costLimitReason };
-  }
-
   const schemaName = schemaNameForPending(pending);
   onProgress?.({
     requestId,
@@ -192,10 +348,11 @@ export async function buildAIDecision(
   const expectedThinkingMs = expectedThinkingWindowMs(persona);
 
   const adapter = createRateLimitedAdapter(adapterFactory(provider), request.signal);
+  const attemptRecorder = new ProviderAttemptRecorder(request.state, config, pending, provider, model, costLedger);
   let textRecoveryAttempts = 0;
   const maxTextRecoveryAttempts = 1;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const isCompactRepairAttempt = attempt > 1;
+    const isCompactRepairAttempt = attempt > 0 && attempt === maxAttempts - 1;
     const maxOutputTokens = limitMaxOutputTokens(persona.maxOutputTokens, config.costControls);
     const currentPrompt =
       attempt === 0
@@ -216,21 +373,24 @@ export async function buildAIDecision(
         expectedThinkingMs,
         message: attempt === 0 ? "服务端已向模型发送请求，正在等待模型返回。" : "服务端已发送修复请求，正在等待模型返回。"
       });
-      const result = await adapter.generateObject<Record<string, unknown>>({
-        provider,
-        model,
-        prompt: currentPrompt,
-        schema: OUTPUT_SCHEMAS[schemaName],
-        apiKey,
-        temperature: isCompactRepairAttempt ? Math.min(persona.temperature, 0.2) : persona.temperature,
-        topP: isCompactRepairAttempt ? Math.min(persona.topP, 0.8) : persona.topP,
-        maxOutputTokens: isCompactRepairAttempt ? Math.min(maxOutputTokens, 600) : maxOutputTokens,
-        reasoningEffort: providerReasoningEffort(provider, persona),
-        timeoutMs,
-        signal: request.signal
-      });
+      const result = await attemptRecorder.run("object", currentPrompt, isCompactRepairAttempt ? Math.min(maxOutputTokens, 600) : maxOutputTokens, () =>
+        adapter.generateObject<Record<string, unknown>>({
+          provider,
+          model,
+          prompt: currentPrompt,
+          schema: OUTPUT_SCHEMAS[schemaName],
+          apiKey,
+          temperature: isCompactRepairAttempt ? Math.min(persona.temperature, 0.2) : persona.temperature,
+          topP: isCompactRepairAttempt ? Math.min(persona.topP, 0.8) : persona.topP,
+          maxOutputTokens: isCompactRepairAttempt ? Math.min(maxOutputTokens, 600) : maxOutputTokens,
+          reasoningEffort: providerReasoningEffort(provider, persona),
+          timeoutMs,
+          signal: request.signal
+        })
+      );
       const command = commandFromModelObject(request.state, pending, result.object);
       const memoryUpdate = extractMemoryUpdate(result.object);
+      attemptRecorder.markLatest("succeeded");
       onProgress?.({
         requestId,
         status: "completed",
@@ -246,13 +406,19 @@ export async function buildAIDecision(
       return {
         ok: true,
         command,
-        llmCall: createCallLog(request.state, config, pending, persona, provider.id, provider.name, model, currentPrompt, result, command, Date.now() - started, attempt, promptPackage),
+        llmCall: createCallLog(request.state, pending, persona, provider.name, model, currentPrompt, result, command, Date.now() - started, attemptRecorder.attempts, promptPackage),
         memoryUpdate,
         fallback: false
       };
     } catch (error) {
       if (request.signal?.aborted || isAbortError(error)) {
-        return cancelledDecision(request, onProgress, pending);
+        attemptRecorder.markLatest("cancelled", normalizeError(error).message);
+        return cancelledDecision(request, onProgress, pending, createFailureCallLog(request.state, pending, persona, provider.name, model, prompt, "AI 请求已取消", attemptRecorder.attempts, promptPackage));
+      }
+      if (error instanceof CostLimitError) {
+        const reason = error.message;
+        onProgress?.({ requestId, status: "failed", seatId: pending.seatId, phase: request.state.phase.label, provider: provider.name, model, attempt, message: reason, error: reason });
+        return { ok: false, fallback: false, error: reason, llmCall: createFailureCallLog(request.state, pending, persona, provider.name, model, prompt, reason, attemptRecorder.attempts, promptPackage) };
       }
       if (error instanceof ProviderRateLimitError) {
         const reason = error.message;
@@ -267,10 +433,11 @@ export async function buildAIDecision(
           message: reason,
           error: reason
         });
-        return { ok: false, fallback: false, error: reason };
+        return { ok: false, fallback: false, error: reason, llmCall: createFailureCallLog(request.state, pending, persona, provider.name, model, prompt, reason, attemptRecorder.attempts, promptPackage) };
       }
       const recovered = recoverTextDecisionFromParseError(error, request.state, pending);
       if (recovered) {
+        attemptRecorder.markLatest("recovered");
         onProgress?.({
           requestId,
           status: "completed",
@@ -288,17 +455,15 @@ export async function buildAIDecision(
           command: recovered.command,
           llmCall: createCallLog(
             request.state,
-            config,
             pending,
             persona,
-            provider.id,
             provider.name,
             model,
             currentPrompt,
             recovered.result,
             recovered.command,
             Date.now() - started,
-            attempt,
+            attemptRecorder.attempts,
             promptPackage
           ),
           memoryUpdate: recovered.memoryUpdate,
@@ -306,11 +471,11 @@ export async function buildAIDecision(
         };
       }
       if (textRecoveryAttempts < maxTextRecoveryAttempts && shouldTryTextRecovery(error, pending, attempt)) {
+        attemptRecorder.markLatest("invalid_output", normalizeError(error).message);
         textRecoveryAttempts += 1;
         let textRecovered: Awaited<ReturnType<typeof recoverWithTextGeneration>>;
         try {
           textRecovered = await recoverWithTextGeneration({
-            adapter,
             provider,
             model,
             apiKey,
@@ -319,13 +484,16 @@ export async function buildAIDecision(
             persona,
             config,
             timeoutMs,
-            error: normalizeError(error).message
+            error: normalizeError(error).message,
+            generateText: (textRequest) =>
+              attemptRecorder.run("text_repair", textRequest.prompt, textRequest.maxOutputTokens ?? 0, () => adapter.generateText(textRequest))
           });
         } catch (recoveryError) {
           if (request.signal?.aborted || isAbortError(recoveryError)) {
-            return cancelledDecision(request, onProgress, pending);
+            attemptRecorder.markLatest("cancelled", normalizeError(recoveryError).message);
+            return cancelledDecision(request, onProgress, pending, createFailureCallLog(request.state, pending, persona, provider.name, model, prompt, "AI 请求已取消", attemptRecorder.attempts, promptPackage));
           }
-          if (recoveryError instanceof ProviderRateLimitError) {
+          if (recoveryError instanceof ProviderRateLimitError || recoveryError instanceof CostLimitError) {
             const reason = recoveryError.message;
             onProgress?.({
               requestId,
@@ -338,11 +506,12 @@ export async function buildAIDecision(
               message: reason,
               error: reason
             });
-            return { ok: false, fallback: false, error: reason };
+            return { ok: false, fallback: false, error: reason, llmCall: createFailureCallLog(request.state, pending, persona, provider.name, model, prompt, reason, attemptRecorder.attempts, promptPackage) };
           }
           throw recoveryError;
         }
         if (textRecovered) {
+          attemptRecorder.markLatest("succeeded");
           onProgress?.({
             requestId,
             status: "completed",
@@ -360,17 +529,15 @@ export async function buildAIDecision(
             command: textRecovered.command,
             llmCall: createCallLog(
               request.state,
-              config,
               pending,
               persona,
-              provider.id,
               provider.name,
               model,
               textRecovered.prompt,
               textRecovered.result,
               textRecovered.command,
               Date.now() - started,
-              attempt + 1,
+              attemptRecorder.attempts,
               promptMetadataForPrompt(
                 textRecovered.prompt,
                 promptPackage.promptBudgetTokens,
@@ -383,8 +550,12 @@ export async function buildAIDecision(
             fallback: false
           };
         }
+        if (attemptRecorder.latest?.mode === "text_repair" && attemptRecorder.latest.outcome === "succeeded") {
+          attemptRecorder.markLatest("invalid_output", "文本修复输出未通过结构或语义校验。");
+        }
       }
       lastError = normalizeError(error).message;
+      if (attemptRecorder.latest?.outcome === "succeeded") attemptRecorder.markLatest("invalid_output", lastError);
       onProgress?.({
         requestId,
         status: attempt + 1 < maxAttempts ? "repairing" : "failed",
@@ -414,7 +585,12 @@ export async function buildAIDecision(
     message: "真实模型没有产出可用动作，已暂停以避免继续消耗和错误兜底。",
     error: reason
   });
-  return { ok: false, fallback: false, error: reason };
+  return {
+    ok: false,
+    fallback: false,
+    error: reason,
+    llmCall: createFailureCallLog(request.state, pending, persona, provider.name, model, prompt, reason, attemptRecorder.attempts, promptPackage)
+  };
 }
 
 function createRateLimitedAdapter(adapter: LLMProviderAdapter, fallbackSignal?: AbortSignal): LLMProviderAdapter {
@@ -520,7 +696,8 @@ function isAbortError(error: unknown): boolean {
 function cancelledDecision(
   request: AIDecisionRequest,
   onProgress?: AIDecisionProgressCallback,
-  pending?: PendingAction
+  pending?: PendingAction,
+  llmCall?: LLMCallLog
 ): AIDecisionResponse {
   const reason = "AI 请求已取消";
   onProgress?.({
@@ -531,26 +708,12 @@ function cancelledDecision(
     message: reason,
     error: reason
   });
-  return { ok: false, fallback: false, error: reason };
+  return { ok: false, fallback: false, error: reason, llmCall };
 }
 
 function resolveBrowserApiKey(provider: ProviderAccount, request: AIDecisionRequest): string | undefined {
   const apiKey = request.providerApiKeys?.[provider.id]?.trim();
   return apiKey || undefined;
-}
-
-function checkCostLimit(state: GameState, seatId: PlayerId, costControls: CostControls | undefined): string | undefined {
-  const controls = costControls ?? DEFAULT_COST_CONTROLS;
-  if (!controls.enabled) return undefined;
-  const gameCost = state.llmCalls.reduce((sum, call) => sum + call.estimatedCost, 0);
-  const seatCost = state.llmCalls.filter((call) => call.seatId === seatId).reduce((sum, call) => sum + call.estimatedCost, 0);
-  if (controls.maxGameCost > 0 && gameCost >= controls.maxGameCost) {
-    return `成本保护：本局费用 ${gameCost.toFixed(6)} 已达到上限 ${controls.maxGameCost.toFixed(6)}，已暂停真实模型请求。`;
-  }
-  if (controls.maxSeatCost > 0 && seatCost >= controls.maxSeatCost) {
-    return `成本保护：该 AI 费用 ${seatCost.toFixed(6)} 已达到上限 ${controls.maxSeatCost.toFixed(6)}，已暂停真实模型请求。`;
-  }
-  return undefined;
 }
 
 function limitMaxOutputTokens(personaMaxOutputTokens: number, costControls: CostControls | undefined): number {
@@ -580,8 +743,7 @@ function requestTimeoutMs(_provider: ProviderAccount): number | undefined {
 }
 
 function realProviderObjectAttempts(provider: ProviderAccount): number {
-  if (isDeepSeekProvider(provider)) return 1;
-  return Math.max(1, Math.min(2, provider.retryCount));
+  return 1 + Math.max(0, Math.min(2, provider.retryCount));
 }
 
 function providerReasoningEffort(provider: ProviderAccount, persona: AIPersona): AIPersona["reasoningEffort"] | undefined {
@@ -642,7 +804,6 @@ function recoverTextDecisionFromParseError(
 }
 
 async function recoverWithTextGeneration({
-  adapter,
   provider,
   model,
   apiKey,
@@ -651,9 +812,9 @@ async function recoverWithTextGeneration({
   persona,
   config,
   timeoutMs,
-  error
+  error,
+  generateText
 }: {
-  adapter: LLMProviderAdapter;
   provider: ProviderAccount;
   model: string;
   apiKey: string;
@@ -663,11 +824,12 @@ async function recoverWithTextGeneration({
   config: AIConfigStore;
   timeoutMs: number | undefined;
   error: string;
+  generateText: (request: LLMTextRequest) => Promise<LLMTextResponse>;
 }): Promise<{ prompt: string; result: LLMObjectResponse<Record<string, unknown>>; command: GameCommand; memoryUpdate?: AgentMemoryUpdate } | undefined> {
   const prompt = buildCompactRepairPrompt(state, pending, persona, error);
   let response: Awaited<ReturnType<LLMProviderAdapter["generateText"]>>;
   try {
-    response = await adapter.generateText({
+    response = await generateText({
       provider,
       model,
       prompt,
@@ -679,7 +841,7 @@ async function recoverWithTextGeneration({
       timeoutMs
     });
   } catch (error) {
-    if (isAbortError(error) || error instanceof ProviderRateLimitError) throw error;
+    if (isAbortError(error) || error instanceof ProviderRateLimitError || error instanceof CostLimitError) throw error;
     return undefined;
   }
   let result: LLMObjectResponse<Record<string, unknown>> | undefined;
@@ -1808,20 +1970,19 @@ function hasMemoryUpdateContent(update: AgentMemoryUpdate): boolean {
 
 function createCallLog(
   state: GameState,
-  config: AIConfigStore,
   pending: PendingAction,
   persona: AIPersona,
-  providerId: string,
   providerName: string,
   model: string,
   prompt: string,
   result: LLMObjectResponse<Record<string, unknown>>,
   command: GameCommand,
   latencyMs: number,
-  retryCount: number,
+  attempts: LLMAttemptLog[],
   promptPackage?: PromptPackage
 ): LLMCallLog {
   const promptMeta = promptPackage ?? promptMetadataForPrompt(prompt, 0, "FULL");
+  const usage = summarizeAttempts(attempts);
   return {
     id: createLLMCallId(state),
     gameId: state.id,
@@ -1837,13 +1998,15 @@ function createCallLog(
     parsedJson: result.object,
     publicSpeech: "text" in command ? command.text : "publicSpeech" in command ? command.publicSpeech : "messageToWolves" in command ? command.messageToWolves : undefined,
     privateRationale: "privateReason" in command ? command.privateReason : undefined,
-    inputTokens: result.usage.inputTokens,
-    outputTokens: result.usage.outputTokens,
-    reasoningTokens: result.usage.reasoningTokens ?? 0,
-    cachedTokens: result.usage.cachedTokens ?? 0,
-    estimatedCost: estimateCost(config, providerId, model, result.usage.inputTokens, result.usage.outputTokens),
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    reasoningTokens: usage.reasoningTokens,
+    cachedTokens: usage.cachedTokens,
+    estimatedCost: usage.estimatedCost,
+    costStatus: usage.costStatus,
     latencyMs,
-    retryCount,
+    retryCount: Math.max(0, attempts.length - 1),
+    attempts: attempts.map((attempt) => ({ ...attempt })),
     promptCompressionLevel: promptMeta.compressionLevel,
     estimatedInputTokens: promptMeta.estimatedInputTokens,
     promptBudgetTokens: promptMeta.promptBudgetTokens,
@@ -1851,10 +2014,84 @@ function createCallLog(
   };
 }
 
-function estimateCost(config: AIConfigStore, providerId: string, modelName: string, inputTokens: number, outputTokens: number): number {
+function createFailureCallLog(
+  state: GameState,
+  pending: PendingAction,
+  persona: AIPersona,
+  providerName: string,
+  model: string,
+  prompt: string,
+  error: string,
+  attempts: LLMAttemptLog[],
+  promptPackage?: PromptPackage
+): LLMCallLog | undefined {
+  if (attempts.length === 0) return undefined;
+  const promptMeta = promptPackage ?? promptMetadataForPrompt(prompt, 0, "FULL");
+  const usage = summarizeAttempts(attempts);
+  return {
+    id: createLLMCallId(state),
+    gameId: state.id,
+    phase: state.phase.type,
+    seatId: pending.seatId,
+    personaId: persona.id,
+    provider: providerName,
+    model,
+    promptVersion: SYSTEM_PROMPT_VERSION,
+    promptHash: createPromptHash(prompt),
+    promptTextRedacted: truncatePromptPreview(prompt),
+    rawResponse: "",
+    parsedJson: {},
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    reasoningTokens: usage.reasoningTokens,
+    cachedTokens: usage.cachedTokens,
+    estimatedCost: usage.estimatedCost,
+    costStatus: usage.costStatus,
+    latencyMs: attempts.reduce((sum, attempt) => sum + attempt.latencyMs, 0),
+    retryCount: Math.max(0, attempts.length - 1),
+    attempts: attempts.map((attempt) => ({ ...attempt })),
+    promptCompressionLevel: promptMeta.compressionLevel,
+    estimatedInputTokens: promptMeta.estimatedInputTokens,
+    promptBudgetTokens: promptMeta.promptBudgetTokens,
+    promptPreviewTruncated: promptMeta.promptPreviewTruncated,
+    error
+  };
+}
+
+function summarizeAttempts(attempts: LLMAttemptLog[]): {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cachedTokens: number;
+  estimatedCost: number;
+  costStatus: LLMCostStatus;
+} {
+  return {
+    inputTokens: attempts.reduce((sum, attempt) => sum + attempt.inputTokens, 0),
+    outputTokens: attempts.reduce((sum, attempt) => sum + attempt.outputTokens, 0),
+    reasoningTokens: attempts.reduce((sum, attempt) => sum + attempt.reasoningTokens, 0),
+    cachedTokens: attempts.reduce((sum, attempt) => sum + attempt.cachedTokens, 0),
+    estimatedCost: attempts.reduce((sum, attempt) => sum + attempt.estimatedCost, 0),
+    costStatus: attempts.some((attempt) => attempt.costStatus === "unknown")
+      ? "unknown"
+      : attempts.some((attempt) => attempt.costStatus === "reserved")
+        ? "reserved"
+        : "actual"
+  };
+}
+
+function modelPricing(config: AIConfigStore, providerId: string, modelName: string): ModelPricing {
   const model = findModelConfig(config.models, providerId, modelName);
-  if (!model) return 0;
-  return (inputTokens / 1_000_000) * model.inputPricePerMillion + (outputTokens / 1_000_000) * model.outputPricePerMillion;
+  if (!model) return { known: false, inputPricePerMillion: 0, outputPricePerMillion: 0 };
+  return {
+    known: model.inputPricePerMillion > 0 || model.outputPricePerMillion > 0,
+    inputPricePerMillion: model.inputPricePerMillion,
+    outputPricePerMillion: model.outputPricePerMillion
+  };
+}
+
+function calculateCost(pricing: ModelPricing, inputTokens: number, outputTokens: number): number {
+  return (inputTokens / 1_000_000) * pricing.inputPricePerMillion + (outputTokens / 1_000_000) * pricing.outputPricePerMillion;
 }
 
 function findModelConfig(models: ModelConfig[], providerId: string, modelName: string): ModelConfig | undefined {
@@ -1892,8 +2129,10 @@ function createFallbackCallLog(
     reasoningTokens: 0,
     cachedTokens: 0,
     estimatedCost: 0,
+    costStatus: "actual",
     latencyMs: 0,
     retryCount,
+    attempts: [],
     promptCompressionLevel: promptPackage?.compressionLevel,
     estimatedInputTokens: promptPackage?.estimatedInputTokens,
     promptBudgetTokens: promptPackage?.promptBudgetTokens,

@@ -171,6 +171,7 @@ export interface AgentMemoryUpdate {
 
 export interface GameState {
   id: string;
+  revision: number;
   setup: GameSetup;
   rulePreset: RulePreset;
   players: PlayerState[];
@@ -197,6 +198,10 @@ export interface GameState {
     lastGuardTarget?: PlayerId;
     hunterReturn?: "last_words" | "after_day";
     pendingBadgeSeatId?: PlayerId;
+    debugResume?: {
+      phase: GamePhase;
+      pendingActions: PendingAction[];
+    };
   };
 }
 
@@ -308,6 +313,7 @@ export function createGame(setup: GameSetup, preset: RulePreset = STANDARD_PRESE
 
   const state: GameState = {
     id: createGameId(),
+    revision: 0,
     setup,
     rulePreset: preset,
     players,
@@ -403,6 +409,8 @@ export function applyCommand(input: GameState, command: GameCommand): GameState 
       break;
   }
 
+  state.revision = (Number.isInteger(input.revision) ? input.revision : 0) + 1;
+  if (command.type === "DebugForceKill") validateRestoredState(state);
   return state;
 }
 
@@ -722,6 +730,7 @@ export function restoreSnapshotFixture(value: unknown): GameState {
   }
   const fixture = value as unknown as GameSnapshotFixture;
   const state = clone(fixture.state);
+  state.revision = Number.isInteger(state.revision) && state.revision >= 0 ? state.revision : 0;
   if (fixture.gameId !== state.id) {
     throw new Error("快照 gameId 与局面状态不一致。");
   }
@@ -799,6 +808,7 @@ function validateRestoredState(state: GameState): void {
     throw new Error("快照缺少必要的结构化状态字段。");
   }
   validateRestoredSetup(state.setup);
+  if (!Number.isInteger(state.revision) || state.revision < 0) throw new Error("快照状态 revision 非法。");
   validateRestoredRulePreset(state.rulePreset, state.setup.totalPlayers);
   validateSetup(state.setup, state.rulePreset);
   if (!PHASE_TYPES.has(state.phase.type)) {
@@ -902,6 +912,12 @@ function validateRestoredState(state: GameState): void {
   }
   if (state.round.pendingBadgeSeatId && !playerIds.has(state.round.pendingBadgeSeatId)) {
     throw new Error(`快照警徽待处理玩家不存在：${state.round.pendingBadgeSeatId}`);
+  }
+  if (state.round.debugResume !== undefined) {
+    if (!isRecord(state.round.debugResume) || !isRecord(state.round.debugResume.phase) || !Array.isArray(state.round.debugResume.pendingActions)) {
+      throw new Error("快照调试恢复点非法。");
+    }
+    if (!PHASE_TYPES.has(state.round.debugResume.phase.type)) throw new Error("快照调试恢复阶段非法。");
   }
   if (state.sheriffSeatId && !playerIds.has(state.sheriffSeatId)) {
     throw new Error(`快照警长玩家不存在：${state.sheriffSeatId}`);
@@ -2427,12 +2443,103 @@ function abandonSheriffElection(state: GameState, reason: string): void {
 
 function handleDebugForceKill(state: GameState, command: Extract<GameCommand, { type: "DebugForceKill" }>): void {
   if (!state.setup.debugMode.allowManualOverride) return;
+  const target = requirePlayer(state, command.seatId);
+  if (!target.alive || state.status === "ended") return;
+
+  // Resolve the target's current action through the existing deterministic
+  // timeout path before removing them. This prevents action phases from being
+  // left without a matching pending action.
+  if (state.pendingActions.some((pending) => pending.seatId === command.seatId)) {
+    handleTimeout(state, command.seatId);
+  }
   markDead(state, command.seatId, "debug");
   pushEvent(state, "DebugForceKill", "admin", { targetId: command.seatId, reason: command.reason });
+  removeDebugDeathReferences(state, command.seatId);
   if (finishIfWon(state)) return;
   const pendingBadgeSeatId = takePendingBadgeSeatId(state, command.seatId);
   if (pendingBadgeSeatId) {
+    state.round.debugResume = { phase: clone(state.phase), pendingActions: clone(state.pendingActions) };
     enterBadgeDecision(state, pendingBadgeSeatId, "debug", [command.seatId]);
+  }
+}
+
+function removeDebugDeathReferences(state: GameState, targetId: PlayerId): void {
+  const isAlive = (id: PlayerId) => Boolean(getPlayer(state, id)?.alive);
+  state.pendingActions = state.pendingActions
+    .filter((pending) => {
+      if (pending.seatId !== targetId) return true;
+      return pending.kind === "badge_decision" || pending.kind === "hunter_shot" || (pending.kind === "speech" && pending.speechType === "last_words");
+    })
+    .map((pending) => {
+      if (pending.kind === "wolf_discussion") {
+        return {
+          ...pending,
+          legalTargets: pending.legalTargets.filter(isAlive),
+          currentProposal: pending.currentProposal && isAlive(pending.currentProposal) ? pending.currentProposal : undefined
+        };
+      }
+      if (pending.kind === "witch_action") {
+        return {
+          ...pending,
+          wolfTarget: pending.wolfTarget && isAlive(pending.wolfTarget) ? pending.wolfTarget : undefined,
+          canSave: pending.canSave && Boolean(pending.wolfTarget && isAlive(pending.wolfTarget)),
+          legalTargets: pending.legalTargets.filter(isAlive)
+        };
+      }
+      if ("legalTargets" in pending) return { ...pending, legalTargets: pending.legalTargets.filter(isAlive) };
+      return pending;
+    });
+
+  const sheriff = state.round.sheriff;
+  sheriff.candidates = sheriff.candidates.filter(isAlive);
+  sheriff.speechQueue = sheriff.speechQueue.filter(isAlive);
+  sheriff.pkCandidates = sheriff.pkCandidates.filter(isAlive);
+  removePlayerFromVoteRecord(sheriff.votes, targetId);
+  removePlayerFromVoteRecord(sheriff.pkVotes, targetId);
+
+  const day = state.round.day;
+  if (day) {
+    day.speechQueue = day.speechQueue.filter(isAlive);
+    day.pkCandidates = day.pkCandidates.filter(isAlive);
+    day.pkSpeechQueue = day.pkSpeechQueue.filter(isAlive);
+    removePlayerFromVoteRecord(day.votes, targetId);
+    removePlayerFromVoteRecord(day.pkVotes, targetId);
+  }
+
+  state.round.lastWordsQueue = state.round.lastWordsQueue.filter((id) => id !== targetId);
+  state.round.pendingNightDeaths = state.round.pendingNightDeaths?.filter((death) => death.seatId !== targetId);
+  if (state.round.lastGuardTarget === targetId) state.round.lastGuardTarget = undefined;
+
+  const night = state.round.night;
+  if (night) {
+    if (night.protectedTarget === targetId) night.protectedTarget = undefined;
+    if (night.wolfTarget === targetId) night.wolfTarget = undefined;
+    if (night.witchPoisonTarget === targetId) night.witchPoisonTarget = undefined;
+    const discussion = night.wolfDiscussion;
+    if (discussion) {
+      discussion.speakerOrder = discussion.speakerOrder.filter(isAlive);
+      discussion.currentIndex = discussion.speakerOrder.length > 0 ? discussion.currentIndex % discussion.speakerOrder.length : 0;
+      delete discussion.proposals[targetId];
+      delete discussion.agreements[targetId];
+      for (const [seatId, proposedTarget] of Object.entries(discussion.proposals)) {
+        if (!isAlive(seatId) || !isAlive(proposedTarget)) delete discussion.proposals[seatId];
+      }
+      for (const [seatId, agreedTarget] of Object.entries(discussion.agreements)) {
+        if (!isAlive(seatId) || !isAlive(agreedTarget)) delete discussion.agreements[seatId];
+      }
+      if (discussion.lockedTarget && !isAlive(discussion.lockedTarget)) discussion.lockedTarget = undefined;
+    }
+  }
+
+  if (state.phase.actingSeatId === targetId) {
+    state.phase.actingSeatId = state.pendingActions[0]?.seatId;
+  }
+}
+
+function removePlayerFromVoteRecord(votes: Record<PlayerId, PlayerId | "abstain">, playerId: PlayerId): void {
+  delete votes[playerId];
+  for (const [voterId, targetId] of Object.entries(votes)) {
+    if (targetId === playerId) delete votes[voterId];
   }
 }
 
@@ -2603,6 +2710,14 @@ function resumeAfterBadgeDecision(
   state: GameState,
   pending: Pick<Extract<PendingAction, { kind: "badge_decision" }>, "returnTo" | "deathIds">
 ): void {
+  if (pending.returnTo === "debug") {
+    const resume = state.round.debugResume;
+    state.round.debugResume = undefined;
+    if (!resume) throw new Error("调试警徽处理缺少恢复点。");
+    state.phase = resume.phase;
+    state.pendingActions = resume.pendingActions;
+    return;
+  }
   if (pending.returnTo === "after_death_announcement") {
     const hunter = findPendingHunter(state, pending.deathIds);
     if (hunter) {

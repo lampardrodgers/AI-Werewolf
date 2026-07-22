@@ -34,7 +34,7 @@ describe("AI decision service", () => {
     expect(response.llmCall?.error).toContain("未配置真实供应商");
   });
 
-  it("retries once when model output fails legality validation", async () => {
+  it("treats retryCount as retries and uses the compact prompt for the final retry", async () => {
     const state = createGame({
       totalPlayers: 8,
       humanPlayers: 0,
@@ -47,26 +47,21 @@ describe("AI decision service", () => {
     if (!("legalTargets" in pending)) throw new Error("expected target action");
     const legalTarget = pending.legalTargets[0];
     const config = withRealProvider();
-    config.providers[0].retryCount = 2;
+    config.providers[0].retryCount = 1;
     let calls = 0;
-    const adapter = fakeAdapter(async () => {
+    const prompts: string[] = [];
+    const adapter = fakeAdapter(async (request) => {
       calls += 1;
+      prompts.push(request.prompt);
+      if (calls === 1) throw new Error("network unavailable during first attempt");
       return {
         text: "{}",
-        object:
-          calls === 1
-            ? {
-                message_to_wolves: "第一轮输出非法目标。",
-                proposed_target: "player_999",
-                agree_current_proposal: true,
-                private_reason: "故意输出不存在的目标，验证规则引擎会触发修复重试。"
-              }
-            : {
-                message_to_wolves: "修复后选择合法目标。",
-                proposed_target: legalTarget,
-                agree_current_proposal: true,
-                private_reason: "第二轮输出合法目标，应该被规则引擎正常接受并继续流程。"
-              },
+        object: {
+          message_to_wolves: "修复后选择合法目标。",
+          proposed_target: legalTarget,
+          agree_current_proposal: true,
+          private_reason: "第二轮输出合法目标，应该被规则引擎正常接受并继续流程。"
+        },
         raw: { calls },
         usage: { inputTokens: 100, outputTokens: 20 },
         latencyMs: 3
@@ -79,8 +74,13 @@ describe("AI decision service", () => {
     expect(response.fallback).toBe(false);
     expect(response.command).toMatchObject({ type: "SubmitWolfDiscussionMessage", proposedTargetId: legalTarget });
     expect(response.llmCall?.retryCount).toBe(1);
+    expect(response.llmCall?.attempts?.map((attempt) => attempt.outcome)).toEqual(["failed", "succeeded"]);
+    expect(response.llmCall?.inputTokens).toBe(100);
+    expect(response.llmCall?.estimatedCost).toBeGreaterThan(0);
     expect(response.llmCall?.promptHash).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
     expect(calls).toBe(2);
+    expect(prompts[0]).toContain("JSON Schema");
+    expect(prompts[1]).toContain("Compact Output Repair");
   });
 
   it("passes only the browser-supplied provider key to the adapter", async () => {
@@ -674,6 +674,7 @@ describe("AI decision service", () => {
     config.models[0].name = "deepseek-v4-flash";
     config.models[0].contextWindow = 1_000_000;
     config.models[0].maxOutputTokens = 384_000;
+    config.costControls = { ...config.costControls, enabled: false };
     config.personas = config.personas.map((persona) => ({
       ...persona,
       defaultModel: "deepseek-v4-flash",
@@ -870,7 +871,9 @@ describe("AI decision service", () => {
 
     expect(response.ok).toBe(false);
     expect(response.fallback).toBe(false);
-    expect(response.llmCall).toBeUndefined();
+    expect(response.llmCall).toBeDefined();
+    expect(response.llmCall?.attempts?.length).toBeGreaterThan(0);
+    expect(response.llmCall?.estimatedCost).toBeGreaterThan(0);
     expect(response.error).toContain("真实 AI 输出连续失败");
   });
 
@@ -1016,7 +1019,7 @@ describe("AI decision service", () => {
       type: "SubmitSpeech",
       text: "我先按警上发言和票型看，暂时不急着归死票。"
     });
-    expect(response.llmCall?.retryCount).toBe(1);
+    expect(response.llmCall?.retryCount).toBe(2);
     expect(calls).toBe(2);
   });
 
@@ -1205,7 +1208,7 @@ describe("AI decision service", () => {
       type: "SubmitSpeech",
       text: "我先上警抢发言视角。警徽流先5后7，后面重点听5号和7号解释站边。"
     });
-    expect(response.llmCall?.retryCount).toBe(1);
+    expect(response.llmCall?.retryCount).toBe(2);
     expect(calls).toBe(2);
   });
 
@@ -1323,7 +1326,7 @@ describe("AI decision service", () => {
       type: "SubmitSpeech",
       text: "我先不保死任何人，今天重点听4号和5号的发言矛盾再归票。"
     });
-    expect(response.llmCall?.retryCount).toBe(1);
+    expect(response.llmCall?.retryCount).toBe(2);
     expect(calls).toBe(2);
   });
 
@@ -1506,7 +1509,8 @@ describe("AI decision service", () => {
     expect(response.ok).toBe(false);
     expect(response.fallback).toBe(false);
     expect(response.command).toBeUndefined();
-    expect(response.llmCall).toBeUndefined();
+    expect(response.llmCall).toBeDefined();
+    expect(response.llmCall?.attempts?.map((attempt) => attempt.mode)).toEqual(["object", "text_repair"]);
     expect(response.error).toContain("真实 AI 输出连续失败");
     expect(objectCalls).toBe(1);
     expect(textCalls).toBe(1);
@@ -1559,7 +1563,7 @@ describe("AI decision service", () => {
       type: "SubmitWolfDiscussionMessage",
       proposedTargetId: legalTarget
     });
-    expect(response.llmCall?.retryCount).toBe(1);
+    expect(response.llmCall?.retryCount).toBe(2);
     expect(calls).toBe(2);
   });
 
@@ -2853,7 +2857,7 @@ describe("AI decision service", () => {
     expect(progress).not.toContain("completed");
   });
 
-  it("fails without fallback when cost protection has already reached the game budget", async () => {
+  it("uses the server cost ledger even when the client submits an empty call history", async () => {
     const state = createGame({
       totalPlayers: 8,
       humanPlayers: 0,
@@ -2862,41 +2866,162 @@ describe("AI decision service", () => {
       rulePresetId: STANDARD_PRESET.id,
       debugMode: DEFAULT_DEBUG_MODE
     });
-    state.llmCalls.push({
-      id: "call_spent",
-      gameId: state.id,
-      phase: state.phase.type,
-      seatId: state.pendingActions[0].seatId,
-      provider: "real",
-      model: "expensive-model",
-      promptVersion: "test",
-      promptHash: "fnv1a32:00000000",
-      promptTextRedacted: "",
-      rawResponse: "{}",
-      parsedJson: {},
-      inputTokens: 1000,
-      outputTokens: 1000,
-      reasoningTokens: 0,
-      cachedTokens: 0,
-      estimatedCost: 0.02,
-      latencyMs: 10,
-      retryCount: 0
-    });
+    const pending = state.pendingActions[0];
+    if (!("legalTargets" in pending)) throw new Error("expected target action");
+    const legalTarget = pending.legalTargets[0];
     const config = withRealProvider();
-    config.costControls = { enabled: true, maxGameCost: 0.01, maxSeatCost: 1, maxOutputTokensPerCall: 1000 };
+    config.providers[0].retryCount = 0;
+    config.models[0].inputPricePerMillion = 0;
+    config.models[0].outputPricePerMillion = 1000;
+    config.personas = config.personas.map((persona) => ({ ...persona, maxOutputTokens: 100 }));
+    config.costControls = { enabled: true, maxGameCost: 0.15, maxSeatCost: 1, maxOutputTokensPerCall: 100 };
     let calls = 0;
     const adapter = fakeAdapter(async () => {
       calls += 1;
-      throw new Error("should not call adapter");
+      return {
+        text: "{}",
+        object: {
+          message_to_wolves: "成本账本测试使用合法目标。",
+          proposed_target: legalTarget,
+          agree_current_proposal: true,
+          private_reason: "第一次请求结算后应保留在服务端账本，不依赖客户端调用历史。"
+        },
+        raw: {},
+        usage: { inputTokens: 100, outputTokens: 100 },
+        latencyMs: 3
+      };
+    });
+
+    const first = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+    const second = await buildAIDecision(requestWithKey({ ...state, llmCalls: [] }), config, undefined, () => adapter);
+
+    expect(first.ok).toBe(true);
+    expect(first.llmCall?.estimatedCost).toBeCloseTo(0.1, 8);
+    expect(second.ok).toBe(false);
+    expect(second.fallback).toBe(false);
+    expect(second.error).toContain("成本保护");
+    expect(second.llmCall).toBeUndefined();
+    expect(calls).toBe(1);
+  });
+
+  it("counts active reservations so parallel requests cannot oversubscribe the game budget", async () => {
+    const state = advanceToSheriffCandidacy("ai-decision-parallel-budget");
+    const pendingBatch = state.pendingActions.slice(0, 2);
+    expect(pendingBatch).toHaveLength(2);
+    const config = withRealProvider();
+    config.providers[0].retryCount = 0;
+    config.models[0].inputPricePerMillion = 0;
+    config.models[0].outputPricePerMillion = 1000;
+    config.personas = config.personas.map((persona) => ({ ...persona, maxOutputTokens: 100 }));
+    config.costControls = { enabled: true, maxGameCost: 0.15, maxSeatCost: 1, maxOutputTokensPerCall: 100 };
+    let calls = 0;
+    let releaseFirst: (() => void) | undefined;
+    const firstWaiting = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      markStarted?.();
+      await firstWaiting;
+      return {
+        text: "{}",
+        object: {
+          run_for_sheriff: false,
+          public_speech: "我不上警，警下听发言和票型。",
+          private_reason: "并行成本预留测试，第一个请求未结算时必须占用单局预算。"
+        },
+        raw: {},
+        usage: { inputTokens: 100, outputTokens: 100 },
+        latencyMs: 3
+      };
+    });
+
+    const firstPromise = buildAIDecision(
+      { ...requestWithKey(state), seatId: pendingBatch[0].seatId },
+      config,
+      undefined,
+      () => adapter
+    );
+    await started;
+    const second = await buildAIDecision(
+      { ...requestWithKey(state), seatId: pendingBatch[1].seatId },
+      config,
+      undefined,
+      () => adapter
+    );
+    releaseFirst?.();
+    const first = await firstPromise;
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    expect(second.error).toContain("本局已使用/预留");
+    expect(calls).toBe(1);
+  });
+
+  it("blocks zero-price real models while cost protection is enabled", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-unknown-price",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const config = withRealProvider();
+    config.models[0].inputPricePerMillion = 0;
+    config.models[0].outputPricePerMillion = 0;
+    let calls = 0;
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      throw new Error("adapter should not be called without known pricing");
     });
 
     const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
 
     expect(response.ok).toBe(false);
-    expect(response.fallback).toBe(false);
-    expect(response.error).toContain("成本保护");
+    expect(response.error).toContain("价格");
     expect(response.llmCall).toBeUndefined();
     expect(calls).toBe(0);
+  });
+
+  it("labels zero-price calls as unknown when cost protection is explicitly disabled", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-unknown-price-without-protection",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions[0];
+    if (!("legalTargets" in pending)) throw new Error("expected target action");
+    const legalTarget = pending.legalTargets[0];
+    const config = withRealProvider();
+    config.models[0].inputPricePerMillion = 0;
+    config.models[0].outputPricePerMillion = 0;
+    config.costControls = { ...config.costControls, enabled: false };
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        message_to_wolves: "关闭成本保护后允许价格未知的模型继续运行。",
+        proposed_target: legalTarget,
+        agree_current_proposal: true,
+        private_reason: "价格未知时不得把费用显示为已知的零，但显式关闭保护后仍允许请求。"
+      },
+      raw: {},
+      usage: { inputTokens: 100, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.llmCall?.costStatus).toBe("unknown");
+    expect(response.llmCall?.attempts?.[0].costStatus).toBe("unknown");
   });
 });
 

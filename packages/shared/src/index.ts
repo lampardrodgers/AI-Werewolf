@@ -218,6 +218,29 @@ export interface GameEvent<TPayload = Record<string, unknown>> {
   createdAt: string;
 }
 
+export type LLMAttemptOutcome = "succeeded" | "recovered" | "invalid_output" | "failed" | "cancelled";
+export type LLMCostStatus = "actual" | "reserved" | "unknown";
+
+export interface LLMAttemptLog {
+  id: string;
+  attempt: number;
+  mode: "object" | "text_repair";
+  provider: string;
+  model: string;
+  promptHash: string;
+  promptTextRedacted: string;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cachedTokens: number;
+  estimatedCost: number;
+  costStatus: LLMCostStatus;
+  reservedCost: number;
+  latencyMs: number;
+  outcome: LLMAttemptOutcome;
+  error?: string;
+}
+
 export interface LLMCallLog {
   id: string;
   gameId: string;
@@ -238,8 +261,10 @@ export interface LLMCallLog {
   reasoningTokens: number;
   cachedTokens: number;
   estimatedCost: number;
+  costStatus?: LLMCostStatus;
   latencyMs: number;
   retryCount: number;
+  attempts?: LLMAttemptLog[];
   promptCompressionLevel?: "FULL" | "COMPACT" | "OVERFLOW_FALLBACK";
   estimatedInputTokens?: number;
   promptBudgetTokens?: number;
@@ -521,6 +546,12 @@ export function buildAIReadiness(config: AIConfigStore): AIReadinessReport {
   const personaModels = realPersonas.map((persona) => `${persona.defaultProviderId}:${persona.defaultModel}`);
   const modelKeys = new Set(config.models.filter((model) => model.enabled).map((model) => `${model.providerId}:${model.name}`));
   const missingModelCount = personaModels.filter((key) => !modelKeys.has(key)).length;
+  const pricedModelKeys = new Set(
+    config.models
+      .filter((model) => model.enabled && (model.inputPricePerMillion > 0 || model.outputPricePerMillion > 0))
+      .map((model) => `${model.providerId}:${model.name}`)
+  );
+  const missingPriceCount = personaModels.filter((key) => !pricedModelKeys.has(key)).length;
   const realProviderWithSecret = realProviders.filter((provider) => Boolean(provider.apiKeyEncrypted?.trim()));
   const schemaProviderCount = realProviders.filter((provider) => provider.supportsJsonSchema).length;
   const controls = config.costControls ?? DEFAULT_COST_CONTROLS;
@@ -557,6 +588,16 @@ export function buildAIReadiness(config: AIConfigStore): AIReadinessReport {
           : missingModelCount === 0
             ? "角色卡使用的真实模型已在模型管理中启用。"
             : `${missingModelCount} 个角色卡模型缺少启用的模型管理记录，费用估算可能不完整。`
+    },
+    {
+      label: "模型价格",
+      ok: realPersonas.length > 0 && missingPriceCount === 0,
+      detail:
+        realPersonas.length === 0
+          ? "角色卡还未指向真实模型。"
+          : missingPriceCount === 0
+            ? "真实模型已配置非零输入或输出价格，可以进行费用预留。"
+            : `${missingPriceCount} 个角色卡模型的输入、输出价格均为 0 或未配置，成本保护将阻止真实请求。`
     },
     {
       label: "结构化输出策略",

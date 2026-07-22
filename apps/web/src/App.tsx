@@ -590,6 +590,10 @@ export function App(): JSX.Element {
       if (requestEpoch !== aiRequestEpochRef.current || requestController.signal.aborted) return;
       if (aiInFlightRef.current !== actionKey) return;
       if (!result.ok || !result.command) {
+        const latestGame = gameRef.current;
+        if (result.llmCall && latestGame?.id === game.id && latestGame.revision === game.revision) {
+          commitGame({ ...latestGame, llmCalls: [...latestGame.llmCalls, result.llmCall as LLMCallLog] });
+        }
         setAiStepStatus(result.error ? `自动处理失败：${result.error}` : "自动处理失败，请稍后重试。");
         return;
       }
@@ -614,6 +618,10 @@ export function App(): JSX.Element {
         .catch(() => undefined);
       const latestGame = gameRef.current;
       if (!latestGame || latestGame.id !== game.id) return;
+      if (latestGame.revision !== game.revision) {
+        setAiStepStatus(`${seatName(game, pending.seatId)} 的局面已变化，忽略旧 AI 返回。`);
+        return;
+      }
       const latestPending = findMatchingPending(latestGame, pending);
       if (!latestPending) {
         setAiStepStatus(`${seatName(game, pending.seatId)} 的 ${pendingLabel(pending)} 已不再等待，忽略旧 AI 返回。`);
@@ -717,8 +725,15 @@ export function App(): JSX.Element {
       const failures = results.filter((item) => !item.result?.ok || !item.result.command);
       const latestGame = gameRef.current;
       if (!latestGame || latestGame.id !== snapshot.id) return;
+      if (latestGame.revision !== snapshot.revision) return;
       let nextState = latestGame;
       const appliedSuccesses: ParallelAIDecisionResult[] = [];
+
+      for (const item of failures) {
+        if (item.result?.llmCall) {
+          nextState = { ...nextState, llmCalls: [...nextState.llmCalls, item.result.llmCall as LLMCallLog] };
+        }
+      }
 
       if (successes.length > 0) {
         for (const item of successes) {
@@ -730,11 +745,11 @@ export function App(): JSX.Element {
           if (result.memoryUpdate) {
             nextState = applyAgentMemoryUpdate(nextState, latestPending.seatId, result.memoryUpdate as AgentMemoryUpdate);
           }
-          if (result.llmCall) nextState.llmCalls.push(result.llmCall as LLMCallLog);
+          if (result.llmCall) nextState = { ...nextState, llmCalls: [...nextState.llmCalls, result.llmCall as LLMCallLog] };
           appliedSuccesses.push(item);
         }
-        if (appliedSuccesses.length > 0) commitGame(nextState);
       }
+      if (appliedSuccesses.length > 0 || failures.some((item) => item.result?.llmCall)) commitGame(nextState);
 
       const fallbackCount = appliedSuccesses.filter((item) => item.result?.fallback).length;
       const fallbackReason = appliedSuccesses.map((item) => (item.result ? fallbackDetailText(item.result) : "")).find(Boolean);
@@ -897,6 +912,8 @@ export function App(): JSX.Element {
   }
 
   function forceKillPlayer(seatId: PlayerId): void {
+    invalidateAIRequests();
+    setAiBusy(false);
     setGame((current) => {
       const next = current
         ? applyCommand(current, {
@@ -3165,10 +3182,12 @@ function DebugPanel({
   const totalReasoning = game.llmCalls.reduce((sum, call) => sum + call.reasoningTokens, 0);
   const totalCached = game.llmCalls.reduce((sum, call) => sum + call.cachedTokens, 0);
   const totalCost = game.llmCalls.reduce((sum, call) => sum + call.estimatedCost, 0);
+  const unknownCostCalls = game.llmCalls.filter((call) => call.costStatus === "unknown").length;
+  const knownCostCalls = game.llmCalls.filter((call) => call.costStatus !== "unknown");
   const failedCalls = game.llmCalls.filter((call) => call.error).length;
   const totalRetries = game.llmCalls.reduce((sum, call) => sum + call.retryCount, 0);
-  const averageCost = game.llmCalls.length > 0 ? totalCost / game.llmCalls.length : 0;
-  const mostExpensiveCall = game.llmCalls.reduce<LLMCallLog | undefined>(
+  const averageCost = knownCostCalls.length > 0 ? totalCost / knownCostCalls.length : 0;
+  const mostExpensiveCall = knownCostCalls.reduce<LLMCallLog | undefined>(
     (current, call) => (!current || call.estimatedCost > current.estimatedCost ? call : current),
     undefined
   );
@@ -3245,13 +3264,27 @@ function DebugPanel({
                   <span>输出 {call.outputTokens}</span>
                   <span>推理 {call.reasoningTokens}</span>
                   <span>缓存 {call.cachedTokens}</span>
-                  <span>费用 {call.estimatedCost.toFixed(6)}</span>
+                  <span>费用 {call.costStatus === "unknown" ? "未知" : `${call.estimatedCost.toFixed(6)}${call.costStatus === "reserved" ? "（保守预留）" : ""}`}</span>
                   <span>耗时 {call.latencyMs}ms</span>
                   <span>重试 {call.retryCount}</span>
                   {call.promptCompressionLevel && <span>上下文 {call.promptCompressionLevel}</span>}
                   {call.estimatedInputTokens !== undefined && <span>估算 {call.estimatedInputTokens}/{call.promptBudgetTokens ?? "-"}</span>}
                   <span>Prompt {call.promptHash}</span>
                 </div>
+                {call.attempts && call.attempts.length > 0 && (
+                  <details className="raw-response-detail">
+                    <summary>真实请求尝试 {call.attempts.length} 次</summary>
+                    {call.attempts.map((attempt) => (
+                      <div className="log-line" key={attempt.id}>
+                        <span>#{attempt.attempt + 1} {attempt.mode} · {attempt.outcome}</span>
+                        <p>
+                          Token {attempt.inputTokens}/{attempt.outputTokens} · 费用 {attempt.costStatus === "unknown" ? "未知" : attempt.estimatedCost.toFixed(6)}
+                          {attempt.error ? ` · ${attempt.error}` : ""}
+                        </p>
+                      </div>
+                    ))}
+                  </details>
+                )}
                 {call.error && <p className="call-error">{call.error}</p>}
                 <div className="reasoning-trace">
                   <strong>模型 thinking / reasoning_content</strong>
@@ -3332,15 +3365,15 @@ function DebugPanel({
           </div>
           <div>
             <span>费用估算</span>
-            <strong>{totalCost.toFixed(4)}</strong>
+            <strong>{totalCost.toFixed(4)}{unknownCostCalls > 0 ? ` + ${unknownCostCalls} 次未知` : ""}</strong>
           </div>
           <div>
             <span>平均费用</span>
-            <strong>{averageCost.toFixed(6)}</strong>
+            <strong>{knownCostCalls.length > 0 ? averageCost.toFixed(6) : "未知"}</strong>
           </div>
           <div>
             <span>最贵调用</span>
-            <strong>{(mostExpensiveCall?.estimatedCost ?? 0).toFixed(6)}</strong>
+            <strong>{mostExpensiveCall ? mostExpensiveCall.estimatedCost.toFixed(6) : "未知"}</strong>
           </div>
         </div>
       </section>
@@ -3368,7 +3401,7 @@ function DebugPanel({
                 ))}
               </select>
             </label>
-            <button className="ghost-button" onClick={() => onForceKill(debugTarget)} disabled={!debugTarget}>
+            <button className="ghost-button" onClick={() => onForceKill(debugTarget)} disabled={!debugTarget || aiBusy}>
               <Skull size={16} />
               强制死亡
             </button>

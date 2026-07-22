@@ -1,19 +1,19 @@
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProviderAdapter } from "@langrensha/llm-gateway";
-import { AIConfigStore, DEFAULT_AI_CONFIG, DEFAULT_CONTEXT_COMPRESSION, DEFAULT_COST_CONTROLS } from "@langrensha/shared";
 import { AIDecisionProgress, AIDecisionRequest, AIDecisionResponse, buildAIDecision } from "./aiDecision";
 import { AIRequestRegistry } from "./aiRequestRegistry";
+import { AIConfigRepository, ConfigValidationError } from "./configStore";
 import { buildAllowedOrigins, isAllowedCorsOrigin } from "./cors";
 
 const WORKSPACE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const DATA_DIR = process.env.LANGRENSHA_DATA_DIR ? path.resolve(process.env.LANGRENSHA_DATA_DIR) : path.join(WORKSPACE_ROOT, "data");
 const CONFIG_PATH = path.join(DATA_DIR, "ai-config.json");
 const LEGACY_CONFIG_PATH = path.join(WORKSPACE_ROOT, "apps/server/data/ai-config.json");
+const configRepository = new AIConfigRepository(CONFIG_PATH, LEGACY_CONFIG_PATH);
 const ALLOWED_ORIGINS = buildAllowedOrigins(process.env.LANGRENSHA_ALLOWED_ORIGINS);
 const AI_STATUS_TTL_MS = 10 * 60 * 1000;
 const aiStatuses = new Map<string, AIDecisionProgress & { startedAt: string; updatedAt: string; active: boolean }>();
@@ -31,12 +31,17 @@ await fastify.register(cors, {
 
 fastify.get("/api/health", async () => ({ ok: true }));
 
-fastify.get("/api/config", async () => loadConfig());
+fastify.get("/api/config", async () => configRepository.load());
 
-fastify.put<{ Body: AIConfigStore }>("/api/config", async (request) => {
-  const normalized = normalizeIncomingConfig(request.body);
-  await saveConfig(normalized);
-  return normalized;
+fastify.put<{ Body: unknown }>("/api/config", async (request, reply) => {
+  try {
+    return await configRepository.save(request.body);
+  } catch (error) {
+    if (error instanceof ConfigValidationError) {
+      return reply.code(422).send({ ok: false, error: error.message });
+    }
+    throw error;
+  }
 });
 
 fastify.post<{
@@ -45,7 +50,7 @@ fastify.post<{
     apiKey?: string;
   };
 }>("/api/llm/test", async (request) => {
-  const config = await loadConfig();
+  const config = await configRepository.load();
   const provider = config.providers.find((item) => item.id === request.body.providerId);
   if (!provider) {
     return { ok: false, error: "找不到供应商配置" };
@@ -82,7 +87,7 @@ fastify.post<{ Body: AIDecisionRequest }>("/api/ai/decision", async (request) =>
       message: "服务端已收到 AI 决策请求。"
     });
     try {
-      const config = await loadConfig();
+      const config = await configRepository.load();
       return await buildAIDecision({ ...request.body, requestId, signal }, config, undefined, createProviderAdapter, recordAIProgress);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -117,29 +122,6 @@ fastify.post<{ Params: { requestId: string } }>("/api/ai/cancel/:requestId", asy
 const port = Number(process.env.PORT ?? 12001);
 const host = process.env.HOST ?? "127.0.0.1";
 await fastify.listen({ port, host });
-
-async function loadConfig(): Promise<AIConfigStore> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await migrateLegacyConfig();
-  try {
-    const raw = await fs.readFile(CONFIG_PATH, "utf8");
-    const parsed = JSON.parse(raw) as AIConfigStore;
-    const config = withConfigDefaults(parsed);
-    if (hasStoredProviderSecrets(parsed)) {
-      await saveConfig(config);
-    }
-    return config;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    await saveConfig(DEFAULT_AI_CONFIG);
-    return normalizeIncomingConfig(DEFAULT_AI_CONFIG);
-  }
-}
-
-async function saveConfig(config: AIConfigStore): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(CONFIG_PATH, `${JSON.stringify(normalizeIncomingConfig(config), null, 2)}\n`, "utf8");
-}
 
 function recordAIProgress(progress: AIDecisionProgress): void {
   const now = new Date().toISOString();
@@ -182,65 +164,4 @@ function decisionFingerprint(request: AIDecisionRequest): string {
     contextCompression: request.contextCompression
   });
   return crypto.createHash("sha256").update(canonicalInput).digest("hex");
-}
-
-function normalizeIncomingConfig(next: AIConfigStore): AIConfigStore {
-  return {
-    ...next,
-    costControls: next.costControls ?? DEFAULT_COST_CONTROLS,
-    contextCompression: next.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION,
-    models: next.models.map(normalizeModelConfig),
-    providers: next.providers.map((provider) => {
-      const normalized = { ...provider, apiKeyEncrypted: undefined };
-      if (normalized.baseUrl.includes("api.deepseek.com") && (normalized.reasoningEffort ?? "minimal") === "minimal") {
-        normalized.thinkingMode = "enabled";
-        normalized.reasoningEffort = "high";
-      }
-      return normalized;
-    })
-  };
-}
-
-function normalizeModelConfig(model: AIConfigStore["models"][number]): AIConfigStore["models"][number] {
-  const normalized = { ...model };
-  if (normalized.providerId === "deepseek-provider" || normalized.name.startsWith("deepseek-v4-")) {
-    if (normalized.id === "model-deepseek-v4-pro") {
-      normalized.name = "deepseek-v4-pro";
-      normalized.displayName = "DeepSeek V4 Pro";
-    }
-    if (normalized.name === "deepseek-v4-flash" || normalized.name === "deepseek-v4-pro") {
-      normalized.contextWindow = 1_000_000;
-      normalized.maxOutputTokens = 384_000;
-    }
-  }
-  return normalized;
-}
-
-function withConfigDefaults(config: AIConfigStore): AIConfigStore {
-  return normalizeIncomingConfig({
-    ...config,
-    costControls: config.costControls ?? DEFAULT_COST_CONTROLS,
-    contextCompression: config.contextCompression ?? DEFAULT_CONTEXT_COMPRESSION
-  });
-}
-
-function hasStoredProviderSecrets(config: AIConfigStore): boolean {
-  return config.providers.some((provider) => Boolean(provider.apiKeyEncrypted));
-}
-
-async function migrateLegacyConfig(): Promise<void> {
-  if (CONFIG_PATH === LEGACY_CONFIG_PATH) return;
-  const [rootExists, legacyExists] = await Promise.all([fileExists(CONFIG_PATH), fileExists(LEGACY_CONFIG_PATH)]);
-  if (!rootExists && legacyExists) {
-    await fs.copyFile(LEGACY_CONFIG_PATH, CONFIG_PATH);
-  }
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
 }

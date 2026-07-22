@@ -52,6 +52,22 @@ describe("AI readiness", () => {
     });
   });
 
+  it("does not report cost readiness when a real model has zero prices", () => {
+    const config = withRealProvider();
+    const model = config.models.find((item) => item.providerId === "real-provider");
+    if (!model) throw new Error("expected real model");
+    model.inputPricePerMillion = 0;
+    model.outputPricePerMillion = 0;
+
+    const readiness = buildAIReadiness(config);
+
+    expect(readiness.ready).toBe(false);
+    expect(item(readiness, "模型价格")).toMatchObject({
+      ok: false,
+      detail: expect.stringContaining("成本保护将阻止")
+    });
+  });
+
   it("creates stable prompt hashes without exposing prompt text", () => {
     expect(createPromptHash("same prompt")).toBe(createPromptHash("same prompt"));
     expect(createPromptHash("same prompt")).not.toBe(createPromptHash("different prompt"));
