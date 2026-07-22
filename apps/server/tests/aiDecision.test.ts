@@ -1,10 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { applyCommand, applyMockStep, createGame } from "@langrensha/engine";
-import { buildAIDecision } from "../src/aiDecision";
+import { buildAIDecision, resetProviderRateLimitsForTests } from "../src/aiDecision";
 import { LLMObjectParseError, LLMProviderAdapter } from "@langrensha/llm-gateway";
 import { DEFAULT_AI_CONFIG, DEFAULT_CONTEXT_COMPRESSION, DEFAULT_DEBUG_MODE, ProviderAccount, STANDARD_PRESET } from "@langrensha/shared";
 
 describe("AI decision service", () => {
+  afterEach(() => {
+    resetProviderRateLimitsForTests();
+  });
+
   it("defaults context compression to automatic mode", () => {
     expect(DEFAULT_AI_CONFIG.contextCompression).toEqual(DEFAULT_CONTEXT_COMPRESSION);
     expect(DEFAULT_AI_CONFIG.contextCompression).toMatchObject({ enabled: true, mode: "auto" });
@@ -1355,6 +1359,53 @@ describe("AI decision service", () => {
     expect(response.llmCall?.parsedJson).toMatchObject({ public_speech: plainSpeech });
   });
 
+  it("repairs plain text that mentions self-explosion instead of executing it", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-plain-self-explosion-repair",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const seatId = state.players.find((player) => player.role === "werewolf")?.id;
+    if (!seatId) throw new Error("expected wolf seat");
+    state.day = 1;
+    state.phase = { type: "day_speech", day: 1, label: "白天发言", actingSeatId: seatId };
+    state.pendingActions = [{ kind: "speech", seatId, speechType: "day" }];
+    const config = withRealProvider();
+    let repairCalls = 0;
+    const plainSpeech = "我反对直接自爆，先听完今天的公开发言。";
+    const repairedSpeech = "我先听完今天的公开发言，再结合票型给出明确判断。";
+    const adapter = fakeAdapter(async () => {
+      throw new LLMObjectParseError("LLM response did not contain a valid JSON object", {
+        text: plainSpeech,
+        raw: {},
+        usage: { inputTokens: 100, outputTokens: 20 },
+        latencyMs: 3
+      });
+    });
+    adapter.generateText = async () => {
+      repairCalls += 1;
+      return {
+        text: JSON.stringify({
+          public_speech: repairedSpeech,
+          self_explode: false,
+          private_reason: "修复输出使用明确的结构化开关，确保普通发言不会被误执行为不可逆自爆。"
+        }),
+        raw: {},
+        usage: { inputTokens: 80, outputTokens: 24 },
+        latencyMs: 3
+      };
+    };
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.command).toMatchObject({ type: "SubmitSpeech", seatId, text: repairedSpeech });
+    expect(repairCalls).toBe(1);
+  });
+
   it("uses a real text repair request when structured speech responses are empty", async () => {
     const state = createGame({
       totalPlayers: 8,
@@ -2186,6 +2237,41 @@ describe("AI decision service", () => {
     expect(capturedPrompt).toContain("self_explode=true");
   });
 
+  it("rejects explicit self-explosion from a player who cannot legally use it", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-illegal-self-explosion",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const seatId = state.players.find((player) => player.role !== "werewolf")?.id;
+    if (!seatId) throw new Error("expected non-wolf seat");
+    state.day = 1;
+    state.phase = { type: "day_speech", day: 1, label: "白天发言", actingSeatId: seatId };
+    state.pendingActions = [{ kind: "speech", seatId, speechType: "day" }];
+    const config = withRealProvider();
+    config.providers[0].retryCount = 0;
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        public_speech: "错误请求自爆。",
+        self_explode: true,
+        private_reason: "非狼人或非法阶段不能执行不可逆的自爆动作，服务端必须拒绝。"
+      },
+      raw: {},
+      usage: { inputTokens: 80, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision({ ...requestWithKey(state), seatId }, config, undefined, () => adapter);
+
+    expect(response.ok).toBe(false);
+    expect(response.command).toBeUndefined();
+    expect(response.error).toContain("不允许狼人自爆");
+  });
+
   it("includes public speech history and own resource facts in public-reasoning prompts", async () => {
     const state = createGame({
       totalPlayers: 8,
@@ -2302,6 +2388,469 @@ describe("AI decision service", () => {
       text: `${targetSeat}号出局身份未公开，我倾向其为狼，今天继续按这个逻辑归票。`
     });
     expect(response.llmCall?.retryCount).toBe(0);
+  });
+
+  it("uses the requested seat when a parallel decision falls back to Mock", async () => {
+    const state = advanceToSheriffCandidacy("ai-decision-seat-scoped-fallback");
+    const requested = state.pendingActions[2];
+    if (!requested) throw new Error("expected parallel pending actions");
+
+    const response = await buildAIDecision({ state, seatId: requested.seatId }, DEFAULT_AI_CONFIG);
+
+    expect(response.ok).toBe(true);
+    expect(response.fallback).toBe(true);
+    expect(response.command).toMatchObject({ seatId: requested.seatId });
+  });
+
+  it("parses the string false safely for a witch save decision", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-witch-string-false",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const witch = state.players.find((player) => player.role === "witch");
+    if (!witch) throw new Error("expected witch");
+    const legalTargets = state.players.filter((player) => player.id !== witch.id).map((player) => player.id);
+    state.phase = { type: "night_witch", day: 1, label: "夜晚 · 女巫行动", actingSeatId: witch.id };
+    state.pendingActions = [
+      { kind: "witch_action", seatId: witch.id, wolfTarget: legalTargets[0], canSave: true, canPoison: true, legalTargets }
+    ];
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        save: "false",
+        poison_target_id: null,
+        private_reason: "当前夜晚信息不足，明确保留解药和毒药，避免因为字符串布尔值误用药。"
+      },
+      raw: {},
+      usage: { inputTokens: 80, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision({ ...requestWithKey(state), seatId: witch.id }, config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.command).toMatchObject({ type: "SubmitWitchAction", seatId: witch.id, save: false });
+  });
+
+  it("does not infer self-explosion from a negated sentence or an explicit false field", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-negated-self-explosion",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const seatId = state.players.find((player) => player.role === "werewolf")?.id;
+    if (!seatId) throw new Error("expected wolf seat");
+    state.day = 1;
+    state.phase = { type: "day_speech", day: 1, label: "白天发言", actingSeatId: seatId };
+    state.pendingActions = [{ kind: "speech", seatId, speechType: "day" }];
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        public_speech: "我不会直接自爆，先把今天的公开发言和票型完整盘完。",
+        self_explode: false,
+        private_reason: "当前没有通过自爆换取轮次的明确收益，继续隐藏身份并参与白天讨论更有利。"
+      },
+      raw: {},
+      usage: { inputTokens: 80, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.command).toMatchObject({ type: "SubmitSpeech", seatId });
+  });
+
+  it("requires explicit self_explode=true instead of inferring it from speech text", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-explicit-self-explosion-only",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const seatId = state.players.find((player) => player.role === "werewolf")?.id;
+    if (!seatId) throw new Error("expected wolf seat");
+    state.day = 1;
+    state.phase = { type: "day_speech", day: 1, label: "白天发言", actingSeatId: seatId };
+    state.pendingActions = [{ kind: "speech", seatId, speechType: "day" }];
+    const config = withRealProvider();
+    const speech = "我反对直接自爆的打法，今天应先完整听完公开发言和票型。";
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        public_speech: speech,
+        private_reason: "文本提到了自爆但没有明确设置结构化开关，服务端必须将它作为普通发言处理。"
+      },
+      raw: {},
+      usage: { inputTokens: 80, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(true);
+    expect(response.command).toMatchObject({ type: "SubmitSpeech", seatId, text: speech });
+  });
+
+  it("rejects missing badge targets instead of silently destroying the badge", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-badge-missing-target",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const sheriff = state.players[0];
+    const legalTargets = state.players.slice(1).map((player) => player.id);
+    state.phase = { type: "badge_decision", day: 1, label: "警徽处理", actingSeatId: sheriff.id };
+    state.pendingActions = [
+      { kind: "badge_decision", seatId: sheriff.id, legalTargets, canDestroy: true, returnTo: "debug", deathIds: [sheriff.id] }
+    ];
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: { private_reason: "模型遗漏了警徽目标，服务端必须拒绝而不能默认撕毁警徽。" },
+      raw: {},
+      usage: { inputTokens: 80, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(false);
+    expect(response.command).toBeUndefined();
+    expect(response.error).toContain("缺少必要文本字段");
+  });
+
+  it("rejects abstain when the active rule preset disallows it", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-illegal-abstain",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const seatId = state.players[0].id;
+    state.rulePreset = {
+      ...state.rulePreset,
+      voteRules: { ...state.rulePreset.voteRules, allowAbstain: false }
+    };
+    state.phase = { type: "day_vote", day: 1, label: "白天投票", actingSeatId: seatId };
+    state.pendingActions = [
+      { kind: "vote", seatId, voteType: "day", legalTargets: state.players.slice(1).map((player) => player.id) }
+    ];
+    const config = withRealProvider();
+    const adapter = fakeAdapter(async () => ({
+      text: "{}",
+      object: {
+        vote_target: "abstain",
+        private_reason: "模型提出弃票，但当前规则明确禁止弃票，服务端必须拒绝该动作。",
+        confidence: 0.5
+      },
+      raw: {},
+      usage: { inputTokens: 80, outputTokens: 20 },
+      latencyMs: 3
+    }));
+
+    const response = await buildAIDecision(requestWithKey(state), config, undefined, () => adapter);
+
+    expect(response.ok).toBe(false);
+    expect(response.command).toBeUndefined();
+    expect(response.error).toContain("当前规则不允许弃票");
+  });
+
+  it("serializes parallel calls at the provider concurrency limit", async () => {
+    const state = advanceToSheriffCandidacy("ai-decision-provider-concurrency");
+    const pendingBatch = state.pendingActions.slice(0, 2);
+    const config = withRealProvider();
+    config.providers[0].rateLimit = { rpm: 100, tpm: 1_000_000, concurrency: 1 };
+    let calls = 0;
+    let active = 0;
+    let maxActive = 0;
+    let releaseFirst: (() => void) | undefined;
+    let notifyFirstStarted: (() => void) | undefined;
+    const firstStarted = new Promise<void>((resolve) => {
+      notifyFirstStarted = resolve;
+    });
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (calls === 1) {
+        notifyFirstStarted?.();
+        await firstGate;
+      }
+      active -= 1;
+      return {
+        text: "{}",
+        object: {
+          run_for_sheriff: false,
+          public_speech: "我不上警，警下完整听发言并记录后续票型。",
+          private_reason: "当前并发测试选择留在警下，确保供应商同一时间只有一个真实请求。"
+        },
+        raw: {},
+        usage: { inputTokens: 80, outputTokens: 20 },
+        latencyMs: 3
+      };
+    });
+
+    const first = buildAIDecision({ ...requestWithKey(state), seatId: pendingBatch[0].seatId }, config, undefined, () => adapter);
+    await firstStarted;
+    const second = buildAIDecision({ ...requestWithKey(state), seatId: pendingBatch[1].seatId }, config, undefined, () => adapter);
+    await Promise.resolve();
+    expect(calls).toBe(1);
+    releaseFirst?.();
+    const responses = await Promise.all([first, second]);
+
+    expect(responses.every((response) => response.ok)).toBe(true);
+    expect(maxActive).toBe(1);
+  });
+
+  it("rejects provider calls that exceed RPM or reserved TPM", async () => {
+    const state = advanceToSheriffCandidacy("ai-decision-provider-minute-limits");
+    const pendingBatch = state.pendingActions.slice(0, 2);
+    const config = withRealProvider();
+    config.providers[0].rateLimit = { rpm: 1, tpm: 1_000_000, concurrency: 2 };
+    let calls = 0;
+    const adapter = fakeAdapter(async () => {
+      calls += 1;
+      return {
+        text: "{}",
+        object: {
+          run_for_sheriff: false,
+          public_speech: "我不上警，警下观察候选人的发言和投票。",
+          private_reason: "当前测试按合法结构完成一次请求，用于验证每分钟请求限额。"
+        },
+        raw: {},
+        usage: { inputTokens: 80, outputTokens: 20 },
+        latencyMs: 3
+      };
+    });
+
+    const first = await buildAIDecision({ ...requestWithKey(state), seatId: pendingBatch[0].seatId }, config, undefined, () => adapter);
+    const second = await buildAIDecision({ ...requestWithKey(state), seatId: pendingBatch[1].seatId }, config, undefined, () => adapter);
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+    expect(second.error).toContain("每分钟 1 次请求上限");
+    expect(calls).toBe(1);
+
+    resetProviderRateLimitsForTests();
+    config.providers[0].rateLimit = { rpm: 100, tpm: 1, concurrency: 2 };
+    const tokenLimited = await buildAIDecision({ ...requestWithKey(state), seatId: pendingBatch[0].seatId }, config, undefined, () => adapter);
+    expect(tokenLimited.ok).toBe(false);
+    expect(tokenLimited.error).toContain("tokens");
+    expect(calls).toBe(1);
+  });
+
+  it("uses a CJK-aware prompt estimate for provider TPM limits", async () => {
+    const state = advanceToSheriffCandidacy("ai-decision-provider-cjk-tpm");
+    const pending = state.pendingActions[0];
+    if (!pending) throw new Error("expected pending sheriff action");
+    const config = withRealProvider();
+    config.providers[0].rateLimit = { rpm: 100, tpm: 1_000_000, concurrency: 2 };
+    let calls = 0;
+    let prompt = "";
+    let maxOutputTokens = 0;
+    const adapter = fakeAdapter(async (request) => {
+      calls += 1;
+      prompt = request.prompt;
+      maxOutputTokens = request.maxOutputTokens ?? 0;
+      return {
+        text: "{}",
+        object: {
+          run_for_sheriff: false,
+          public_speech: "我留在警下听候选人完整发言，再依据公开信息投票。",
+          private_reason: "先捕获当前中文提示词长度，再验证 TPM 预留使用中英文感知的估算方式。"
+        },
+        raw: {},
+        usage: { inputTokens: 80, outputTokens: 20 },
+        latencyMs: 3
+      };
+    });
+
+    const first = await buildAIDecision({ ...requestWithKey(state), seatId: pending.seatId }, config, undefined, () => adapter);
+    expect(first.ok).toBe(true);
+    const asciiChars = [...prompt].filter((char) => char.charCodeAt(0) < 128).length;
+    const nonAsciiChars = [...prompt].length - asciiChars;
+    const naiveEstimate = Math.ceil(prompt.length / 4) + maxOutputTokens;
+    const cjkAwareEstimate = Math.ceil(asciiChars / 4) + nonAsciiChars + maxOutputTokens;
+    expect(cjkAwareEstimate).toBeGreaterThan(naiveEstimate);
+
+    resetProviderRateLimitsForTests();
+    config.providers[0].rateLimit = {
+      rpm: 100,
+      tpm: Math.floor((naiveEstimate + cjkAwareEstimate) / 2),
+      concurrency: 2
+    };
+    const limited = await buildAIDecision({ ...requestWithKey(state), seatId: pending.seatId }, config, undefined, () => adapter);
+
+    expect(limited.ok).toBe(false);
+    expect(limited.error).toContain("tokens");
+    expect(calls).toBe(1);
+  });
+
+  it("cancels an in-flight provider call without issuing a repair retry", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-provider-cancel",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const config = withRealProvider();
+    config.providers[0].retryCount = 2;
+    const controller = new AbortController();
+    let calls = 0;
+    let notifyStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    const adapter = fakeAdapter(async (request) => {
+      calls += 1;
+      notifyStarted?.();
+      return await new Promise((_, reject) => {
+        const abort = () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        request.signal?.addEventListener("abort", abort, { once: true });
+      });
+    });
+
+    const decision = buildAIDecision({ ...requestWithKey(state), signal: controller.signal }, config, undefined, () => adapter);
+    await started;
+    controller.abort();
+    const response = await decision;
+
+    expect(response).toMatchObject({ ok: false, fallback: false, error: "AI 请求已取消" });
+    expect(calls).toBe(1);
+  });
+
+  it("cancels an in-flight text repair without starting another object attempt", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-text-repair-cancel",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const config = withRealProvider();
+    config.providers[0].retryCount = 2;
+    const controller = new AbortController();
+    let objectCalls = 0;
+    let textCalls = 0;
+    let notifyRepairStarted: (() => void) | undefined;
+    const repairStarted = new Promise<void>((resolve) => {
+      notifyRepairStarted = resolve;
+    });
+    const adapter = fakeAdapter(async () => {
+      objectCalls += 1;
+      return {
+        text: "{}",
+        object: {},
+        raw: {},
+        usage: { inputTokens: 20, outputTokens: 2 },
+        latencyMs: 2
+      };
+    });
+    adapter.generateText = async (request) => {
+      textCalls += 1;
+      notifyRepairStarted?.();
+      return await new Promise((_, reject) => {
+        const abort = () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        request.signal?.addEventListener("abort", abort, { once: true });
+      });
+    };
+
+    const decision = buildAIDecision({ ...requestWithKey(state), signal: controller.signal }, config, undefined, () => adapter);
+    await repairStarted;
+    controller.abort();
+    const response = await decision;
+
+    expect(response).toMatchObject({ ok: false, fallback: false, error: "AI 请求已取消" });
+    expect(objectCalls).toBe(1);
+    expect(textCalls).toBe(1);
+  });
+
+  it("does not publish a completed command when cancellation races with provider resolution", async () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "ai-decision-provider-resolve-cancel-race",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const pending = state.pendingActions[0];
+    if (!pending || pending.kind !== "wolf_discussion") throw new Error("expected wolf discussion");
+    const config = withRealProvider();
+    const controller = new AbortController();
+    let releaseResult: (() => void) | undefined;
+    let notifyStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      notifyStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseResult = resolve;
+    });
+    const adapter = fakeAdapter(async () => {
+      notifyStarted?.();
+      await gate;
+      return {
+        text: "{}",
+        object: {
+          message_to_wolves: "先按当前合法目标统一夜间刀口，白天再围绕公开信息组织发言。",
+          proposed_target: pending.legalTargets[0],
+          agree_current_proposal: true,
+          private_reason: "供应商已经产出结果，但取消信号先于调用方消费结果到达，不能再发布旧命令。"
+        },
+        raw: {},
+        usage: { inputTokens: 80, outputTokens: 20 },
+        latencyMs: 3
+      };
+    });
+    const progress: string[] = [];
+
+    const decision = buildAIDecision(
+      { ...requestWithKey(state), signal: controller.signal },
+      config,
+      undefined,
+      () => adapter,
+      (item) => progress.push(item.status)
+    );
+    await started;
+    releaseResult?.();
+    controller.abort();
+    const response = await decision;
+
+    expect(response).toMatchObject({ ok: false, error: "AI 请求已取消" });
+    expect(response.command).toBeUndefined();
+    expect(progress.at(-1)).toBe("failed");
+    expect(progress).not.toContain("completed");
   });
 
   it("fails without fallback when cost protection has already reached the game budget", async () => {

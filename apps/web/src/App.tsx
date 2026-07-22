@@ -58,7 +58,15 @@ import {
   STANDARD_PRESET,
   ThinkingMode
 } from "@langrensha/shared";
-import { AIDecisionStatus, loadAIConfig, loadAIDecisionStatus, requestAIDecision, saveAIConfig, testProvider } from "./api";
+import { AIDecisionStatus, cancelAIDecision, loadAIConfig, loadAIDecisionStatus, requestAIDecision, saveAIConfig, testProvider } from "./api";
+import { ActiveAIDecisionRequests, isCurrentAIStatus } from "./aiRequestLifecycle";
+import {
+  assertSingleBrowserGame,
+  clearStoredGameSession,
+  loadStoredGameSession,
+  normalizeSingleBrowserHumanPlayers,
+  saveStoredGameSession
+} from "./gameSession";
 
 type AppScreen = "setup" | "game" | "admin";
 type AdminSection = "overview" | "ai" | "roles" | "logs";
@@ -160,7 +168,7 @@ function normalizeRoleOverrides(totalPlayers: number, roles?: RoleId[]): RoleId[
 
 function normalizeSetupForGame(setup: GameSetup): GameSetup {
   const totalPlayers = clampNumber(setup.totalPlayers, STANDARD_PRESET.minPlayers, STANDARD_PRESET.maxPlayers);
-  const humanPlayers = clampNumber(setup.humanPlayers, 0, totalPlayers);
+  const humanPlayers = normalizeSingleBrowserHumanPlayers(setup.humanPlayers);
   const roleOverrides = setup.roleOverrides ? normalizeRoleOverrides(totalPlayers, setup.roleOverrides) : undefined;
   return {
     ...setup,
@@ -303,11 +311,13 @@ const THINKING_MODE_OPTIONS: Array<{ value: ThinkingMode; label: string }> = [
 ];
 
 export function App(): JSX.Element {
-  const [setup, setSetup] = useState<GameSetup>(() => createDefaultSetup());
-  const [game, setGame] = useState<GameState | null>(null);
+  const [initialSession] = useState(() => (typeof window === "undefined" ? { hasStoredSession: false } : loadStoredGameSession(window.localStorage)));
+  const restoredGame = initialSession.game ?? null;
+  const [setup, setSetup] = useState<GameSetup>(() => restoredGame?.setup ?? createDefaultSetup());
+  const [game, setGame] = useState<GameState | null>(() => restoredGame);
   const [autoRun, setAutoRun] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
-  const [screen, setScreen] = useState<AppScreen>("setup");
+  const [isPaused, setIsPaused] = useState(Boolean(restoredGame?.status === "running"));
+  const [screen, setScreen] = useState<AppScreen>(restoredGame ? "game" : "setup");
   const [tab, setTab] = useState<GameSideTab>("chat");
   const [adminSection, setAdminSection] = useState<AdminSection>("ai");
   const [speechText, setSpeechText] = useState("");
@@ -317,23 +327,30 @@ export function App(): JSX.Element {
   const [wolfAgree, setWolfAgree] = useState(true);
   const [sheriffRun, setSheriffRun] = useState(false);
   const [config, setConfig] = useState<AIConfigStore>(DEFAULT_AI_CONFIG);
-  const [gameContextCompression, setGameContextCompression] = useState<ContextCompressionConfig | undefined>();
+  const [gameContextCompression, setGameContextCompression] = useState<ContextCompressionConfig | undefined>(initialSession.gameContextCompression);
   const [configStatus, setConfigStatus] = useState("配置尚未保存");
   const [providerTestStatus, setProviderTestStatus] = useState("");
   const [providerTestResults, setProviderTestResults] = useState<ProviderTestResults>({});
   const [providerApiKeys, setProviderApiKeys] = useState<LocalProviderApiKeys>(() => loadLocalProviderApiKeys());
-  const [aiMode, setAiMode] = useState<"mock" | "llm">("llm");
+  const [aiMode, setAiMode] = useState<"mock" | "llm">(initialSession.aiMode ?? "llm");
   const [aiBusy, setAiBusy] = useState(false);
   const [aiElapsedSeconds, setAiElapsedSeconds] = useState(0);
   const [aiProgress, setAiProgress] = useState<AIDecisionStatus | null>(null);
-  const [aiStepStatus, setAiStepStatus] = useState("等待玩家行动。");
+  const [aiStepStatus, setAiStepStatus] = useState(
+    restoredGame ? (restoredGame.status === "ended" ? "已从本机恢复已结束的对局。" : "已从本机恢复对局，当前保持暂停；点击继续后恢复自动流程。") : "等待玩家行动。"
+  );
   const [streamingSpeech, setStreamingSpeech] = useState("");
   const [readableOutputPause, setReadableOutputPause] = useState<ReadableOutputPause | null>(null);
   const [batchResult, setBatchResult] = useState<MockBatchRunResult | null>(null);
-  const [debugStatus, setDebugStatus] = useState("");
+  const [debugStatus, setDebugStatus] = useState(restoredGame ? `已从本机恢复对局：${restoredGame.id}` : "");
+  const [sessionRecoveryError, setSessionRecoveryError] = useState(initialSession.error ?? "");
   const streamingTimerRef = useRef<number | undefined>();
   const aiInFlightRef = useRef<string | null>(null);
-  const gameRef = useRef<GameState | null>(null);
+  const aiRequestEpochRef = useRef(0);
+  const activeAIRequestsRef = useRef(new ActiveAIDecisionRequests());
+  const gameRef = useRef<GameState | null>(restoredGame);
+  const sessionPreferencesRef = useRef({ aiMode, gameContextCompression });
+  sessionPreferencesRef.current = { aiMode, gameContextCompression };
 
   const humanPlayerId = useMemo(() => game?.players.find((player) => player.controller === "human")?.id, [game]);
   const publicGame = useMemo(() => (game ? toPublicViewState(game) : null), [game]);
@@ -369,9 +386,45 @@ export function App(): JSX.Element {
     gameRef.current = game;
   }, [game]);
 
+  useEffect(() => {
+    if (!game || typeof window === "undefined") return;
+    const timer = window.setTimeout(() => {
+      try {
+        saveStoredGameSession(window.localStorage, game, { aiMode, gameContextCompression });
+      } catch (error) {
+        setDebugStatus(error instanceof Error ? `自动保存失败：${error.message}。当前对局仍可继续。` : "自动保存失败，当前对局仍可继续。");
+      }
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [aiMode, game, gameContextCompression]);
+
+  useEffect(() => {
+    function handlePageHide(): void {
+      if (gameRef.current) {
+        try {
+          saveStoredGameSession(window.localStorage, gameRef.current, sessionPreferencesRef.current);
+        } catch {
+          // 页面离开时无法可靠展示错误；运行期间的自动保存会提供可见提示。
+        }
+      }
+      invalidateAIRequests();
+      setAiBusy(false);
+      setAutoRun(false);
+      setIsPaused(true);
+    }
+    window.addEventListener("pagehide", handlePageHide);
+    return () => window.removeEventListener("pagehide", handlePageHide);
+  }, []);
+
   function commitGame(next: GameState | null): void {
     gameRef.current = next;
     setGame(next);
+  }
+
+  function invalidateAIRequests(): void {
+    aiRequestEpochRef.current += 1;
+    activeAIRequestsRef.current.cancelAll(cancelAIDecision);
+    aiInFlightRef.current = null;
   }
 
   useEffect(() => {
@@ -386,6 +439,8 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     return () => {
+      aiRequestEpochRef.current += 1;
+      activeAIRequestsRef.current.cancelAll(cancelAIDecision);
       if (streamingTimerRef.current !== undefined) {
         window.clearInterval(streamingTimerRef.current);
       }
@@ -417,7 +472,7 @@ export function App(): JSX.Element {
   }, [game?.rulePreset.voteRules.allowAbstain, humanPending?.kind, humanPending?.seatId, humanPending && "round" in humanPending ? humanPending.round : undefined]);
 
   function startGame(): void {
-    aiInFlightRef.current = null;
+    invalidateAIRequests();
     const normalized = normalizeSetupForGame(setup);
     setSetup(normalized);
     commitGame(assignPersonasToAISeats(createGame(normalized), config.personas, normalized.seed));
@@ -428,12 +483,14 @@ export function App(): JSX.Element {
     setReadableOutputPause(null);
     setAiProgress(null);
     setGameContextCompression(undefined);
+    setSessionRecoveryError("");
     setTab("chat");
     setScreen("game");
   }
 
   function restartGame(): void {
-    aiInFlightRef.current = null;
+    invalidateAIRequests();
+    setAiBusy(false);
     setIsPaused(false);
     setAutoRun(true);
     const normalized = normalizeSetupForGame(setup);
@@ -493,6 +550,8 @@ export function App(): JSX.Element {
 
     setAiBusy(true);
     const requestId = `ai_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const requestEpoch = aiRequestEpochRef.current;
+    const requestController = activeAIRequestsRef.current.begin(requestId);
     const startedAt = new Date().toISOString();
     setAiProgress({
       requestId,
@@ -508,12 +567,27 @@ export function App(): JSX.Element {
     const pollTimer = window.setInterval(() => {
       void loadAIDecisionStatus(requestId)
         .then((status) => {
-          if (status) setAiProgress(status);
+          if (!status) return;
+          setAiProgress((current) =>
+            isCurrentAIStatus({
+              expectedRequestId: requestId,
+              statusRequestId: status.requestId,
+              activeStatusRequestId: current?.requestId,
+              expectedActionKey: actionKey,
+              activeActionKey: aiInFlightRef.current,
+              expectedEpoch: requestEpoch,
+              currentEpoch: aiRequestEpochRef.current,
+              aborted: requestController.signal.aborted
+            })
+              ? status
+              : current
+          );
         })
         .catch(() => undefined);
     }, 1000);
     try {
-      const result = await requestAIDecision(game, pending.seatId, requestId, providerApiKeys, effectiveContextCompression);
+      const result = await requestAIDecision(game, pending.seatId, requestId, providerApiKeys, effectiveContextCompression, requestController.signal);
+      if (requestEpoch !== aiRequestEpochRef.current || requestController.signal.aborted) return;
       if (aiInFlightRef.current !== actionKey) return;
       if (!result.ok || !result.command) {
         setAiStepStatus(result.error ? `自动处理失败：${result.error}` : "自动处理失败，请稍后重试。");
@@ -521,7 +595,21 @@ export function App(): JSX.Element {
       }
       void loadAIDecisionStatus(requestId)
         .then((status) => {
-          if (status) setAiProgress(status);
+          if (!status) return;
+          setAiProgress((current) =>
+            isCurrentAIStatus({
+              expectedRequestId: requestId,
+              statusRequestId: status.requestId,
+              activeStatusRequestId: current?.requestId,
+              expectedActionKey: actionKey,
+              activeActionKey: aiInFlightRef.current,
+              expectedEpoch: requestEpoch,
+              currentEpoch: aiRequestEpochRef.current,
+              aborted: requestController.signal.aborted
+            })
+              ? status
+              : current
+          );
         })
         .catch(() => undefined);
       const latestGame = gameRef.current;
@@ -548,11 +636,15 @@ export function App(): JSX.Element {
         pauseAfterTransitionEvents(latestGame, nextState, latestGame.phase.label);
       }
     } catch (error) {
+      if (requestEpoch !== aiRequestEpochRef.current || requestController.signal.aborted) return;
       setAiStepStatus(error instanceof Error ? `自动处理失败：${error.message}` : "自动处理失败，请稍后重试。");
     } finally {
       window.clearInterval(pollTimer);
-      setAiBusy(false);
-      if (aiInFlightRef.current === actionKey) aiInFlightRef.current = null;
+      activeAIRequestsRef.current.finish(requestId, requestController);
+      if (requestEpoch === aiRequestEpochRef.current) {
+        setAiBusy(false);
+        if (aiInFlightRef.current === actionKey) aiInFlightRef.current = null;
+      }
     }
   }
 
@@ -592,6 +684,7 @@ export function App(): JSX.Element {
     clearStreamingOutput();
     const snapshot = game;
     const batchId = `ai_batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const requestEpoch = aiRequestEpochRef.current;
     const startedAt = new Date().toISOString();
     setAiProgress({
       requestId: batchId,
@@ -607,14 +700,18 @@ export function App(): JSX.Element {
       const results = await Promise.all(
         pendingBatch.map(async (pending): Promise<ParallelAIDecisionResult> => {
           const requestId = `${batchId}_${pending.seatId}`;
+          const requestController = activeAIRequestsRef.current.begin(requestId);
           try {
-            const result = await requestAIDecision(snapshot, pending.seatId, requestId, providerApiKeys, effectiveContextCompression);
+            const result = await requestAIDecision(snapshot, pending.seatId, requestId, providerApiKeys, effectiveContextCompression, requestController.signal);
             return { pending, requestId, result };
           } catch (error) {
             return { pending, requestId, error: error instanceof Error ? error.message : "AI 决策请求失败" };
+          } finally {
+            activeAIRequestsRef.current.finish(requestId, requestController);
           }
         })
       );
+      if (requestEpoch !== aiRequestEpochRef.current) return;
       if (aiInFlightRef.current !== batchKey) return;
       const successes = results.filter((item) => item.result?.ok && item.result.command);
       const failures = results.filter((item) => !item.result?.ok || !item.result.command);
@@ -666,8 +763,10 @@ export function App(): JSX.Element {
         }
       }
     } finally {
-      setAiBusy(false);
-      if (aiInFlightRef.current === batchKey) aiInFlightRef.current = null;
+      if (requestEpoch === aiRequestEpochRef.current) {
+        setAiBusy(false);
+        if (aiInFlightRef.current === batchKey) aiInFlightRef.current = null;
+      }
     }
   }
 
@@ -733,6 +832,8 @@ export function App(): JSX.Element {
 
   function submitWolfSelfExplosion(): void {
     if (!game || !humanPlayerId || !canWolfSelfExplode(game, humanPlayerId)) return;
+    invalidateAIRequests();
+    setAiBusy(false);
     const next = applyCommand(game, {
       type: "SubmitWolfSelfExplosion",
       seatId: humanPlayerId,
@@ -771,10 +872,13 @@ export function App(): JSX.Element {
     const file = input.files?.[0];
     if (!file) return;
     try {
-      aiInFlightRef.current = null;
-      const restored = restoreSnapshotFixture(JSON.parse(await file.text()));
+      const restored = assertSingleBrowserGame(restoreSnapshotFixture(JSON.parse(await file.text())));
+      invalidateAIRequests();
+      setAiBusy(false);
+      setAutoRun(false);
+      setIsPaused(true);
       commitGame(restored);
-      setSetup(restored.setup);
+      setSetup(normalizeSetupForGame(restored.setup));
       setAutoRun(true);
       setBatchResult(null);
       clearStreamingOutput();
@@ -952,7 +1056,20 @@ export function App(): JSX.Element {
               </button>
             </div>
           </header>
-          <SetupScreen setup={setup} setSetup={setSetup} onStart={startGame} />
+          <SetupScreen
+            setup={setup}
+            setSetup={setSetup}
+            onStart={startGame}
+            sessionRecoveryError={sessionRecoveryError}
+            onClearBrokenSession={() => {
+              try {
+                clearStoredGameSession(window.localStorage);
+                setSessionRecoveryError("");
+              } catch (error) {
+                setSessionRecoveryError(error instanceof Error ? `清除失败：${error.message}` : "清除本机对局失败。");
+              }
+            }}
+          />
         </>
       ) : (
         <GameRoom
@@ -1016,10 +1133,17 @@ export function App(): JSX.Element {
           onRestart={restartGame}
           onOpenAdmin={() => setScreen("admin")}
           onNewGame={() => {
-            aiInFlightRef.current = null;
+            invalidateAIRequests();
+            setAiBusy(false);
             setAutoRun(false);
             setIsPaused(false);
             commitGame(null);
+            try {
+              clearStoredGameSession(window.localStorage);
+              setSessionRecoveryError("");
+            } catch (error) {
+              setSessionRecoveryError(error instanceof Error ? `清除本机对局失败：${error.message}` : "清除本机对局失败。");
+            }
             setSetup((current) => ({ ...current, seed: createRandomSeed() }));
             setGameContextCompression(undefined);
             setReadableOutputPause(null);
@@ -1616,18 +1740,22 @@ function GameRoom({
 function SetupScreen({
   setup,
   setSetup,
-  onStart
+  onStart,
+  sessionRecoveryError,
+  onClearBrokenSession
 }: {
   setup: GameSetup;
   setSetup: (setup: GameSetup) => void;
   onStart: () => void;
+  sessionRecoveryError: string;
+  onClearBrokenSession: () => void;
 }): JSX.Element {
   const aiPlayers = setup.totalPlayers - setup.humanPlayers;
   const customRoles = setup.roleOverrides ? normalizeRoleOverrides(setup.totalPlayers, setup.roleOverrides) : undefined;
 
   function patch(next: Partial<GameSetup>): void {
     const totalPlayers = clampNumber(next.totalPlayers ?? setup.totalPlayers, 6, 12);
-    const humanPlayers = clampNumber(next.humanPlayers ?? setup.humanPlayers, 0, totalPlayers);
+    const humanPlayers = normalizeSingleBrowserHumanPlayers(next.humanPlayers ?? setup.humanPlayers);
     const incomingRoles = next.roleOverrides !== undefined ? next.roleOverrides : setup.roleOverrides;
     const roleOverrides = incomingRoles ? normalizeRoleOverrides(totalPlayers, incomingRoles) : undefined;
     setSetup({ ...setup, ...next, totalPlayers, humanPlayers, aiPlayers: totalPlayers - humanPlayers, roleOverrides });
@@ -1643,8 +1771,17 @@ function SetupScreen({
     <section className="setup-page">
       <div className="setup-copy">
         <h2>创建可观战/可参与的 AI 狼人杀</h2>
-        <p>第一版聚焦稳定规则、API 接入、透明日志和可顺畅跑完一局。真人数可以为 0，剩余座位由 AI 补齐。</p>
+        <p>第一版支持纯 AI 观战或单人参与；当前浏览器只承载一名真人身份，其余座位由 AI 补齐。</p>
       </div>
+      {sessionRecoveryError && (
+        <div className="setup-visibility-note" role="alert">
+          <strong>无法恢复上次对局</strong>
+          <p>{sessionRecoveryError}</p>
+          <button type="button" className="ghost-button mini" onClick={onClearBrokenSession}>
+            清除损坏的本机存档
+          </button>
+        </div>
+      )}
       <div className="setup-grid">
         <label>
           总人数
@@ -1664,12 +1801,13 @@ function SetupScreen({
         <label>
           真人数量
           <div className="range-with-number">
-            <input type="range" min={0} max={setup.totalPlayers} value={setup.humanPlayers} onChange={(event) => patch({ humanPlayers: Number(event.target.value) })} />
+            <input type="range" min={0} max={1} step={1} value={setup.humanPlayers} onChange={(event) => patch({ humanPlayers: Number(event.target.value) })} />
             <input
               aria-label="真人数量数字"
               type="number"
               min={0}
-              max={setup.totalPlayers}
+              max={1}
+              step={1}
               value={setup.humanPlayers}
               onChange={(event) => patch({ humanPlayers: Number(event.target.value) })}
             />

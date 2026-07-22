@@ -16,6 +16,7 @@ export interface LLMTextRequest {
   reasoningEffort?: "minimal" | "low" | "medium" | "high" | "max";
   apiKey?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface LLMTextResponse {
@@ -112,7 +113,7 @@ class OpenAIResponsesAdapter implements LLMProviderAdapter {
         max_output_tokens: req.maxOutputTokens,
         reasoning: requestReasoningEffort(req) ? { effort: requestReasoningEffort(req) } : undefined
       })
-    }, req.timeoutMs ?? req.provider.timeoutMs);
+    }, req.timeoutMs ?? req.provider.timeoutMs, req.signal);
     const raw = (await response.json()) as OpenAIResponsePayload;
     return {
       text: extractOpenAIText(raw),
@@ -141,7 +142,7 @@ class OpenAIResponsesAdapter implements LLMProviderAdapter {
         reasoning: requestReasoningEffort(req) ? { effort: requestReasoningEffort(req) } : undefined,
         text: req.provider.supportsJsonSchema ? { format: jsonSchemaTextFormat(req.schema) } : undefined
       })
-    }, req.timeoutMs ?? req.provider.timeoutMs);
+    }, req.timeoutMs ?? req.provider.timeoutMs, req.signal);
     const raw = (await response.json()) as OpenAIResponsePayload;
     const text = extractOpenAIText(raw);
     return parseObjectResponse<TObject>({
@@ -185,7 +186,7 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
         reasoning_effort: thinking?.type === "disabled" ? undefined : reasoningEffort,
         thinking
       })
-    }, req.timeoutMs ?? req.provider.timeoutMs);
+    }, req.timeoutMs ?? req.provider.timeoutMs, req.signal);
     const raw = (await response.json()) as ChatCompletionPayload;
     return {
       text: extractChatCompletionText(raw, { allowReasoningJson: true }),
@@ -213,7 +214,7 @@ class OpenAICompatibleAdapter implements LLMProviderAdapter {
         thinking,
         response_format: responseFormat
       })
-    }, req.timeoutMs ?? req.provider.timeoutMs);
+    }, req.timeoutMs ?? req.provider.timeoutMs, req.signal);
     const raw = (await response.json()) as ChatCompletionPayload;
     const text = extractChatCompletionText(raw, { allowReasoningJson: true });
     return parseObjectResponse<TObject>({
@@ -246,7 +247,7 @@ class AnthropicAdapter implements LLMProviderAdapter {
         top_p: req.topP,
         messages: [{ role: "user", content: req.prompt }]
       })
-    }, req.timeoutMs ?? req.provider.timeoutMs);
+    }, req.timeoutMs ?? req.provider.timeoutMs, req.signal);
     const raw = (await response.json()) as AnthropicPayload;
     return {
       text: raw.content?.map((item) => item.text ?? "").join("") ?? "",
@@ -287,7 +288,7 @@ class GeminiAdapter implements LLMProviderAdapter {
           maxOutputTokens: req.maxOutputTokens
         }
       })
-    }, req.timeoutMs ?? req.provider.timeoutMs);
+    }, req.timeoutMs ?? req.provider.timeoutMs, req.signal);
     const raw = (await response.json()) as GeminiPayload;
     return {
       text: raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "",
@@ -316,7 +317,7 @@ class GeminiAdapter implements LLMProviderAdapter {
           responseSchema: req.provider.supportsJsonSchema ? req.schema : undefined
         }
       })
-    }, req.timeoutMs ?? req.provider.timeoutMs);
+    }, req.timeoutMs ?? req.provider.timeoutMs, req.signal);
     const raw = (await response.json()) as GeminiPayload;
     const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
     return parseObjectResponse<TObject>({
@@ -460,15 +461,22 @@ export function parseObjectResponse<TObject>(response: LLMTextResponse): LLMObje
   }
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs?: number): Promise<Response> {
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs?: number, externalSignal?: AbortSignal): Promise<Response> {
+  const signal = externalSignal ?? init.signal ?? undefined;
   if (!timeoutMs || timeoutMs <= 0) {
-    const response = await fetch(url, init);
+    const response = await fetch(url, { ...init, signal });
     if (!response.ok) {
       throw new Error(await formatHttpError(response));
     }
     return response;
   }
   const controller = new AbortController();
+  const abortFromExternalSignal = () => controller.abort(signal?.reason);
+  if (signal?.aborted) {
+    controller.abort(signal.reason);
+  } else {
+    signal?.addEventListener("abort", abortFromExternalSignal, { once: true });
+  }
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(url, { ...init, signal: controller.signal });
@@ -478,6 +486,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs?: numb
     return response;
   } finally {
     clearTimeout(timeout);
+    signal?.removeEventListener("abort", abortFromExternalSignal);
   }
 }
 

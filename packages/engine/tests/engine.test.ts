@@ -26,12 +26,61 @@ describe("werewolf engine", () => {
     expect(counts.guard).toBe(1);
   });
 
+  it("creates unique game ids for rapid consecutive games", () => {
+    const setup = {
+      totalPlayers: 6,
+      humanPlayers: 0,
+      aiPlayers: 6,
+      seed: "unique-game-id",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    };
+    const ids = Array.from({ length: 32 }, () => createGame(setup).id);
+
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("keeps gameplay deterministic for the same seed despite unique game ids", () => {
+    const setup = {
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "same-seed-deterministic-gameplay",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    };
+    let left = createGame(setup);
+    let right = createGame(setup);
+    expect(left.id).not.toBe(right.id);
+    expect(left.players.map((player) => player.role)).toEqual(right.players.map((player) => player.role));
+
+    for (let step = 0; step < 400; step += 1) {
+      const leftDecision = createMockDecision(left);
+      const rightDecision = createMockDecision(right);
+      expect(leftDecision?.command).toEqual(rightDecision?.command);
+      if (!leftDecision || !rightDecision) break;
+      left = applyCommand(left, leftDecision.command);
+      right = applyCommand(right, rightDecision.command);
+      expect(left.phase).toEqual(right.phase);
+      expect(left.pendingActions).toEqual(right.pendingActions);
+      expect(left.players.map((player) => ({ alive: player.alive, isSheriff: player.isSheriff, death: player.death }))).toEqual(
+        right.players.map((player) => ({ alive: player.alive, isSheriff: player.isSheriff, death: player.death }))
+      );
+      if (left.status === "ended" || right.status === "ended") break;
+    }
+
+    expect(left.status).toBe("ended");
+    expect(right.status).toBe("ended");
+    expect(left.winner).toBe(right.winner);
+    expect(left.endReason).toBe(right.endReason);
+  });
+
   it("uses test role overrides in seat order when provided", () => {
     const roleOverrides: RoleId[] = ["guard", "werewolf", "seer", "witch", "hunter", "villager"];
     const state = createGame({
       totalPlayers: 6,
-      humanPlayers: 6,
-      aiPlayers: 0,
+      humanPlayers: 1,
+      aiPlayers: 5,
       seed: "test-role-overrides",
       rulePresetId: STANDARD_PRESET.id,
       debugMode: DEFAULT_DEBUG_MODE,
@@ -40,6 +89,19 @@ describe("werewolf engine", () => {
 
     expect(state.players.map((player) => player.role)).toEqual(roleOverrides);
     expect(state.events.some((event) => event.type === "RoleAssigned" && (event.payload as { role?: RoleId }).role === "guard")).toBe(true);
+  });
+
+  it("rejects multiple human players until private per-seat sessions are implemented", () => {
+    expect(() =>
+      createGame({
+        totalPlayers: 6,
+        humanPlayers: 2,
+        aiPlayers: 4,
+        seed: "multiple-humans-not-supported",
+        rulePresetId: STANDARD_PRESET.id,
+        debugMode: DEFAULT_DEBUG_MODE
+      })
+    ).toThrow("当前版本仅支持 0 或 1 名真人玩家");
   });
 
   it("rejects test role overrides that do not match the player count", () => {
@@ -431,8 +493,187 @@ describe("werewolf engine", () => {
     });
 
     expect(STANDARD_PRESET.witchRules.guardSaveSameTargetDies).toBe(true);
+    expect(state.phase.type).toBe("sheriff_candidacy");
+    expect(state.players.find((player) => player.id === targetId)?.alive).toBe(true);
+    expect(state.round.lastDeaths).not.toContain(targetId);
+    expect(state.round.pendingNightDeaths).toContainEqual({ seatId: targetId, reason: "wolf" });
+
+    for (const action of [...state.pendingActions]) {
+      state = applyCommand(state, {
+        type: "SubmitSheriffCandidacy",
+        seatId: action.seatId,
+        runForSheriff: false,
+        publicSpeech: "不上警。",
+        privateReason: "测试首夜死亡延迟公布。"
+      });
+    }
+
     expect(state.players.find((player) => player.id === targetId)?.alive).toBe(false);
     expect(state.round.lastDeaths).toContain(targetId);
+    expect(state.events.some((event) => event.type === "NightDeathsAnnounced")).toBe(true);
+  });
+
+  it("keeps first-night deaths alive and hidden through sheriff candidacy and voting", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "deferred-first-night-death",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["werewolf", "werewolf", "werewolf", "seer", "witch", "hunter", "villager", "villager"]
+    });
+    const witch = state.players[4];
+    const nightDeath = state.players[7];
+    state.round.night!.wolfTarget = nightDeath.id;
+    state.phase = { type: "night_witch", day: 0, label: "夜晚 0 · 女巫行动", actingSeatId: witch.id };
+    state.pendingActions = [
+      {
+        kind: "witch_action",
+        seatId: witch.id,
+        wolfTarget: nightDeath.id,
+        canSave: true,
+        canPoison: true,
+        legalTargets: state.players.filter((player) => player.id !== witch.id).map((player) => player.id)
+      }
+    ];
+
+    state = applyCommand(state, { type: "SubmitWitchAction", seatId: witch.id, save: false, privateReason: "测试延迟死亡。" });
+
+    expect(state.phase.type).toBe("sheriff_candidacy");
+    expect(state.players.find((player) => player.id === nightDeath.id)?.alive).toBe(true);
+    expect(state.pendingActions.some((action) => action.kind === "sheriff_candidacy" && action.seatId === nightDeath.id)).toBe(true);
+    expect(getPlayerVisibleEvents(state, state.players[6].id).some((event) => event.type === "PlayerKilled" || event.type === "NightDeathsAnnounced")).toBe(false);
+
+    const candidates = [state.players[0].id, state.players[1].id];
+    for (const action of [...state.pendingActions]) {
+      state = applyCommand(state, {
+        type: "SubmitSheriffCandidacy",
+        seatId: action.seatId,
+        runForSheriff: candidates.includes(action.seatId),
+        publicSpeech: candidates.includes(action.seatId) ? "我上警。" : "我警下投票。",
+        privateReason: "测试首夜死者参与警长流程。"
+      });
+    }
+    while (state.phase.type === "sheriff_speech") {
+      const pending = state.pendingActions[0];
+      if (!pending || pending.kind !== "speech") throw new Error("expected sheriff speech");
+      state = applyCommand(state, { type: "SubmitSpeech", seatId: pending.seatId, text: "警上测试发言。" });
+    }
+    while (state.phase.type === "sheriff_withdrawal") {
+      const pending = state.pendingActions[0];
+      if (!pending || pending.kind !== "sheriff_withdrawal") throw new Error("expected sheriff withdrawal");
+      state = applyCommand(state, {
+        type: "SubmitSheriffWithdrawalDecision",
+        seatId: pending.seatId,
+        withdraw: false,
+        privateReason: "继续竞选。"
+      });
+    }
+
+    expect(state.phase.type).toBe("sheriff_vote");
+    expect(state.pendingActions.some((action) => action.kind === "vote" && action.seatId === nightDeath.id)).toBe(true);
+    for (const action of [...state.pendingActions]) {
+      state = applyCommand(state, {
+        type: "SubmitVote",
+        seatId: action.seatId,
+        targetId: candidates[0],
+        privateReason: "测试警徽票。"
+      });
+    }
+
+    expect(state.players.find((player) => player.id === nightDeath.id)?.alive).toBe(false);
+    expect(state.events.some((event) => event.type === "NightDeathsAnnounced" && (event.payload as { deaths?: string[] }).deaths?.includes(nightDeath.id))).toBe(true);
+  });
+
+  it("publishes simultaneous night deaths in stable seat order rather than cause order", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "stable-night-death-order",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["werewolf", "werewolf", "werewolf", "seer", "witch", "hunter", "villager", "villager"]
+    });
+    const witch = state.players[4];
+    const poisoned = state.players[1];
+    const wolfTarget = state.players[7];
+    state.round.night!.wolfTarget = wolfTarget.id;
+    state.phase = { type: "night_witch", day: 0, label: "夜晚 0 · 女巫行动", actingSeatId: witch.id };
+    state.pendingActions = [
+      {
+        kind: "witch_action",
+        seatId: witch.id,
+        wolfTarget: wolfTarget.id,
+        canSave: true,
+        canPoison: true,
+        legalTargets: state.players.filter((player) => player.id !== witch.id).map((player) => player.id)
+      }
+    ];
+    state = applyCommand(state, {
+      type: "SubmitWitchAction",
+      seatId: witch.id,
+      save: false,
+      poisonTargetId: poisoned.id,
+      privateReason: "测试死亡顺序。"
+    });
+    for (const action of [...state.pendingActions]) {
+      state = applyCommand(state, {
+        type: "SubmitSheriffCandidacy",
+        seatId: action.seatId,
+        runForSheriff: false,
+        publicSpeech: "不上警。",
+        privateReason: "测试死亡顺序。"
+      });
+    }
+
+    const announced = state.events.find((event) => event.type === "NightDeathsAnnounced");
+    const publicKills = state.events.filter((event) => event.type === "PlayerKilled" && event.visibility === "public");
+    expect((announced?.payload as { deaths?: string[] }).deaths).toEqual([poisoned.id, wolfTarget.id]);
+    expect(publicKills.map((event) => (event.payload as { targetId?: string }).targetId)).toEqual([poisoned.id, wolfTarget.id]);
+  });
+
+  it("allows witch self-save only on the first night when enabled", () => {
+    const makeWitchPending = (nightNumber: number, allowSelfSaveFirstNight: boolean) => {
+      const preset: RulePreset = {
+        ...STANDARD_PRESET,
+        id: `witch-self-save-${nightNumber}-${allowSelfSaveFirstNight}`,
+        witchRules: { ...STANDARD_PRESET.witchRules, allowSelfSaveFirstNight }
+      };
+      let state = createGame(
+        {
+          totalPlayers: 6,
+          humanPlayers: 0,
+          aiPlayers: 6,
+          seed: preset.id,
+          rulePresetId: preset.id,
+          debugMode: DEFAULT_DEBUG_MODE,
+          roleOverrides: ["werewolf", "werewolf", "seer", "witch", "villager", "villager"]
+        },
+        preset
+      );
+      const seer = state.players[2];
+      const witch = state.players[3];
+      state.day = nightNumber;
+      state.round.night = { nightNumber, wolfTarget: witch.id, witchSave: false };
+      state.phase = { type: "night_seer", day: nightNumber, label: "预言家查验", actingSeatId: seer.id };
+      state.pendingActions = [{ kind: "seer_check", seatId: seer.id, legalTargets: state.players.filter((player) => player.id !== seer.id).map((player) => player.id) }];
+      state = applyCommand(state, {
+        type: "SubmitNightAction",
+        seatId: seer.id,
+        action: "seer_check",
+        targetId: witch.id,
+        privateReason: "推进到女巫行动。"
+      });
+      const pending = state.pendingActions[0];
+      if (!pending || pending.kind !== "witch_action") throw new Error("expected witch action");
+      return pending;
+    };
+
+    expect(makeWitchPending(0, true).canSave).toBe(true);
+    expect(makeWitchPending(0, false).canSave).toBe(false);
+    expect(makeWitchPending(1, true).canSave).toBe(false);
   });
 
   it("does not give last words to the player killed by a hunter shot", () => {
@@ -573,6 +814,118 @@ describe("werewolf engine", () => {
     expect(next.day).toBe(2);
   });
 
+  it("blocks wolf self-explosion during settlement actions", () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "wolf-self-explosion-phase-whitelist",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const wolf = state.players.find((player) => player.role === "werewolf");
+    const hunter = state.players.find((player) => player.role === "hunter");
+    const target = state.players.find((player) => player.id !== hunter?.id && player.role !== "werewolf");
+    if (!wolf || !hunter || !target) throw new Error("expected wolf, hunter and target");
+    hunter.alive = false;
+    hunter.death = { day: 1, phase: "day_vote", reason: "exile" };
+    state.day = 1;
+    state.phase = { type: "hunter_shot", day: 1, label: "猎人开枪", actingSeatId: hunter.id };
+    state.pendingActions = [{ kind: "hunter_shot", seatId: hunter.id, legalTargets: [target.id], canSkip: true }];
+
+    expect(canWolfSelfExplode(state, wolf.id)).toBe(false);
+    const next = applyCommand(state, { type: "SubmitWolfSelfExplosion", seatId: wolf.id, privateReason: "不得跳过猎人结算。" });
+    expect(next.phase.type).toBe("hunter_shot");
+    expect(next.pendingActions).toEqual(state.pendingActions);
+    expect(next.players.find((player) => player.id === wolf.id)?.alive).toBe(true);
+
+    for (const phase of ["badge_decision", "last_words", "death_announcement"] as const) {
+      state.phase = { type: phase, day: 1, label: phase };
+      expect(canWolfSelfExplode(state, wolf.id)).toBe(false);
+    }
+  });
+
+  it("finishes the sheriff election and announces deferred night deaths after a wolf explodes", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "sheriff-self-explosion-cleanup",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["werewolf", "werewolf", "werewolf", "seer", "witch", "hunter", "villager", "villager"]
+    });
+    const witch = state.players[4];
+    const wolf = state.players[0];
+    const nightDeath = state.players[7];
+    state.round.night!.wolfTarget = nightDeath.id;
+    state.phase = { type: "night_witch", day: 0, label: "女巫行动", actingSeatId: witch.id };
+    state.pendingActions = [
+      {
+        kind: "witch_action",
+        seatId: witch.id,
+        wolfTarget: nightDeath.id,
+        canSave: true,
+        canPoison: false,
+        legalTargets: state.players.filter((player) => player.id !== witch.id).map((player) => player.id)
+      }
+    ];
+    state = applyCommand(state, { type: "SubmitWitchAction", seatId: witch.id, save: false, privateReason: "测试自爆收尾。" });
+    expect(state.phase.type).toBe("sheriff_candidacy");
+
+    state = applyCommand(state, { type: "SubmitWolfSelfExplosion", seatId: wolf.id, privateReason: "竞选阶段自爆。" });
+
+    expect(state.round.sheriff.completed).toBe(true);
+    expect(state.sheriffSeatId).toBeUndefined();
+    expect(state.players.find((player) => player.id === nightDeath.id)?.alive).toBe(false);
+    expect(state.events.some((event) => event.type === "SheriffSkipped" && String((event.payload as { reason?: string }).reason).includes("自爆"))).toBe(true);
+    expect(state.events.some((event) => event.type === "NightDeathsAnnounced" && (event.payload as { deaths?: string[] }).deaths?.includes(nightDeath.id))).toBe(true);
+    expect(state.phase.type).toBe("last_words");
+
+    state = applyCommand(state, { type: "ResolveTimeout", seatId: nightDeath.id });
+    expect(state.phase.type.startsWith("night_")).toBe(true);
+    expect(state.day).toBe(1);
+  });
+
+  it("does not announce or grant last words to a pending night-dead wolf that self-explodes", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "pending-night-dead-wolf-self-explosion",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["werewolf", "werewolf", "werewolf", "seer", "witch", "hunter", "villager", "villager"]
+    });
+    const explodingWolf = state.players[0];
+    const witch = state.players[4];
+    state.round.night!.wolfTarget = explodingWolf.id;
+    state.phase = { type: "night_witch", day: 0, label: "女巫行动", actingSeatId: witch.id };
+    state.pendingActions = [
+      {
+        kind: "witch_action",
+        seatId: witch.id,
+        wolfTarget: explodingWolf.id,
+        canSave: true,
+        canPoison: false,
+        legalTargets: state.players.filter((player) => player.id !== witch.id).map((player) => player.id)
+      }
+    ];
+    state = applyCommand(state, { type: "SubmitWitchAction", seatId: witch.id, save: false, privateReason: "制造待公布夜死。" });
+    expect(state.round.pendingNightDeaths).toContainEqual({ seatId: explodingWolf.id, reason: "wolf" });
+
+    state = applyCommand(state, { type: "SubmitWolfSelfExplosion", seatId: explodingWolf.id, privateReason: "夜死公布前自爆。" });
+
+    expect(state.players.find((player) => player.id === explodingWolf.id)?.death?.reason).toBe("self_explosion");
+    expect(state.events.filter((event) => event.type === "WolfSelfExploded" && event.seatId === explodingWolf.id)).toHaveLength(1);
+    const announcement = state.events.find((event) => event.type === "NightDeathsAnnounced");
+    expect((announcement?.payload as { deaths?: string[] }).deaths).toEqual([]);
+    expect(state.events.some((event) => event.type === "LastWordsPublished" && event.seatId === explodingWolf.id)).toBe(false);
+    expect(state.round.lastWordsQueue).not.toContain(explodingWolf.id);
+    expect(state.phase.type.startsWith("night_")).toBe(true);
+    expect(state.day).toBe(1);
+  });
+
   it("ends the game when the last wolf self-explodes", () => {
     const state = createGame({
       totalPlayers: 6,
@@ -645,6 +998,153 @@ describe("werewolf engine", () => {
     const timedOut = applyCommand(state, { type: "ResolveTimeout", seatId: voterId });
     const timeoutVote = timedOut.events.find((event) => event.type === "VoteCast" && event.seatId === voterId);
     expect(timeoutVote?.payload).toMatchObject({ targetId: aliveIds[1] });
+  });
+
+  it("resolves human night-action timeouts without selecting another AI pending action", () => {
+    let guardState = createGame({
+      totalPlayers: 10,
+      humanPlayers: 1,
+      aiPlayers: 9,
+      seed: "human-guard-timeout",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["guard", "werewolf", "werewolf", "werewolf", "seer", "witch", "hunter", "villager", "villager", "villager"]
+    });
+    expect(guardState.pendingActions[0]).toMatchObject({ kind: "guard_protect", seatId: "player_1" });
+    guardState = applyCommand(guardState, { type: "ResolveTimeout", seatId: "player_1" });
+    expect(guardState.round.night?.protectedTarget).toBeUndefined();
+    expect(guardState.phase.type).toBe("night_wolves");
+
+    let wolfState = createGame({
+      totalPlayers: 6,
+      humanPlayers: 1,
+      aiPlayers: 5,
+      seed: "human-wolf-timeout",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["werewolf", "werewolf", "seer", "witch", "villager", "villager"]
+    });
+    const otherWolf = wolfState.players[1];
+    wolfState.round.night!.wolfDiscussion = {
+      speakerOrder: ["player_1", otherWolf.id],
+      currentIndex: 0,
+      turnCount: 0,
+      maxTurns: 6,
+      proposals: {},
+      agreements: {},
+      messages: []
+    };
+    wolfState.phase = { type: "night_wolves", day: 0, label: "狼人私聊", actingSeatId: "player_1" };
+    wolfState.pendingActions = [{ kind: "wolf_discussion", seatId: "player_1", legalTargets: wolfState.players.map((player) => player.id), round: 1 }];
+    wolfState = applyCommand(wolfState, { type: "ResolveTimeout", seatId: "player_1" });
+    expect(wolfState.round.night?.wolfDiscussion?.messages[0]).toMatchObject({ seatId: "player_1" });
+    expect(wolfState.pendingActions[0]?.seatId).toBe(otherWolf.id);
+
+    let seerState = createGame({
+      totalPlayers: 6,
+      humanPlayers: 1,
+      aiPlayers: 5,
+      seed: "human-seer-timeout",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["seer", "werewolf", "werewolf", "witch", "villager", "villager"]
+    });
+    const seerTargets = seerState.players.slice(1).map((player) => player.id);
+    seerState.phase = { type: "night_seer", day: 0, label: "预言家查验", actingSeatId: "player_1" };
+    seerState.pendingActions = [{ kind: "seer_check", seatId: "player_1", legalTargets: seerTargets }];
+    seerState = applyCommand(seerState, { type: "ResolveTimeout", seatId: "player_1" });
+    expect(seerState.round.night?.seerCheck?.seerId).toBe("player_1");
+    expect(seerState.phase.type).toBe("night_witch");
+
+    let witchState = createGame({
+      totalPlayers: 6,
+      humanPlayers: 1,
+      aiPlayers: 5,
+      seed: "human-witch-timeout",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["witch", "werewolf", "werewolf", "seer", "villager", "villager"]
+    });
+    const wolfTarget = witchState.players[4].id;
+    witchState.round.night!.wolfTarget = wolfTarget;
+    witchState.phase = { type: "night_witch", day: 0, label: "女巫行动", actingSeatId: "player_1" };
+    witchState.pendingActions = [
+      {
+        kind: "witch_action",
+        seatId: "player_1",
+        wolfTarget,
+        canSave: true,
+        canPoison: true,
+        legalTargets: witchState.players.slice(1).map((player) => player.id)
+      }
+    ];
+    witchState = applyCommand(witchState, { type: "ResolveTimeout", seatId: "player_1" });
+    expect(witchState.round.night?.witchSave).toBe(false);
+    expect(witchState.resources.player_1).toMatchObject({ antidote: true, poison: true });
+    expect(witchState.phase.type).toBe("sheriff_candidacy");
+  });
+
+  it("resolves human sheriff, hunter, and badge timeouts with safe defaults", () => {
+    let candidacyState = createGame({
+      totalPlayers: 6,
+      humanPlayers: 1,
+      aiPlayers: 5,
+      seed: "human-candidacy-timeout",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    candidacyState.phase = { type: "sheriff_candidacy", day: 0, label: "警长竞选" };
+    candidacyState.pendingActions = [{ kind: "sheriff_candidacy", seatId: "player_1" }];
+    candidacyState = applyCommand(candidacyState, { type: "ResolveTimeout", seatId: "player_1" });
+    expect(candidacyState.round.sheriff.candidacy.player_1?.run).toBe(false);
+
+    let hunterState = createGame({
+      totalPlayers: 8,
+      humanPlayers: 1,
+      aiPlayers: 7,
+      seed: "human-hunter-timeout",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE,
+      roleOverrides: ["hunter", "werewolf", "werewolf", "werewolf", "seer", "witch", "villager", "villager"]
+    });
+    const hunter = hunterState.players[0];
+    hunter.alive = false;
+    hunter.death = { day: 1, phase: "day_vote", reason: "exile" };
+    hunterState.day = 1;
+    hunterState.round.lastDeaths = [hunter.id];
+    hunterState.round.hunterReturn = "after_day";
+    hunterState.phase = { type: "hunter_shot", day: 1, label: "猎人开枪", actingSeatId: hunter.id };
+    hunterState.pendingActions = [{ kind: "hunter_shot", seatId: hunter.id, legalTargets: hunterState.players.filter((player) => player.alive).map((player) => player.id), canSkip: true }];
+    hunterState = applyCommand(hunterState, { type: "ResolveTimeout", seatId: hunter.id });
+    expect(hunterState.resources[hunter.id].hunterCanShoot).toBe(false);
+    expect(hunterState.events.some((event) => event.type === "HunterShotSkipped" && event.seatId === hunter.id)).toBe(true);
+
+    let badgeState = createGame({
+      totalPlayers: 6,
+      humanPlayers: 1,
+      aiPlayers: 5,
+      seed: "human-badge-timeout",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const deadSheriff = badgeState.players[0];
+    deadSheriff.alive = false;
+    deadSheriff.death = { day: 1, phase: "day_vote", reason: "exile" };
+    badgeState.day = 1;
+    badgeState.phase = { type: "badge_decision", day: 1, label: "警徽移交", actingSeatId: deadSheriff.id };
+    badgeState.pendingActions = [
+      {
+        kind: "badge_decision",
+        seatId: deadSheriff.id,
+        legalTargets: badgeState.players.filter((player) => player.alive).map((player) => player.id),
+        canDestroy: true,
+        returnTo: "after_day_exile",
+        deathIds: [deadSheriff.id]
+      }
+    ];
+    badgeState = applyCommand(badgeState, { type: "ResolveTimeout", seatId: deadSheriff.id });
+    expect(badgeState.badgeDestroyed).toBe(true);
+    expect(badgeState.events.some((event) => event.type === "BadgeDestroyed")).toBe(true);
   });
 
   it("does not allow day voters to vote for themselves", () => {
@@ -783,6 +1283,248 @@ describe("werewolf engine", () => {
     expect(restored.pendingActions).not.toBe(state.pendingActions);
     const advanced = applyMockStep(restored);
     expect(advanced.events.length).toBeGreaterThan(state.events.length);
+  });
+
+  it("accepts valid snapshots throughout a complete game", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "snapshot-every-phase",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+
+    for (let step = 0; step < 400; step += 1) {
+      expect(() => restoreSnapshotFixture(createSnapshotFixture(state))).not.toThrow();
+      if (state.status === "ended") break;
+      state = applyMockStep(state);
+    }
+    expect(state.status).toBe("ended");
+  });
+
+  it("rejects snapshots with ghost actors, targets, resources, or round references", () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "snapshot-deep-validation",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const fixture = createSnapshotFixture(state);
+    const corrupt = (mutate: (value: ReturnType<typeof createSnapshotFixture>) => void) => {
+      const value = JSON.parse(JSON.stringify(fixture)) as ReturnType<typeof createSnapshotFixture>;
+      mutate(value);
+      return value;
+    };
+
+    expect(() =>
+      restoreSnapshotFixture(
+        corrupt((value) => {
+          value.state.pendingActions[0].seatId = "player_ghost";
+        })
+      )
+    ).toThrow("待处理行动玩家不存在");
+
+    expect(() =>
+      restoreSnapshotFixture(
+        corrupt((value) => {
+          const pending = value.state.pendingActions[0];
+          if (!("legalTargets" in pending)) throw new Error("expected legal targets");
+          pending.legalTargets.push("player_ghost");
+        })
+      )
+    ).toThrow("合法目标");
+
+    expect(() =>
+      restoreSnapshotFixture(
+        corrupt((value) => {
+          delete (value.state.pendingActions[0] as unknown as Record<string, unknown>).legalTargets;
+        })
+      )
+    ).toThrow("缺少合法目标列表");
+
+    expect(() =>
+      restoreSnapshotFixture(
+        corrupt((value) => {
+          value.state.pendingActions = [];
+        })
+      )
+    ).toThrow("必须包含匹配的待处理行动");
+
+    expect(() =>
+      restoreSnapshotFixture(
+        corrupt((value) => {
+          value.state.phase.actingSeatId = "player_ghost";
+        })
+      )
+    ).toThrow("阶段行动玩家不存在");
+
+    expect(() =>
+      restoreSnapshotFixture(
+        corrupt((value) => {
+          value.state.resources.player_ghost = { antidote: false, poison: false, hunterCanShoot: false };
+        })
+      )
+    ).toThrow("资源引用了不存在的玩家");
+
+    expect(() =>
+      restoreSnapshotFixture(
+        corrupt((value) => {
+          value.state.round.sheriff.speechQueue.push("player_ghost");
+        })
+      )
+    ).toThrow("警上发言队列");
+
+    expect(() =>
+      restoreSnapshotFixture(
+        corrupt((value) => {
+          if (!value.state.round.night) throw new Error("expected night state");
+          value.state.round.night.wolfTarget = "player_ghost";
+        })
+      )
+    ).toThrow("狼人刀口不存在");
+  });
+
+  it("rejects pending actions whose kind-specific required fields are missing", () => {
+    const base = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "snapshot-pending-required-fields",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const actorId = base.players[0].id;
+    const targetIds = base.players.slice(1).map((player) => player.id);
+    const cases: Array<{
+      phase: typeof base.phase.type;
+      role: RoleId;
+      dead?: boolean;
+      pending: Record<string, unknown>;
+    }> = [
+      { phase: "night_guard", role: "guard", pending: { kind: "guard_protect", seatId: actorId } },
+      { phase: "night_wolves", role: "werewolf", pending: { kind: "wolf_discussion", seatId: actorId, legalTargets: targetIds } },
+      { phase: "night_seer", role: "seer", pending: { kind: "seer_check", seatId: actorId } },
+      {
+        phase: "night_witch",
+        role: "witch",
+        pending: { kind: "witch_action", seatId: actorId, legalTargets: targetIds, canPoison: true }
+      },
+      { phase: "sheriff_withdrawal", role: "villager", pending: { kind: "sheriff_withdrawal", seatId: actorId } },
+      { phase: "day_speech", role: "villager", pending: { kind: "speech", seatId: actorId } },
+      { phase: "day_vote", role: "villager", pending: { kind: "vote", seatId: actorId, legalTargets: targetIds } },
+      {
+        phase: "badge_decision",
+        role: "villager",
+        dead: true,
+        pending: {
+          kind: "badge_decision",
+          seatId: actorId,
+          legalTargets: targetIds,
+          returnTo: "after_day_exile",
+          deathIds: [actorId]
+        }
+      },
+      {
+        phase: "hunter_shot",
+        role: "hunter",
+        dead: true,
+        pending: { kind: "hunter_shot", seatId: actorId, legalTargets: targetIds }
+      }
+    ];
+
+    for (const testCase of cases) {
+      const fixture = JSON.parse(JSON.stringify(createSnapshotFixture(base))) as ReturnType<typeof createSnapshotFixture>;
+      const actor = fixture.state.players[0];
+      actor.role = testCase.role;
+      actor.alive = !testCase.dead;
+      actor.death = testCase.dead ? { day: 1, phase: "day_vote", reason: "exile" } : undefined;
+      fixture.state.phase = { type: testCase.phase, day: 1, label: testCase.phase, actingSeatId: actorId };
+      fixture.state.pendingActions = [testCase.pending as never];
+
+      expect(() => restoreSnapshotFixture(fixture), `${testCase.phase} should reject missing required fields`).toThrow();
+    }
+  });
+
+  it("rejects stuck synchronous phases and inconsistent ended status snapshots", () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "snapshot-status-phase-consistency",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const makeFixture = () => JSON.parse(JSON.stringify(createSnapshotFixture(state))) as ReturnType<typeof createSnapshotFixture>;
+
+    for (const phase of ["lobby", "night_resolve", "death_announcement"] as const) {
+      const fixture = makeFixture();
+      fixture.state.phase = { type: phase, day: 0, label: phase };
+      fixture.state.pendingActions = [];
+      expect(() => restoreSnapshotFixture(fixture)).toThrow("同步瞬时阶段");
+    }
+
+    const runningEnded = makeFixture();
+    runningEnded.state.phase = { type: "ended", day: 0, label: "结束" };
+    runningEnded.state.pendingActions = [];
+    expect(() => restoreSnapshotFixture(runningEnded)).toThrow("运行中快照不能处于 ended 阶段");
+
+    const endedInActionPhase = makeFixture();
+    endedInActionPhase.state.status = "ended";
+    endedInActionPhase.state.winner = "good";
+    endedInActionPhase.state.endReason = "测试结束";
+    endedInActionPhase.state.pendingActions = [];
+    expect(() => restoreSnapshotFixture(endedInActionPhase)).toThrow("阶段必须为 ended");
+
+    const endedWithoutWinner = makeFixture();
+    endedWithoutWinner.state.status = "ended";
+    endedWithoutWinner.state.phase = { type: "ended", day: 0, label: "结束" };
+    endedWithoutWinner.state.pendingActions = [];
+    endedWithoutWinner.state.winner = undefined;
+    endedWithoutWinner.state.endReason = undefined;
+    expect(() => restoreSnapshotFixture(endedWithoutWinner)).toThrow("缺少合法胜方");
+  });
+
+  it("rejects snapshots with incomplete or illegal nested rule presets", () => {
+    const state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "snapshot-rule-preset-validation",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const corruptPreset = (mutate: (preset: Record<string, unknown>) => void) => {
+      const fixture = JSON.parse(JSON.stringify(createSnapshotFixture(state))) as ReturnType<typeof createSnapshotFixture>;
+      mutate(fixture.state.rulePreset as unknown as Record<string, unknown>);
+      return fixture;
+    };
+
+    expect(() => restoreSnapshotFixture(corruptPreset((preset) => delete preset.nightOrder))).toThrow("nightOrder");
+    expect(() => restoreSnapshotFixture(corruptPreset((preset) => (preset.nightOrder = [])))).toThrow("nightOrder");
+    expect(() => restoreSnapshotFixture(corruptPreset((preset) => (preset.nightOrder = ["invalid_step"])))).toThrow("nightOrder");
+    expect(() => restoreSnapshotFixture(corruptPreset((preset) => delete preset.voteRules))).toThrow("voteRules");
+    expect(() => restoreSnapshotFixture(corruptPreset((preset) => delete preset.witchRules))).toThrow("witchRules");
+    expect(() => restoreSnapshotFixture(corruptPreset((preset) => (preset.winCondition = "invalid")))).toThrow("基础字段");
+    expect(() => restoreSnapshotFixture(corruptPreset((preset) => delete preset.roleTable))).toThrow("身份表");
+  });
+
+  it("rejects restored snapshots that bypass the single-human setup limit", () => {
+    const state = createGame({
+      totalPlayers: 6,
+      humanPlayers: 1,
+      aiPlayers: 5,
+      seed: "snapshot-human-limit",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const fixture = createSnapshotFixture(state);
+    fixture.state.setup.humanPlayers = 2;
+    fixture.state.setup.aiPlayers = 4;
+
+    expect(() => restoreSnapshotFixture(fixture)).toThrow("当前版本仅支持 0 或 1 名真人玩家");
   });
 
   it("does not leak private reasons through public event payloads", () => {
@@ -1163,6 +1905,137 @@ describe("werewolf engine", () => {
     expect(state.players.find((player) => player.id === withdrawnId)?.hasWithdrawnSheriff).toBe(true);
     expect(state.pendingActions.some((action) => action.seatId === withdrawnId)).toBe(false);
     expect(state.pendingActions.every((action) => action.kind === "vote" && !action.legalTargets.includes(withdrawnId))).toBe(true);
+  });
+
+  it("keeps every original sheriff candidate out of the PK vote", () => {
+    let state = createGame({
+      totalPlayers: 8,
+      humanPlayers: 0,
+      aiPlayers: 8,
+      seed: "sheriff-pk-voter-eligibility",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const ids = state.players.map((player) => player.id);
+    const candidates = ids.slice(0, 3);
+    const voters = ids.slice(3);
+    state.day = 0;
+    state.round.sheriff.candidates = [...candidates];
+    state.round.sheriff.candidacy = Object.fromEntries(
+      ids.map((id) => [id, { run: candidates.includes(id), publicSpeech: "测试", privateReason: "测试" }])
+    );
+    for (const player of state.players) player.isSheriffCandidate = candidates.includes(player.id);
+    state.phase = { type: "sheriff_vote", day: 0, label: "警长竞选 · 警下投票" };
+    state.pendingActions = voters.map((seatId) => ({ kind: "vote", seatId, voteType: "sheriff", legalTargets: candidates }));
+
+    const targets = [candidates[0], candidates[0], candidates[1], candidates[1], "abstain"] as const;
+    voters.forEach((voterId, index) => {
+      state = applyCommand(state, {
+        type: "SubmitVote",
+        seatId: voterId,
+        targetId: targets[index],
+        privateReason: "制造两人 PK。"
+      });
+    });
+    expect(state.phase.type).toBe("sheriff_pk_speech");
+    while (state.phase.type === "sheriff_pk_speech") {
+      const pending = state.pendingActions[0];
+      if (!pending || pending.kind !== "speech") throw new Error("expected PK speech");
+      state = applyCommand(state, { type: "SubmitSpeech", seatId: pending.seatId, text: "PK 发言。" });
+    }
+    while (state.phase.type === "sheriff_withdrawal") {
+      const pending = state.pendingActions[0];
+      if (!pending || pending.kind !== "sheriff_withdrawal") throw new Error("expected PK withdrawal");
+      state = applyCommand(state, {
+        type: "SubmitSheriffWithdrawalDecision",
+        seatId: pending.seatId,
+        withdraw: false,
+        privateReason: "继续 PK。"
+      });
+    }
+
+    expect(state.phase.type).toBe("sheriff_pk_vote");
+    expect(state.pendingActions.map((action) => action.seatId).sort()).toEqual(voters.sort());
+    expect(state.pendingActions.some((action) => action.seatId === candidates[2])).toBe(false);
+  });
+
+  it("does not create a sheriff from zero votes or from a no-voter election", () => {
+    let state = createGame({
+      totalPlayers: 6,
+      humanPlayers: 0,
+      aiPlayers: 6,
+      seed: "sheriff-zero-votes",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const ids = state.players.map((player) => player.id);
+    const candidates = ids.slice(0, 2);
+    const voters = ids.slice(2);
+    state.round.sheriff.candidates = candidates;
+    state.round.sheriff.candidacy = Object.fromEntries(
+      ids.map((id) => [id, { run: candidates.includes(id), publicSpeech: "测试", privateReason: "测试" }])
+    );
+    for (const player of state.players) player.isSheriffCandidate = candidates.includes(player.id);
+    state.phase = { type: "sheriff_vote", day: 0, label: "警长竞选 · 警下投票" };
+    state.pendingActions = voters.map((seatId) => ({ kind: "vote", seatId, voteType: "sheriff", legalTargets: candidates }));
+    for (const voterId of voters) {
+      state = applyCommand(state, { type: "SubmitVote", seatId: voterId, targetId: "abstain", privateReason: "全员弃票。" });
+    }
+    expect(state.sheriffSeatId).toBeUndefined();
+    expect(state.round.sheriff.completed).toBe(true);
+    expect(state.events.some((event) => event.type === "SheriffElected")).toBe(false);
+    expect(state.events.some((event) => event.type === "SheriffSkipped" && String((event.payload as { reason?: string }).reason).includes("有效票"))).toBe(true);
+    expect(state.events.some((event) => event.type === "SheriffVoteResolved" && (event.payload as { top?: string[] }).top?.length === 0)).toBe(true);
+
+    state = createGame({
+      totalPlayers: 6,
+      humanPlayers: 0,
+      aiPlayers: 6,
+      seed: "sheriff-no-voters",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const allIds = state.players.map((player) => player.id);
+    state.round.sheriff.candidates = [...allIds];
+    state.round.sheriff.candidacy = Object.fromEntries(allIds.map((id) => [id, { run: true, publicSpeech: "测试", privateReason: "测试" }]));
+    for (const player of state.players) player.isSheriffCandidate = true;
+    state.phase = { type: "sheriff_withdrawal", day: 0, label: "警长竞选 · 退水确认" };
+    state.pendingActions = allIds.map((seatId) => ({ kind: "sheriff_withdrawal", seatId, voteType: "sheriff" }));
+    for (const seatId of allIds) {
+      state = applyCommand(state, {
+        type: "SubmitSheriffWithdrawalDecision",
+        seatId,
+        withdraw: false,
+        privateReason: "全部留警。"
+      });
+    }
+    expect(state.sheriffSeatId).toBeUndefined();
+    expect(state.events.some((event) => event.type === "SheriffElected")).toBe(false);
+    expect(state.events.some((event) => event.type === "SheriffSkipped" && String((event.payload as { reason?: string }).reason).includes("没有符合资格"))).toBe(true);
+  });
+
+  it("treats an all-abstain day vote as no exile instead of an all-player PK", () => {
+    let state = createGame({
+      totalPlayers: 6,
+      humanPlayers: 0,
+      aiPlayers: 6,
+      seed: "day-all-abstain",
+      rulePresetId: STANDARD_PRESET.id,
+      debugMode: DEFAULT_DEBUG_MODE
+    });
+    const aliveIds = state.players.map((player) => player.id);
+    state.day = 1;
+    state.phase = { type: "day_vote", day: 1, label: "白天投票" };
+    state.round.day = { speechQueue: [], votes: {}, pkCandidates: [], pkSpeechQueue: [], pkVotes: {} };
+    state.pendingActions = aliveIds.map((seatId) => ({ kind: "vote", seatId, voteType: "day", legalTargets: aliveIds.filter((id) => id !== seatId) }));
+    for (const voterId of aliveIds) {
+      state = applyCommand(state, { type: "SubmitVote", seatId: voterId, targetId: "abstain", privateReason: "全员弃票。" });
+    }
+
+    expect(state.events.some((event) => event.type === "NoExile" && String((event.payload as { reason?: string }).reason).includes("有效票"))).toBe(true);
+    expect(state.events.some((event) => event.type === "PlayerExiled")).toBe(false);
+    expect(state.phase.type.startsWith("night_")).toBe(true);
+    expect(state.day).toBe(2);
   });
 
   it("lets a dead sheriff pass the badge before the game continues", () => {

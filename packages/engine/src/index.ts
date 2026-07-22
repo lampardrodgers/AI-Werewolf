@@ -83,6 +83,11 @@ type DeathReason = NonNullable<PlayerState["death"]>["reason"];
 type BadgeReturnTo = "after_death_announcement" | "after_day_exile" | "after_hunter_last_words" | "after_hunter_day" | "debug";
 type ConfiguredNightStep = RulePreset["nightOrder"][number];
 
+interface PendingNightDeath {
+  seatId: PlayerId;
+  reason: Extract<DeathReason, "wolf" | "poison">;
+}
+
 export interface NightState {
   nightNumber: number;
   protectedTarget?: PlayerId;
@@ -188,6 +193,7 @@ export interface GameState {
     lastWordsQueue: PlayerId[];
     lastWordsReturn?: "day_speech" | "night";
     lastDeaths: PlayerId[];
+    pendingNightDeaths?: PendingNightDeath[];
     lastGuardTarget?: PlayerId;
     hunterReturn?: "last_words" | "after_day";
     pendingBadgeSeatId?: PlayerId;
@@ -262,6 +268,8 @@ export interface GameSnapshotFixture {
 
 const AI_NAMES = ["青岚", "观棋", "白石", "夜航", "南枝", "北辰", "听雨", "折光", "云起", "归鸿", "星河", "墨衡"];
 
+let gameIdSequence = 0;
+
 export function createGame(setup: GameSetup, preset: RulePreset = STANDARD_PRESET): GameState {
   validateSetup(setup, preset);
   const rng = createRng(setup.seed);
@@ -299,7 +307,7 @@ export function createGame(setup: GameSetup, preset: RulePreset = STANDARD_PRESE
   ) as Record<PlayerId, PlayerResources>;
 
   const state: GameState = {
-    id: `game_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}`,
+    id: createGameId(),
     setup,
     rulePreset: preset,
     players,
@@ -726,7 +734,424 @@ export function restoreSnapshotFixture(value: unknown): GameState {
   if (state.status !== "running" && state.status !== "ended") {
     throw new Error("快照游戏状态非法。");
   }
+  validateRestoredState(state);
   return state;
+}
+
+const PHASE_TYPES = new Set<PhaseType>([
+  "lobby",
+  "night_guard",
+  "night_wolves",
+  "night_seer",
+  "night_witch",
+  "night_resolve",
+  "sheriff_candidacy",
+  "sheriff_speech",
+  "sheriff_withdrawal",
+  "sheriff_vote",
+  "sheriff_pk_speech",
+  "sheriff_pk_vote",
+  "death_announcement",
+  "last_words",
+  "day_speech",
+  "day_vote",
+  "day_pk_speech",
+  "day_pk_vote",
+  "badge_decision",
+  "hunter_shot",
+  "ended"
+]);
+
+const PENDING_PHASES: Record<PendingAction["kind"], PhaseType[]> = {
+  guard_protect: ["night_guard"],
+  wolf_discussion: ["night_wolves"],
+  seer_check: ["night_seer"],
+  witch_action: ["night_witch"],
+  sheriff_candidacy: ["sheriff_candidacy"],
+  sheriff_withdrawal: ["sheriff_withdrawal"],
+  speech: ["sheriff_speech", "sheriff_pk_speech", "last_words", "day_speech", "day_pk_speech"],
+  vote: ["sheriff_vote", "sheriff_pk_vote", "day_vote", "day_pk_vote"],
+  badge_decision: ["badge_decision"],
+  hunter_shot: ["hunter_shot"]
+};
+
+const ACTION_PHASES = new Set<PhaseType>(Object.values(PENDING_PHASES).flat());
+const SYNCHRONOUS_PHASES = new Set<PhaseType>(["lobby", "night_resolve", "death_announcement"]);
+const PENDING_KINDS_WITH_LEGAL_TARGETS = new Set<PendingAction["kind"]>([
+  "guard_protect",
+  "wolf_discussion",
+  "seer_check",
+  "witch_action",
+  "vote",
+  "badge_decision",
+  "hunter_shot"
+]);
+const BADGE_RETURN_TARGETS = new Set<BadgeReturnTo>([
+  "after_death_announcement",
+  "after_day_exile",
+  "after_hunter_last_words",
+  "after_hunter_day",
+  "debug"
+]);
+
+function validateRestoredState(state: GameState): void {
+  if (!isRecord(state.setup) || !isRecord(state.rulePreset) || !isRecord(state.phase) || !isRecord(state.round)) {
+    throw new Error("快照缺少必要的结构化状态字段。");
+  }
+  validateRestoredSetup(state.setup);
+  validateRestoredRulePreset(state.rulePreset, state.setup.totalPlayers);
+  validateSetup(state.setup, state.rulePreset);
+  if (!PHASE_TYPES.has(state.phase.type)) {
+    throw new Error(`快照阶段非法：${String(state.phase.type)}`);
+  }
+  if (state.status === "ended") {
+    if (state.phase.type !== "ended") throw new Error("已结束快照的阶段必须为 ended。");
+    if (state.winner !== "good" && state.winner !== "wolves") throw new Error("已结束快照缺少合法胜方。");
+    if (typeof state.endReason !== "string" || state.endReason.trim().length === 0) throw new Error("已结束快照缺少结束原因。");
+  } else {
+    if (state.phase.type === "ended") throw new Error("运行中快照不能处于 ended 阶段。");
+    if (SYNCHRONOUS_PHASES.has(state.phase.type)) throw new Error(`运行中快照不能停留在同步瞬时阶段 ${state.phase.type}。`);
+    if (state.winner !== undefined || state.endReason !== undefined) throw new Error("运行中快照不能预先包含胜方或结束原因。");
+  }
+
+  const playerIds = new Set<PlayerId>();
+  const seatNumbers = new Set<number>();
+  for (const player of state.players) {
+    if (!isRecord(player) || typeof player.id !== "string" || player.id.length === 0) {
+      throw new Error("快照包含无效玩家。");
+    }
+    if (playerIds.has(player.id)) throw new Error(`快照包含重复玩家：${player.id}`);
+    if (!Number.isInteger(player.seatNumber) || player.seatNumber < 1 || player.seatNumber > state.players.length) {
+      throw new Error(`快照玩家座位号非法：${player.id}`);
+    }
+    if (seatNumbers.has(player.seatNumber)) throw new Error(`快照包含重复座位号：${player.seatNumber}`);
+    if (!(player.role in ROLE_DEFINITIONS)) throw new Error(`快照玩家身份非法：${player.id}`);
+    if (typeof player.alive !== "boolean") throw new Error(`快照玩家存活状态非法：${player.id}`);
+    playerIds.add(player.id);
+    seatNumbers.add(player.seatNumber);
+  }
+
+  if (state.phase.actingSeatId && !playerIds.has(state.phase.actingSeatId)) {
+    throw new Error(`快照阶段行动玩家不存在：${state.phase.actingSeatId}`);
+  }
+  if (!isRecord(state.resources) || !isRecord(state.memories)) {
+    throw new Error("快照缺少玩家资源或记忆状态。");
+  }
+  if (Object.keys(state.resources).some((playerId) => !playerIds.has(playerId))) {
+    throw new Error("快照玩家资源引用了不存在的玩家。");
+  }
+  if (Object.keys(state.memories).some((playerId) => !playerIds.has(playerId))) {
+    throw new Error("快照玩家记忆引用了不存在的玩家。");
+  }
+  for (const playerId of playerIds) {
+    const resource = state.resources[playerId];
+    if (
+      !isRecord(resource) ||
+      typeof resource.antidote !== "boolean" ||
+      typeof resource.poison !== "boolean" ||
+      typeof resource.hunterCanShoot !== "boolean"
+    ) {
+      throw new Error(`快照玩家资源非法：${playerId}`);
+    }
+    if (!isRecord(state.memories[playerId])) throw new Error(`快照玩家记忆缺失：${playerId}`);
+  }
+
+  const pendingSeatIds = new Set<PlayerId>();
+  for (const pending of state.pendingActions) {
+    validateRestoredPending(state, pending, playerIds);
+    if (pendingSeatIds.has(pending.seatId)) throw new Error(`快照包含重复待处理玩家：${pending.seatId}`);
+    pendingSeatIds.add(pending.seatId);
+  }
+  if (state.phase.actingSeatId && state.pendingActions.length > 0 && !pendingSeatIds.has(state.phase.actingSeatId)) {
+    throw new Error(`快照阶段行动玩家与待处理行动不一致：${state.phase.actingSeatId}`);
+  }
+  if (state.status === "ended" && state.pendingActions.length > 0) {
+    throw new Error("已结束的快照不能包含待处理行动。");
+  }
+  if (state.status === "running" && ACTION_PHASES.has(state.phase.type) && state.pendingActions.length === 0) {
+    throw new Error(`运行中的行动阶段 ${state.phase.type} 必须包含匹配的待处理行动。`);
+  }
+  if (state.pendingActions.length > 0 && !PENDING_PHASES[state.pendingActions[0].kind].includes(state.phase.type)) {
+    throw new Error("快照阶段与待处理行动不一致。");
+  }
+
+  validatePlayerIdList(state.round.lastDeaths, playerIds, "昨夜死亡列表");
+  validatePlayerIdList(state.round.lastWordsQueue, playerIds, "遗言队列");
+  if (state.round.lastGuardTarget && !playerIds.has(state.round.lastGuardTarget)) {
+    throw new Error(`快照上一轮守护目标不存在：${state.round.lastGuardTarget}`);
+  }
+  validateRestoredSheriffState(state.round.sheriff, playerIds);
+  if (state.round.day !== undefined) validateRestoredDayState(state.round.day, playerIds);
+  if (state.round.night !== undefined) validateRestoredNightState(state.round.night, playerIds);
+  if (state.round.pendingNightDeaths !== undefined) {
+    if (!Array.isArray(state.round.pendingNightDeaths)) throw new Error("快照待公布夜间死亡列表非法。");
+    const pendingDeathIds = new Set<PlayerId>();
+    for (const death of state.round.pendingNightDeaths) {
+      if (!isRecord(death) || typeof death.seatId !== "string" || !playerIds.has(death.seatId)) {
+        throw new Error("快照待公布夜间死亡玩家不存在。");
+      }
+      if (death.reason !== "wolf" && death.reason !== "poison") {
+        throw new Error(`快照待公布夜间死亡原因非法：${death.seatId}`);
+      }
+      if (!requirePlayer(state, death.seatId).alive) {
+        throw new Error(`快照待公布夜间死亡玩家已被提前标记死亡：${death.seatId}`);
+      }
+      if (pendingDeathIds.has(death.seatId)) throw new Error(`快照待公布夜间死亡玩家重复：${death.seatId}`);
+      pendingDeathIds.add(death.seatId);
+    }
+  }
+  if (state.round.pendingBadgeSeatId && !playerIds.has(state.round.pendingBadgeSeatId)) {
+    throw new Error(`快照警徽待处理玩家不存在：${state.round.pendingBadgeSeatId}`);
+  }
+  if (state.sheriffSeatId && !playerIds.has(state.sheriffSeatId)) {
+    throw new Error(`快照警长玩家不存在：${state.sheriffSeatId}`);
+  }
+}
+
+function validateRestoredSetup(setup: GameSetup): void {
+  if (
+    !Number.isInteger(setup.totalPlayers) ||
+    !Number.isInteger(setup.humanPlayers) ||
+    !Number.isInteger(setup.aiPlayers) ||
+    typeof setup.seed !== "string" ||
+    typeof setup.rulePresetId !== "string"
+  ) {
+    throw new Error("快照游戏配置字段非法。");
+  }
+}
+
+function validateRestoredRulePreset(preset: RulePreset, totalPlayers: number): void {
+  if (
+    typeof preset.id !== "string" ||
+    typeof preset.name !== "string" ||
+    !Number.isInteger(preset.minPlayers) ||
+    !Number.isInteger(preset.maxPlayers) ||
+    typeof preset.sheriffEnabled !== "boolean" ||
+    (preset.winCondition !== "slay_side" && preset.winCondition !== "slay_all_good")
+  ) {
+    throw new Error("快照规则包基础字段非法。");
+  }
+  const legalNightSteps = new Set<ConfiguredNightStep>(["guard_protect", "wolf_discussion", "seer_check", "witch_action", "resolve_deaths"]);
+  if (
+    !Array.isArray(preset.nightOrder) ||
+    preset.nightOrder.length === 0 ||
+    preset.nightOrder.some((step) => !legalNightSteps.has(step)) ||
+    new Set(preset.nightOrder).size !== preset.nightOrder.length ||
+    !preset.nightOrder.includes("resolve_deaths")
+  ) {
+    throw new Error("快照规则包 nightOrder 必须是非空、无重复且包含死亡结算的合法步骤列表。");
+  }
+  if (
+    !isRecord(preset.voteRules) ||
+    typeof preset.voteRules.allowAbstain !== "boolean" ||
+    typeof preset.voteRules.sheriffVoteWeight !== "number" ||
+    !Number.isFinite(preset.voteRules.sheriffVoteWeight) ||
+    preset.voteRules.sheriffVoteWeight <= 0 ||
+    (preset.voteRules.secondTiePolicy !== "no_exile" && preset.voteRules.secondTiePolicy !== "random")
+  ) {
+    throw new Error("快照规则包 voteRules 字段非法。");
+  }
+  if (
+    !isRecord(preset.witchRules) ||
+    typeof preset.witchRules.allowSelfSaveFirstNight !== "boolean" ||
+    typeof preset.witchRules.allowSaveAndPoisonSameNight !== "boolean" ||
+    typeof preset.witchRules.guardSaveSameTargetDies !== "boolean" ||
+    typeof preset.witchRules.poisonedHunterCanShoot !== "boolean"
+  ) {
+    throw new Error("快照规则包 witchRules 字段非法。");
+  }
+  if (!isRecord(preset.roleTable) || !Array.isArray(preset.roleTable[totalPlayers])) {
+    throw new Error("快照规则包缺少当前人数的身份表。");
+  }
+  if (preset.roleTable[totalPlayers].some((role) => !(role in ROLE_DEFINITIONS))) {
+    throw new Error("快照规则包身份表包含未知身份。");
+  }
+}
+
+function validateRestoredSheriffState(sheriff: SheriffState, playerIds: Set<PlayerId>): void {
+  if (!isRecord(sheriff) || !isRecord(sheriff.candidacy)) throw new Error("快照警长竞选状态非法。");
+  validatePlayerIdList(sheriff.candidates, playerIds, "警长候选人列表");
+  validatePlayerIdList(sheriff.speechQueue, playerIds, "警上发言队列");
+  validatePlayerIdList(sheriff.pkCandidates, playerIds, "警长 PK 候选人列表");
+  for (const [playerId, candidacy] of Object.entries(sheriff.candidacy)) {
+    if (!playerIds.has(playerId) || !isRecord(candidacy) || typeof candidacy.run !== "boolean") {
+      throw new Error(`快照警长报名状态引用非法玩家：${playerId}`);
+    }
+  }
+  validateVoteRecord(sheriff.votes, playerIds, "警长投票");
+  validateVoteRecord(sheriff.pkVotes, playerIds, "警长 PK 投票");
+}
+
+function validateRestoredDayState(day: DayState, playerIds: Set<PlayerId>): void {
+  if (!isRecord(day)) throw new Error("快照白天状态非法。");
+  validatePlayerIdList(day.speechQueue, playerIds, "白天发言队列");
+  validatePlayerIdList(day.pkCandidates, playerIds, "白天 PK 候选人列表");
+  validatePlayerIdList(day.pkSpeechQueue, playerIds, "白天 PK 发言队列");
+  validateVoteRecord(day.votes, playerIds, "白天投票");
+  validateVoteRecord(day.pkVotes, playerIds, "白天 PK 投票");
+}
+
+function validateRestoredNightState(night: NightState, playerIds: Set<PlayerId>): void {
+  if (!isRecord(night) || !Number.isInteger(night.nightNumber)) throw new Error("快照夜晚状态非法。");
+  for (const [label, playerId] of [
+    ["守护目标", night.protectedTarget],
+    ["狼人刀口", night.wolfTarget],
+    ["女巫毒药目标", night.witchPoisonTarget]
+  ] as const) {
+    if (playerId && !playerIds.has(playerId)) throw new Error(`快照夜晚${label}不存在：${playerId}`);
+  }
+  if (night.seerCheck) {
+    if (!playerIds.has(night.seerCheck.seerId) || !playerIds.has(night.seerCheck.targetId)) {
+      throw new Error("快照预言家查验引用了不存在的玩家。");
+    }
+  }
+  if (night.wolfDiscussion) {
+    validatePlayerIdList(night.wolfDiscussion.speakerOrder, playerIds, "狼人发言队列");
+    validatePlayerMap(night.wolfDiscussion.proposals, playerIds, "狼人刀口提案");
+    validatePlayerMap(night.wolfDiscussion.agreements, playerIds, "狼人刀口同意记录");
+    if (!Array.isArray(night.wolfDiscussion.messages)) throw new Error("快照狼人私聊记录非法。");
+    for (const message of night.wolfDiscussion.messages) {
+      if (!isRecord(message) || typeof message.seatId !== "string" || !playerIds.has(message.seatId)) {
+        throw new Error("快照狼人私聊记录引用了不存在的玩家。");
+      }
+      if (message.proposedTarget && (typeof message.proposedTarget !== "string" || !playerIds.has(message.proposedTarget))) {
+        throw new Error("快照狼人私聊刀口引用了不存在的玩家。");
+      }
+    }
+    if (night.wolfDiscussion.lockedTarget && !playerIds.has(night.wolfDiscussion.lockedTarget)) {
+      throw new Error(`快照狼人锁定刀口不存在：${night.wolfDiscussion.lockedTarget}`);
+    }
+  }
+}
+
+function validateVoteRecord(value: unknown, playerIds: Set<PlayerId>, label: string): void {
+  if (!isRecord(value)) throw new Error(`快照${label}状态非法。`);
+  for (const [voterId, targetId] of Object.entries(value)) {
+    if (!playerIds.has(voterId) || (targetId !== "abstain" && (typeof targetId !== "string" || !playerIds.has(targetId)))) {
+      throw new Error(`快照${label}引用了不存在的玩家。`);
+    }
+  }
+}
+
+function validatePlayerMap(value: unknown, playerIds: Set<PlayerId>, label: string): void {
+  if (!isRecord(value)) throw new Error(`快照${label}状态非法。`);
+  for (const [actorId, targetId] of Object.entries(value)) {
+    if (!playerIds.has(actorId) || typeof targetId !== "string" || !playerIds.has(targetId)) {
+      throw new Error(`快照${label}引用了不存在的玩家。`);
+    }
+  }
+}
+
+function validateRestoredPending(state: GameState, pending: PendingAction, playerIds: Set<PlayerId>): void {
+  if (!isRecord(pending) || typeof pending.kind !== "string" || !(pending.kind in PENDING_PHASES)) {
+    throw new Error("快照包含未知待处理行动。");
+  }
+  const pendingRecord = pending as unknown as Record<string, unknown>;
+  if (typeof pending.seatId !== "string" || !playerIds.has(pending.seatId)) {
+    throw new Error(`快照待处理行动玩家不存在：${String(pending.seatId)}`);
+  }
+  if (!PENDING_PHASES[pending.kind].includes(state.phase.type)) {
+    throw new Error(`快照待处理行动 ${pending.kind} 与阶段 ${state.phase.type} 不匹配。`);
+  }
+  const actor = requirePlayer(state, pending.seatId);
+  const allowsDeadActor = pending.kind === "badge_decision" || pending.kind === "hunter_shot" || (pending.kind === "speech" && pending.speechType === "last_words");
+  if (allowsDeadActor ? actor.alive : !actor.alive) {
+    throw new Error(`快照待处理行动玩家存活状态非法：${pending.seatId}`);
+  }
+
+  if (PENDING_KINDS_WITH_LEGAL_TARGETS.has(pending.kind) && !Array.isArray(pendingRecord.legalTargets)) {
+    throw new Error(`快照 ${pending.kind} 缺少合法目标列表。`);
+  }
+  if (Array.isArray(pendingRecord.legalTargets)) {
+    const legalTargets = pendingRecord.legalTargets;
+    validatePlayerIdList(legalTargets, playerIds, `${pending.kind} 合法目标`);
+    if (new Set(legalTargets).size !== legalTargets.length) {
+      throw new Error(`快照 ${pending.kind} 包含重复合法目标。`);
+    }
+    for (const targetId of legalTargets) {
+      if (!requirePlayer(state, targetId).alive) throw new Error(`快照 ${pending.kind} 包含死亡目标：${targetId}`);
+    }
+    if (["seer_check", "witch_action", "vote", "badge_decision", "hunter_shot"].includes(pending.kind) && legalTargets.includes(pending.seatId)) {
+      throw new Error(`快照 ${pending.kind} 不得把行动玩家列为合法目标。`);
+    }
+  }
+
+  switch (pending.kind) {
+    case "guard_protect":
+      break;
+    case "wolf_discussion": {
+      if (!Number.isInteger(pendingRecord.round) || Number(pendingRecord.round) < 1) {
+        throw new Error("快照狼人行动缺少合法轮次。");
+      }
+      if (pending.currentProposal) {
+        if (!playerIds.has(pending.currentProposal)) throw new Error(`快照狼人当前刀口提案不存在：${pending.currentProposal}`);
+        if (!pending.legalTargets.includes(pending.currentProposal)) throw new Error("快照狼人当前刀口提案不在合法目标中。");
+      }
+      break;
+    }
+    case "seer_check":
+      break;
+    case "witch_action":
+      if (typeof pendingRecord.canSave !== "boolean" || typeof pendingRecord.canPoison !== "boolean") {
+        throw new Error("快照女巫行动缺少合法的用药权限。");
+      }
+      if (pending.wolfTarget && !playerIds.has(pending.wolfTarget)) {
+        throw new Error(`快照女巫所见刀口不存在：${pending.wolfTarget}`);
+      }
+      break;
+    case "sheriff_candidacy":
+      break;
+    case "sheriff_withdrawal":
+      if (pending.voteType !== "sheriff" && pending.voteType !== "sheriff_pk") {
+        throw new Error("快照退水行动类型非法。");
+      }
+      break;
+    case "speech": {
+      const expectedSpeechPhase: Record<SpeechAction["speechType"], PhaseType[]> = {
+        sheriff: ["sheriff_speech"],
+        pk: ["sheriff_pk_speech", "day_pk_speech"],
+        last_words: ["last_words"],
+        day: ["day_speech"]
+      };
+      if (!expectedSpeechPhase[pending.speechType]?.includes(state.phase.type)) {
+        throw new Error(`快照发言类型 ${String(pending.speechType)} 与阶段 ${state.phase.type} 不匹配。`);
+      }
+      break;
+    }
+    case "vote": {
+      const expectedVotePhase: Record<VoteAction["voteType"], PhaseType> = {
+        sheriff: "sheriff_vote",
+        sheriff_pk: "sheriff_pk_vote",
+        day: "day_vote",
+        day_pk: "day_pk_vote"
+      };
+      if (expectedVotePhase[pending.voteType] !== state.phase.type) {
+        throw new Error(`快照投票类型 ${String(pending.voteType)} 与阶段 ${state.phase.type} 不匹配。`);
+      }
+      break;
+    }
+    case "badge_decision":
+      if (typeof pendingRecord.canDestroy !== "boolean" || typeof pending.returnTo !== "string" || !BADGE_RETURN_TARGETS.has(pending.returnTo)) {
+        throw new Error("快照警徽行动必填字段非法。");
+      }
+      validatePlayerIdList(pending.deathIds, playerIds, "警徽处理死亡列表");
+      break;
+    case "hunter_shot":
+      if (typeof pendingRecord.canSkip !== "boolean") throw new Error("快照猎人行动缺少跳过权限。");
+      break;
+  }
+
+  if (pending.kind === "guard_protect" && actor.role !== "guard") throw new Error("快照守卫行动玩家身份不符。");
+  if (pending.kind === "wolf_discussion" && actor.role !== "werewolf") throw new Error("快照狼人行动玩家身份不符。");
+  if (pending.kind === "seer_check" && actor.role !== "seer") throw new Error("快照预言家行动玩家身份不符。");
+  if (pending.kind === "witch_action" && actor.role !== "witch") throw new Error("快照女巫行动玩家身份不符。");
+  if (pending.kind === "hunter_shot" && actor.role !== "hunter") throw new Error("快照猎人行动玩家身份不符。");
+}
+
+function validatePlayerIdList(value: unknown, playerIds: Set<PlayerId>, label: string): asserts value is PlayerId[] {
+  if (!Array.isArray(value) || value.some((id) => typeof id !== "string" || !playerIds.has(id))) {
+    throw new Error(`快照${label}包含不存在的玩家。`);
+  }
 }
 
 export function generateMarkdownLog(state: GameState): string {
@@ -934,9 +1359,27 @@ function isPrivateNightPhase(phase: string): boolean {
   return phase === "night_guard" || phase === "night_wolves" || phase === "night_seer" || phase === "night_witch";
 }
 
-function isNightPhaseType(phase: PhaseType): boolean {
-  return phase === "night_guard" || phase === "night_wolves" || phase === "night_seer" || phase === "night_witch" || phase === "night_resolve";
-}
+const WOLF_SELF_EXPLOSION_PHASES = new Set<PhaseType>([
+  "sheriff_candidacy",
+  "sheriff_speech",
+  "sheriff_withdrawal",
+  "sheriff_vote",
+  "sheriff_pk_speech",
+  "sheriff_pk_vote",
+  "day_speech",
+  "day_vote",
+  "day_pk_speech",
+  "day_pk_vote"
+]);
+
+const SHERIFF_ELECTION_PHASES = new Set<PhaseType>([
+  "sheriff_candidacy",
+  "sheriff_speech",
+  "sheriff_withdrawal",
+  "sheriff_vote",
+  "sheriff_pk_speech",
+  "sheriff_pk_vote"
+]);
 
 export function getLegalTargetsForPending(state: GameState, pending: PendingAction): PlayerState[] {
   if (!("legalTargets" in pending)) return [];
@@ -946,7 +1389,7 @@ export function getLegalTargetsForPending(state: GameState, pending: PendingActi
 export function canWolfSelfExplode(state: GameState, seatId: PlayerId): boolean {
   const player = getPlayer(state, seatId);
   if (state.status !== "running" || !player?.alive || player.role !== "werewolf") return false;
-  return state.phase.type !== "lobby" && !isNightPhaseType(state.phase.type);
+  return WOLF_SELF_EXPLOSION_PHASES.has(state.phase.type);
 }
 
 function validateSetup(setup: GameSetup, preset: RulePreset): void {
@@ -955,6 +1398,9 @@ function validateSetup(setup: GameSetup, preset: RulePreset): void {
   }
   if (setup.humanPlayers < 0 || setup.humanPlayers > setup.totalPlayers) {
     throw new Error("真人数量必须介于 0 和总人数之间。");
+  }
+  if (setup.humanPlayers > 1) {
+    throw new Error("当前版本仅支持 0 或 1 名真人玩家；多人真人模式需要独立的身份与行动会话。");
   }
   if (setup.aiPlayers !== setup.totalPlayers - setup.humanPlayers) {
     throw new Error("AI 数量必须等于总人数减真人数量。");
@@ -1010,6 +1456,7 @@ function enterNight(state: GameState, nightNumber: number): void {
   };
   state.round.day = undefined;
   state.round.lastDeaths = [];
+  state.round.pendingNightDeaths = [];
   enterNextNightStep(state);
 }
 
@@ -1098,7 +1545,8 @@ function enterNightStep(state: GameState, step: ConfiguredNightStep): void {
       return;
     }
     const resource = state.resources[witch.id];
-    const canSelfSave = state.rulePreset.witchRules.allowSelfSaveFirstNight || night.nightNumber > 0 || night.wolfTarget !== witch.id;
+    const isSelfSave = night.wolfTarget === witch.id;
+    const canSelfSave = !isSelfSave || (night.nightNumber === 0 && state.rulePreset.witchRules.allowSelfSaveFirstNight);
     setPhase(state, "night_witch", night.nightNumber, `夜晚 ${night.nightNumber} · 女巫行动`, witch.id);
     state.pendingActions = [
       {
@@ -1327,23 +1775,28 @@ function resolveNightDeaths(state: GameState): void {
   const night = requireNight(state);
   setPhase(state, "night_resolve", night.nightNumber, `夜晚 ${night.nightNumber} · 结算死亡`);
   state.pendingActions = [];
-  const deaths: PlayerId[] = [];
+  const pendingDeaths: PendingNightDeath[] = [];
   const wolfTarget = night.wolfTarget;
   if (wolfTarget) {
     const guarded = night.protectedTarget === wolfTarget;
     const saved = night.witchSave;
     const guardSaveClash = guarded && saved && state.rulePreset.witchRules.guardSaveSameTargetDies;
     if ((!guarded && !saved) || guardSaveClash) {
-      deaths.push(wolfTarget);
+      pendingDeaths.push({ seatId: wolfTarget, reason: "wolf" });
     }
   }
-  if (night.witchPoisonTarget && !deaths.includes(night.witchPoisonTarget)) {
-    deaths.push(night.witchPoisonTarget);
+  if (night.witchPoisonTarget) {
+    const existing = pendingDeaths.find((death) => death.seatId === night.witchPoisonTarget);
+    if (existing) {
+      existing.reason = "poison";
+    } else {
+      pendingDeaths.push({ seatId: night.witchPoisonTarget, reason: "poison" });
+    }
   }
-  for (const targetId of deaths) {
-    markDead(state, targetId, night.witchPoisonTarget === targetId ? "poison" : "wolf");
-  }
-  state.round.lastDeaths = deaths;
+  pendingDeaths.sort((left, right) => requirePlayer(state, left.seatId).seatNumber - requirePlayer(state, right.seatId).seatNumber);
+  const deaths = pendingDeaths.map((death) => death.seatId);
+  state.round.pendingNightDeaths = pendingDeaths;
+  state.round.lastDeaths = [];
   pushEvent(state, "NightDeathsResolved", "admin", {
     deaths,
     protectedTarget: night.protectedTarget,
@@ -1352,7 +1805,6 @@ function resolveNightDeaths(state: GameState): void {
     witchPoisonTarget: night.witchPoisonTarget
   });
 
-  if (finishIfWon(state)) return;
   if (night.nightNumber === 0 && state.rulePreset.sheriffEnabled && !state.round.sheriff.completed) {
     enterSheriffCandidacy(state);
   } else {
@@ -1517,10 +1969,11 @@ function resolveSheriffWithdrawalRound(state: GameState, voteType: "sheriff" | "
 
 function enterSheriffVote(state: GameState, voteType: "sheriff" | "sheriff_pk", candidates: PlayerId[]): void {
   const eligible = alivePlayers(state)
-    .filter((player) => !candidates.includes(player.id) && !player.hasWithdrawnSheriff)
+    .filter((player) => !state.round.sheriff.candidacy[player.id]?.run)
     .map((player) => player.id);
   if (eligible.length === 0) {
-    electSheriff(state, chooseDeterministic(state, candidates, "sheriff-no-voters"), "无警下投票者，按种子随机当选");
+    state.round.sheriff.completed = true;
+    pushEvent(state, "SheriffSkipped", "public", { reason: "没有符合资格的警长投票者，本局无警长" });
     enterDeathAnnouncement(state);
     return;
   }
@@ -1538,10 +1991,13 @@ function electSheriff(state: GameState, seatId: PlayerId, reason: string): void 
   pushEvent(state, "SheriffElected", "public", { sheriffId: seatId, reason });
 }
 
-function enterDeathAnnouncement(state: GameState): void {
+function enterDeathAnnouncement(state: GameState, returnTo: "day_speech" | "night" = "day_speech"): void {
   setPhase(state, "death_announcement", state.day, state.day === 0 ? "公布昨夜死亡" : `第 ${state.day} 天 · 公布昨夜死亡`);
   state.pendingActions = [];
+  state.round.lastWordsReturn = returnTo;
+  finalizePendingNightDeaths(state);
   pushEvent(state, "NightDeathsAnnounced", "public", { deaths: state.round.lastDeaths });
+  if (finishIfWon(state)) return;
   const pendingBadgeSeatId = takePendingBadgeSeatId(state);
   if (pendingBadgeSeatId) {
     enterBadgeDecision(state, pendingBadgeSeatId, "after_death_announcement", state.round.lastDeaths);
@@ -1555,14 +2011,31 @@ function enterDeathAnnouncement(state: GameState): void {
   enterLastWordsOrDaySpeech(state);
 }
 
+function finalizePendingNightDeaths(state: GameState): void {
+  const pendingDeaths = [...(state.round.pendingNightDeaths ?? [])]
+    .filter((death) => requirePlayer(state, death.seatId).alive)
+    .sort((left, right) => requirePlayer(state, left.seatId).seatNumber - requirePlayer(state, right.seatId).seatNumber);
+  for (const death of pendingDeaths) {
+    markDead(state, death.seatId, death.reason, "night_resolve");
+  }
+  state.round.pendingNightDeaths = [];
+  state.round.lastDeaths = pendingDeaths.map((death) => death.seatId);
+}
+
 function enterLastWordsOrDaySpeech(state: GameState): void {
-  state.round.lastWordsReturn = "day_speech";
+  state.round.lastWordsReturn ??= "day_speech";
   state.round.lastWordsQueue = state.round.lastDeaths.filter((id) => {
     const player = getPlayer(state, id);
     return Boolean(player?.death && player.death.day === state.day);
   });
   if (state.round.lastWordsQueue.length === 0) {
-    enterDaySpeech(state);
+    const returnTo = state.round.lastWordsReturn;
+    state.round.lastWordsReturn = undefined;
+    if (returnTo === "night") {
+      afterDayDeaths(state);
+    } else {
+      enterDaySpeech(state);
+    }
     return;
   }
   const current = state.round.lastWordsQueue[0];
@@ -1605,10 +2078,12 @@ function enterDaySpeech(state: GameState): void {
 
 function enterDayVote(state: GameState, voteType: "day" | "day_pk", candidates?: PlayerId[]): void {
   const legalTargets = candidates ?? aliveIds(state);
-  const eligible = aliveIds(state).filter((id) => !candidates?.includes(id));
-  const voters = eligible.length > 0 ? eligible : aliveIds(state);
+  const voters = candidates ? aliveIds(state).filter((id) => !candidates.includes(id)) : aliveIds(state);
   setPhase(state, voteType === "day" ? "day_vote" : "day_pk_vote", state.day, voteType === "day" ? "白天投票" : "PK 投票");
   state.pendingActions = voters.map((seatId) => ({ kind: "vote", seatId, voteType, legalTargets: legalTargets.filter((id) => id !== seatId) }));
+  if (state.pendingActions.length === 0) {
+    resolveDayVote(state, voteType);
+  }
 }
 
 function handleSpeech(state: GameState, command: Extract<GameCommand, { type: "SubmitSpeech" }>): void {
@@ -1743,6 +2218,12 @@ function resolveSheriffVote(state: GameState, voteType: "sheriff" | "sheriff_pk"
   const candidates = voteType === "sheriff" ? state.round.sheriff.candidates : state.round.sheriff.pkCandidates;
   const result = tallyVotes(state, votes, candidates, false);
   pushEvent(state, "SheriffVoteResolved", "public", { voteType, votes, tally: result.tally, top: result.top });
+  if (result.top.length === 0) {
+    state.round.sheriff.completed = true;
+    pushEvent(state, "SheriffSkipped", "public", { reason: "警长投票没有产生有效票，本局无警长" });
+    enterDeathAnnouncement(state);
+    return;
+  }
   if (result.top.length === 1) {
     electSheriff(state, result.top[0], "投票最高");
     enterDeathAnnouncement(state);
@@ -1773,6 +2254,11 @@ function resolveDayVote(state: GameState, voteType: "day" | "day_pk"): void {
   const candidates = voteType === "day" ? aliveIds(state) : day.pkCandidates;
   const result = tallyVotes(state, votes, candidates, true);
   pushEvent(state, "DayVoteResolved", "public", { voteType, votes, tally: result.tally, top: result.top });
+  if (result.top.length === 0) {
+    pushEvent(state, "NoExile", "public", { reason: "投票没有产生有效票，当天无人出局" });
+    afterDayDeaths(state);
+    return;
+  }
   if (result.top.length === 1) {
     exilePlayer(state, result.top[0]);
     return;
@@ -1902,9 +2388,17 @@ function afterDayDeaths(state: GameState): void {
 function handleWolfSelfExplosion(state: GameState, command: Extract<GameCommand, { type: "SubmitWolfSelfExplosion" }>): void {
   if (!canWolfSelfExplode(state, command.seatId)) return;
 
+  const interruptsSheriffElection = SHERIFF_ELECTION_PHASES.has(state.phase.type);
+
   pushEvent(state, "WolfSelfExploded", "public", { seatId: command.seatId }, command.seatId);
   markDead(state, command.seatId, "self_explosion");
   pushEvent(state, "WolfSelfExplosionPrivateReason", "admin", { privateReason: command.privateReason ?? "" }, command.seatId);
+
+  if (interruptsSheriffElection) {
+    abandonSheriffElection(state, "狼人自爆，警长竞选终止");
+    enterDeathAnnouncement(state, "night");
+    return;
+  }
 
   const pendingBadgeSeatId = takePendingBadgeSeatId(state, command.seatId);
   if (pendingBadgeSeatId) {
@@ -1915,6 +2409,20 @@ function handleWolfSelfExplosion(state: GameState, command: Extract<GameCommand,
   state.round.lastDeaths = [command.seatId];
   if (finishIfWon(state)) return;
   enterNight(state, state.day + 1);
+}
+
+function abandonSheriffElection(state: GameState, reason: string): void {
+  for (const player of state.players) {
+    player.isSheriffCandidate = false;
+  }
+  state.round.sheriff.completed = true;
+  state.round.sheriff.candidates = [];
+  state.round.sheriff.speechQueue = [];
+  state.round.sheriff.votes = {};
+  state.round.sheriff.pkCandidates = [];
+  state.round.sheriff.pkVotes = {};
+  state.pendingActions = [];
+  pushEvent(state, "SheriffSkipped", "public", { reason });
 }
 
 function handleDebugForceKill(state: GameState, command: Extract<GameCommand, { type: "DebugForceKill" }>): void {
@@ -1931,40 +2439,104 @@ function handleDebugForceKill(state: GameState, command: Extract<GameCommand, { 
 function handleTimeout(state: GameState, seatId?: PlayerId): void {
   const pending = seatId ? state.pendingActions.find((action) => action.seatId === seatId) : state.pendingActions[0];
   if (!pending) return;
-  if (pending.kind === "speech") {
-    handleSpeech(state, { type: "SubmitSpeech", seatId: pending.seatId, text: "时间到，跳过发言。", privateReason: "超时兜底" });
-    return;
-  }
-  if (pending.kind === "vote") {
-    const fallbackTargets = pending.legalTargets.filter((id) => id !== pending.seatId);
-    const targetId = state.rulePreset.voteRules.allowAbstain ? "abstain" : fallbackTargets[0];
-    if (!targetId) return;
-    handleVote(state, {
-      type: "SubmitVote",
-      seatId: pending.seatId,
-      targetId,
-      privateReason: targetId === "abstain" ? "超时自动弃票" : "超时自动投给默认合法目标",
-      confidence: 0
-    });
-    return;
-  }
-  if (pending.kind === "badge_decision") {
-    handleBadgeDecision(state, { type: "SubmitBadgeDecision", seatId: pending.seatId, targetId: "destroy", privateReason: "超时自动撕毁警徽。" });
-    return;
-  }
-  if (pending.kind === "sheriff_withdrawal") {
-    handleSheriffWithdrawalDecision(state, {
-      type: "SubmitSheriffWithdrawalDecision",
-      seatId: pending.seatId,
-      withdraw: false,
-      privateReason: "超时默认继续留警。"
-    });
-    return;
-  }
-  const decision = createMockDecision(state);
-  if (decision) {
-    const next = applyCommand(state, decision.command);
-    Object.assign(state, next);
+  switch (pending.kind) {
+    case "guard_protect":
+      handleNightAction(state, {
+        type: "SubmitNightAction",
+        seatId: pending.seatId,
+        action: "guard_protect",
+        targetId: "skip",
+        privateReason: "超时自动空守。"
+      });
+      return;
+    case "wolf_discussion": {
+      const targetId =
+        pending.currentProposal ??
+        pending.legalTargets.find((id) => getPlayer(state, id)?.role !== "werewolf") ??
+        pending.legalTargets[0];
+      if (!targetId) {
+        enterNextNightStep(state, "wolf_discussion");
+        return;
+      }
+      handleWolfDiscussion(state, {
+        type: "SubmitWolfDiscussionMessage",
+        seatId: pending.seatId,
+        messageToWolves: "行动超时，我跟随默认刀口。",
+        proposedTargetId: targetId,
+        agreeCurrentProposal: true,
+        privateReason: "超时自动跟随默认合法目标。"
+      });
+      return;
+    }
+    case "seer_check": {
+      const targetId = pending.legalTargets[0];
+      if (!targetId) {
+        enterNextNightStep(state, "seer_check");
+        return;
+      }
+      handleNightAction(state, {
+        type: "SubmitNightAction",
+        seatId: pending.seatId,
+        action: "seer_check",
+        targetId,
+        privateReason: "超时自动查验默认合法目标。"
+      });
+      return;
+    }
+    case "witch_action":
+      handleWitchAction(state, {
+        type: "SubmitWitchAction",
+        seatId: pending.seatId,
+        save: false,
+        privateReason: "超时自动保留药品。"
+      });
+      return;
+    case "sheriff_candidacy":
+      handleSheriffCandidacy(state, {
+        type: "SubmitSheriffCandidacy",
+        seatId: pending.seatId,
+        runForSheriff: false,
+        publicSpeech: "超时未上警。",
+        privateReason: "超时默认不上警。"
+      });
+      return;
+    case "sheriff_withdrawal":
+      handleSheriffWithdrawalDecision(state, {
+        type: "SubmitSheriffWithdrawalDecision",
+        seatId: pending.seatId,
+        withdraw: false,
+        privateReason: "超时默认继续留警。"
+      });
+      return;
+    case "speech":
+      handleSpeech(state, { type: "SubmitSpeech", seatId: pending.seatId, text: "时间到，跳过发言。", privateReason: "超时兜底" });
+      return;
+    case "vote": {
+      const fallbackTargets = pending.legalTargets.filter((id) => id !== pending.seatId);
+      const targetId = state.rulePreset.voteRules.allowAbstain ? "abstain" : fallbackTargets[0];
+      if (!targetId) {
+        state.pendingActions = state.pendingActions.filter((action) => action !== pending);
+        if (state.pendingActions.length === 0) {
+          if (pending.voteType === "sheriff" || pending.voteType === "sheriff_pk") resolveSheriffVote(state, pending.voteType);
+          else resolveDayVote(state, pending.voteType);
+        }
+        return;
+      }
+      handleVote(state, {
+        type: "SubmitVote",
+        seatId: pending.seatId,
+        targetId,
+        privateReason: targetId === "abstain" ? "超时自动弃票" : "超时自动投给默认合法目标",
+        confidence: 0
+      });
+      return;
+    }
+    case "badge_decision":
+      handleBadgeDecision(state, { type: "SubmitBadgeDecision", seatId: pending.seatId, targetId: "destroy", privateReason: "超时自动撕毁警徽。" });
+      return;
+    case "hunter_shot":
+      handleHunterShot(state, { type: "SubmitHunterShot", seatId: pending.seatId, targetId: "skip", privateReason: "超时自动放弃开枪。" });
+      return;
   }
 }
 
@@ -1983,18 +2555,18 @@ function tallyVotes(
   const max = Math.max(...Object.values(tally), 0);
   return {
     tally,
-    top: candidates.filter((candidate) => tally[candidate] === max)
+    top: max > 0 ? candidates.filter((candidate) => tally[candidate] === max) : []
   };
 }
 
-function markDead(state: GameState, targetId: PlayerId, reason: DeathReason): void {
+function markDead(state: GameState, targetId: PlayerId, reason: DeathReason, deathPhase: string = state.phase.type): void {
   const player = requirePlayer(state, targetId);
   if (!player.alive) return;
   player.alive = false;
   player.isSheriffCandidate = false;
   player.hasVoted = false;
   player.hasActed = false;
-  player.death = { day: state.day, phase: state.phase.type, reason };
+  player.death = { day: state.day, phase: deathPhase, reason };
   if (player.isSheriff) {
     player.isSheriff = false;
     state.sheriffSeatId = undefined;
@@ -2195,12 +2767,12 @@ function chooseDeterministic<T>(state: GameState, items: T[], salt: string): T {
 
 function orderedSheriffCandidatesForSpeech(state: GameState, candidates: PlayerId[]): PlayerId[] {
   const sorted = [...candidates].sort((left, right) => requirePlayer(state, left).seatNumber - requirePlayer(state, right).seatNumber);
-  return rotateSeatOrder(state, sorted, `sheriff:${state.day}:${state.id}`);
+  return rotateSeatOrder(state, sorted, `sheriff:${state.day}`);
 }
 
 function rotateSeatOrder(state: GameState, ids: PlayerId[], salt: string): PlayerId[] {
   if (ids.length <= 1) return [...ids];
-  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${salt}`);
+  const rng = createRng(`${state.setup.seed}:seat-order:${state.day}:${state.events.length}:${salt}`);
   const clockwise = rng() >= 0.5;
   const ordered = clockwise ? [...ids] : [...ids].reverse();
   const startIndex = Math.floor(rng() * ordered.length);
@@ -2208,7 +2780,7 @@ function rotateSeatOrder(state: GameState, ids: PlayerId[], salt: string): Playe
 }
 
 function chooseSpeechDirection(state: GameState, salt: string): boolean {
-  return createRng(`${state.setup.seed}:${state.id}:${state.day}:${salt}`)() >= 0.5;
+  return createRng(`${state.setup.seed}:speech-direction:${state.day}:${state.events.length}:${salt}`)() >= 0.5;
 }
 
 function chooseGuardTarget(state: GameState, legalTargets: PlayerId[]): PlayerId | undefined {
@@ -2293,7 +2865,7 @@ function chooseBadgeTarget(state: GameState, legalTargets: PlayerId[]): PlayerId
 
 function shouldRunForSheriff(state: GameState, seatId: PlayerId, persona: (typeof DEFAULT_PERSONAS)[number]): boolean {
   const player = requirePlayer(state, seatId);
-  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${seatId}:sheriff-candidacy`);
+  const rng = createRng(`${state.setup.seed}:sheriff-candidacy:${state.day}:${seatId}`);
   if (player.role === "seer") return rng() < 0.9;
   if (player.role === "werewolf") {
     const wolfPlan = extractWolfSheriffPlan(state);
@@ -2400,7 +2972,7 @@ function shouldWithdrawBeforeSheriffVote(
   });
   if (candidates.length <= 2 || player.role === "seer") return false;
 
-  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${seatId}:sheriff-withdraw`);
+  const rng = createRng(`${state.setup.seed}:sheriff-withdraw:${state.day}:${state.events.length}:${seatId}`);
   const publicCase = scoreSheriffCandidatePublicCase(state, seatId);
   if (player.role === "werewolf") {
     const teammateStillOnPolice = knownWolfTeammates(state, seatId).some((id) => id !== seatId && candidates.includes(id));
@@ -2413,7 +2985,7 @@ function shouldWithdrawBeforeSheriffVote(
 
 function choosePublicAttentionTarget(state: GameState, legalTargets: PlayerId[], salt: string): PlayerId | undefined {
   if (legalTargets.length === 0) return undefined;
-  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${salt}`);
+  const rng = createRng(`${state.setup.seed}:public-attention:${state.day}:${state.events.length}:${salt}`);
   const scored = legalTargets.map((id) => ({
     id,
     score: scorePublicAttention(state, id) + scorePublicSuspicion(state, id) * 0.35 + rng() * 0.4
@@ -2429,7 +3001,7 @@ function choosePublicSuspicionTarget(
   minimumScore: number
 ): PlayerId | undefined {
   if (legalTargets.length === 0) return undefined;
-  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${salt}`);
+  const rng = createRng(`${state.setup.seed}:public-suspicion:${state.day}:${state.events.length}:${salt}`);
   const scored = legalTargets.map((id) => ({
     id,
     baseScore: scorePublicSuspicion(state, id),
@@ -2442,7 +3014,7 @@ function choosePublicSuspicionTarget(
 
 function chooseSheriffVoteTarget(state: GameState, voterId: PlayerId, targetPool: PlayerId[]): PlayerId | "abstain" {
   const voter = requirePlayer(state, voterId);
-  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${voterId}:sheriff-vote`);
+  const rng = createRng(`${state.setup.seed}:sheriff-vote:${state.day}:${state.events.length}:${voterId}`);
   const scored = targetPool.map((id) => ({
     id,
     score: scoreSheriffCandidatePublicCase(state, id) + scoreSheriffCandidateRelationToVoter(state, id, voterId) + rng() * 0.3
@@ -2603,7 +3175,7 @@ function latestSeerCheck(state: GameState, seatId: PlayerId): { targetId: Player
 
 function choosePublicPressureTargets(state: GameState, selfId: PlayerId): PlayerId[] {
   const legalTargets = aliveIds(state).filter((id) => id !== selfId);
-  const rng = createRng(`${state.setup.seed}:${state.id}:${state.day}:${state.events.length}:${selfId}:pressure`);
+  const rng = createRng(`${state.setup.seed}:pressure:${state.day}:${state.events.length}:${selfId}`);
   return legalTargets
     .map((id) => ({ id, score: scorePublicSuspicion(state, id) }))
     .filter((item) => item.score >= 1)
@@ -2752,6 +3324,14 @@ function pushEvent<TPayload extends Record<string, unknown>>(
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function createGameId(): string {
+  gameIdSequence += 1;
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, "");
+  const uuid = globalThis.crypto?.randomUUID?.();
+  const entropy = uuid ?? `${gameIdSequence.toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+  return `game_${timestamp}_${entropy}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

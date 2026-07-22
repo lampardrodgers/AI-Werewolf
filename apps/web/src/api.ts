@@ -48,7 +48,8 @@ export async function requestAIDecision(
   seatId?: PlayerId,
   requestId?: string,
   providerApiKeys?: Record<string, string>,
-  contextCompression?: ContextCompressionConfig
+  contextCompression?: ContextCompressionConfig,
+  signal?: AbortSignal
 ): Promise<{
   ok: boolean;
   command?: GameCommand;
@@ -60,6 +61,7 @@ export async function requestAIDecision(
   const response = await fetch("/api/ai/decision", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal,
     body: JSON.stringify({
       state: compactStateForAIDecision(state),
       seatId,
@@ -77,6 +79,12 @@ export async function requestAIDecision(
     fallback: boolean;
     error?: string;
   };
+}
+
+export async function cancelAIDecision(requestId: string): Promise<{ ok: boolean; cancelled: boolean }> {
+  const response = await fetch(`/api/ai/cancel/${encodeURIComponent(requestId)}`, { method: "POST", keepalive: true });
+  if (!response.ok) throw new Error("取消 AI 决策请求失败");
+  return (await response.json()) as { ok: boolean; cancelled: boolean };
 }
 
 function compactStateForAIDecision(state: GameState): GameState {

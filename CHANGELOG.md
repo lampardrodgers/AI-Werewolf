@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.2 - 2026-07-22
+
+- Fixed first-night death timing, sheriff-election voting eligibility, tie/abstention outcomes, witch self-save rules, timeout resolution, and wolf self-explosion phase handling.
+- Added deterministic gameplay randomness independent of unique game IDs, stronger snapshot validation, single-browser human-player validation, and collision-resistant game IDs.
+- Hardened AI decision parsing, provider concurrency/RPM/TPM limits, request idempotency, cancellation, abort propagation, and seat-scoped Mock fallback behavior.
+- Added local session persistence with safe recovery, AI mode/context restoration, page-hide cancellation, stale-response isolation, and atomic snapshot import handling.
+- Expanded engine, server, gateway, and web regression coverage.
+
 ## v0.2.1 - 2026-06-25
 
 - Improved table speech overflow handling so long AI/player text stays within the play area.

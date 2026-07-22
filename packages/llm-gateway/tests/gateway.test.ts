@@ -7,6 +7,44 @@ describe("LLM gateway", () => {
     vi.unstubAllGlobals();
   });
 
+  it("forwards an external abort signal even when hard timeouts are disabled", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        return await new Promise<Response>((_resolve, reject) => {
+          const abort = () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (init?.signal?.aborted) abort();
+          else init?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      })
+    );
+    const provider: ProviderAccount = {
+      ...DEFAULT_AI_CONFIG.providers[0],
+      id: "abort-provider",
+      type: "openai_compatible",
+      baseUrl: "https://example.test/v1",
+      timeoutMs: 0,
+      defaultModel: "abort-model"
+    };
+    const controller = new AbortController();
+    const request = createProviderAdapter(provider).generateText({
+      provider,
+      model: "abort-model",
+      prompt: "wait",
+      apiKey: "test-secret",
+      timeoutMs: 0,
+      signal: controller.signal
+    });
+
+    controller.abort();
+
+    await expect(request).rejects.toMatchObject({ name: "AbortError" });
+  });
+
   it("uses Anthropic's x-api-key header instead of bearer auth", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     vi.stubGlobal(

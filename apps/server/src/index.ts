@@ -6,7 +6,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createProviderAdapter } from "@langrensha/llm-gateway";
 import { AIConfigStore, DEFAULT_AI_CONFIG, DEFAULT_CONTEXT_COMPRESSION, DEFAULT_COST_CONTROLS } from "@langrensha/shared";
-import { AIDecisionProgress, AIDecisionRequest, buildAIDecision } from "./aiDecision";
+import { AIDecisionProgress, AIDecisionRequest, AIDecisionResponse, buildAIDecision } from "./aiDecision";
+import { AIRequestRegistry } from "./aiRequestRegistry";
 import { buildAllowedOrigins, isAllowedCorsOrigin } from "./cors";
 
 const WORKSPACE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -15,7 +16,8 @@ const CONFIG_PATH = path.join(DATA_DIR, "ai-config.json");
 const LEGACY_CONFIG_PATH = path.join(WORKSPACE_ROOT, "apps/server/data/ai-config.json");
 const ALLOWED_ORIGINS = buildAllowedOrigins(process.env.LANGRENSHA_ALLOWED_ORIGINS);
 const AI_STATUS_TTL_MS = 10 * 60 * 1000;
-const aiStatuses = new Map<string, AIDecisionProgress & { startedAt: string; updatedAt: string }>();
+const aiStatuses = new Map<string, AIDecisionProgress & { startedAt: string; updatedAt: string; active: boolean }>();
+const aiRequests = new AIRequestRegistry<AIDecisionResponse>(AI_STATUS_TTL_MS);
 
 const fastify = Fastify({
   logger: true,
@@ -71,14 +73,45 @@ fastify.get<{ Params: { requestId: string } }>("/api/ai/status/:requestId", asyn
 });
 
 fastify.post<{ Body: AIDecisionRequest }>("/api/ai/decision", async (request) => {
-  const config = await loadConfig();
   const requestId = request.body.requestId || crypto.randomUUID();
-  recordAIProgress({
-    requestId,
-    status: "received",
-    message: "服务端已收到 AI 决策请求。"
+  const fingerprint = decisionFingerprint(request.body);
+  const registration = aiRequests.getOrCreate(requestId, fingerprint, async (signal) => {
+    recordAIProgress({
+      requestId,
+      status: "received",
+      message: "服务端已收到 AI 决策请求。"
+    });
+    try {
+      const config = await loadConfig();
+      return await buildAIDecision({ ...request.body, requestId, signal }, config, undefined, createProviderAdapter, recordAIProgress);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      recordAIProgress({ requestId, status: "failed", message: "AI 决策请求失败。", error: message });
+      return { ok: false, fallback: false, error: message };
+    } finally {
+      markAIRequestSettled(requestId);
+    }
   });
-  return buildAIDecision({ ...request.body, requestId }, config, undefined, createProviderAdapter, recordAIProgress);
+  if (registration.kind === "conflict") {
+    return { ok: false, fallback: false, error: "requestId 已用于不同 AI 决策" };
+  }
+  if (registration.kind === "cancelled") {
+    return { ok: false, fallback: false, error: "AI 请求已取消" };
+  }
+  return registration.promise;
+});
+
+fastify.post<{ Params: { requestId: string } }>("/api/ai/cancel/:requestId", async (request) => {
+  const cancelled = aiRequests.cancel(request.params.requestId);
+  if (cancelled) {
+    recordAIProgress({
+      requestId: request.params.requestId,
+      status: "failed",
+      message: "AI 请求已取消",
+      error: "AI 请求已取消"
+    });
+  }
+  return { ok: true, cancelled };
 });
 
 const port = Number(process.env.PORT ?? 12001);
@@ -118,18 +151,37 @@ function recordAIProgress(progress: AIDecisionProgress): void {
     ...progress,
     requestId,
     startedAt: existing?.startedAt ?? now,
-    updatedAt: now
+    updatedAt: now,
+    active: !["completed", "fallback", "failed"].includes(progress.status)
   });
   pruneAIStatuses();
+}
+
+function markAIRequestSettled(requestId: string): void {
+  const status = aiStatuses.get(requestId);
+  if (!status) return;
+  aiStatuses.set(requestId, { ...status, active: false, updatedAt: new Date().toISOString() });
 }
 
 function pruneAIStatuses(): void {
   const cutoff = Date.now() - AI_STATUS_TTL_MS;
   for (const [requestId, status] of aiStatuses.entries()) {
-    if (new Date(status.updatedAt).getTime() < cutoff) {
+    if (!status.active && new Date(status.updatedAt).getTime() < cutoff) {
       aiStatuses.delete(requestId);
     }
   }
+  aiRequests.prune();
+}
+
+function decisionFingerprint(request: AIDecisionRequest): string {
+  // Include every non-secret decision input so a reused requestId cannot return
+  // a result built from stale events, memory, resources, or compression rules.
+  const canonicalInput = JSON.stringify({
+    state: request.state,
+    seatId: request.seatId,
+    contextCompression: request.contextCompression
+  });
+  return crypto.createHash("sha256").update(canonicalInput).digest("hex");
 }
 
 function normalizeIncomingConfig(next: AIConfigStore): AIConfigStore {

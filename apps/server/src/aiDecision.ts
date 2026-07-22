@@ -1,5 +1,13 @@
 import { AgentMemoryUpdate, GameCommand, GameState, PendingAction, canWolfSelfExplode, createMockDecision, getPlayerVisibleEvents } from "@langrensha/engine";
-import { LLMObjectParseError, LLMObjectResponse, LLMProviderAdapter, createProviderAdapter, parseObjectResponse } from "@langrensha/llm-gateway";
+import {
+  LLMObjectParseError,
+  LLMObjectRequest,
+  LLMObjectResponse,
+  LLMProviderAdapter,
+  LLMTextRequest,
+  createProviderAdapter,
+  parseObjectResponse
+} from "@langrensha/llm-gateway";
 import { OUTPUT_SCHEMAS, SYSTEM_PROMPT_VERSION, buildPromptPreview } from "@langrensha/prompts";
 import { randomUUID } from "node:crypto";
 import {
@@ -24,6 +32,7 @@ export interface AIDecisionRequest {
   requestId?: string;
   providerApiKeys?: Record<string, string | undefined>;
   contextCompression?: ContextCompressionConfig;
+  signal?: AbortSignal;
 }
 
 export interface AIDecisionResponse {
@@ -67,6 +76,31 @@ const PROMPT_CONTEXT_SAFETY_TOKENS = 1000;
 const PROMPT_BUDGET_RATIO = 0.9;
 const PROMPT_PREVIEW_MAX_LENGTH = 8000;
 
+interface ProviderUsageEvent {
+  at: number;
+  tokens: number;
+}
+
+interface ProviderRateState {
+  active: number;
+  usage: ProviderUsageEvent[];
+  waiters: Array<() => void>;
+}
+
+const PROVIDER_RATE_WINDOW_MS = 60_000;
+const providerRateStates = new Map<string, ProviderRateState>();
+
+class ProviderRateLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProviderRateLimitError";
+  }
+}
+
+export function resetProviderRateLimitsForTests(): void {
+  providerRateStates.clear();
+}
+
 export async function buildAIDecision(
   request: AIDecisionRequest,
   config: AIConfigStore,
@@ -75,6 +109,9 @@ export async function buildAIDecision(
   onProgress?: AIDecisionProgressCallback
 ): Promise<AIDecisionResponse> {
   const requestId = request.requestId;
+  if (request.signal?.aborted) {
+    return cancelledDecision(request, onProgress);
+  }
   const pending = selectPendingAction(request.state, request.seatId);
   if (!pending) {
     onProgress?.({
@@ -104,7 +141,7 @@ export async function buildAIDecision(
   if (!provider || !model || provider.baseUrl.startsWith("mock://")) {
     const reason = `未配置真实供应商，使用 Mock 兜底：${persona.name}`;
     onProgress?.({ requestId, status: "fallback", seatId: pending.seatId, phase: request.state.phase.label, message: reason, error: reason });
-    return fallbackDecision(request.state, reason);
+    return fallbackDecision(request.state, pending, reason);
   }
 
   const apiKey = apiKeyResolver(provider, request);
@@ -154,7 +191,7 @@ export async function buildAIDecision(
   const timeoutMs = requestTimeoutMs(provider);
   const expectedThinkingMs = expectedThinkingWindowMs(persona);
 
-  const adapter = adapterFactory(provider);
+  const adapter = createRateLimitedAdapter(adapterFactory(provider), request.signal);
   let textRecoveryAttempts = 0;
   const maxTextRecoveryAttempts = 1;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -189,7 +226,8 @@ export async function buildAIDecision(
         topP: isCompactRepairAttempt ? Math.min(persona.topP, 0.8) : persona.topP,
         maxOutputTokens: isCompactRepairAttempt ? Math.min(maxOutputTokens, 600) : maxOutputTokens,
         reasoningEffort: providerReasoningEffort(provider, persona),
-        timeoutMs
+        timeoutMs,
+        signal: request.signal
       });
       const command = commandFromModelObject(request.state, pending, result.object);
       const memoryUpdate = extractMemoryUpdate(result.object);
@@ -213,6 +251,24 @@ export async function buildAIDecision(
         fallback: false
       };
     } catch (error) {
+      if (request.signal?.aborted || isAbortError(error)) {
+        return cancelledDecision(request, onProgress, pending);
+      }
+      if (error instanceof ProviderRateLimitError) {
+        const reason = error.message;
+        onProgress?.({
+          requestId,
+          status: "failed",
+          seatId: pending.seatId,
+          phase: request.state.phase.label,
+          provider: provider.name,
+          model,
+          attempt,
+          message: reason,
+          error: reason
+        });
+        return { ok: false, fallback: false, error: reason };
+      }
       const recovered = recoverTextDecisionFromParseError(error, request.state, pending);
       if (recovered) {
         onProgress?.({
@@ -251,18 +307,41 @@ export async function buildAIDecision(
       }
       if (textRecoveryAttempts < maxTextRecoveryAttempts && shouldTryTextRecovery(error, pending, attempt)) {
         textRecoveryAttempts += 1;
-        const textRecovered = await recoverWithTextGeneration({
-          adapter,
-          provider,
-          model,
-          apiKey,
-          state: request.state,
-          pending,
-          persona,
-          config,
-          timeoutMs,
-          error: normalizeError(error).message
-        });
+        let textRecovered: Awaited<ReturnType<typeof recoverWithTextGeneration>>;
+        try {
+          textRecovered = await recoverWithTextGeneration({
+            adapter,
+            provider,
+            model,
+            apiKey,
+            state: request.state,
+            pending,
+            persona,
+            config,
+            timeoutMs,
+            error: normalizeError(error).message
+          });
+        } catch (recoveryError) {
+          if (request.signal?.aborted || isAbortError(recoveryError)) {
+            return cancelledDecision(request, onProgress, pending);
+          }
+          if (recoveryError instanceof ProviderRateLimitError) {
+            const reason = recoveryError.message;
+            onProgress?.({
+              requestId,
+              status: "failed",
+              seatId: pending.seatId,
+              phase: request.state.phase.label,
+              provider: provider.name,
+              model,
+              attempt,
+              message: reason,
+              error: reason
+            });
+            return { ok: false, fallback: false, error: reason };
+          }
+          throw recoveryError;
+        }
         if (textRecovered) {
           onProgress?.({
             requestId,
@@ -338,6 +417,123 @@ export async function buildAIDecision(
   return { ok: false, fallback: false, error: reason };
 }
 
+function createRateLimitedAdapter(adapter: LLMProviderAdapter, fallbackSignal?: AbortSignal): LLMProviderAdapter {
+  return {
+    listModels: (provider, apiKey) => adapter.listModels(provider, apiKey),
+    generateText: (request) =>
+      withProviderRateLimit(request, request.signal ?? fallbackSignal, () =>
+        adapter.generateText({ ...request, signal: request.signal ?? fallbackSignal })
+      ),
+    generateObject: <TObject>(request: LLMObjectRequest) =>
+      withProviderRateLimit(request, request.signal ?? fallbackSignal, () =>
+        adapter.generateObject<TObject>({ ...request, signal: request.signal ?? fallbackSignal })
+      )
+  };
+}
+
+async function withProviderRateLimit<T>(request: LLMTextRequest, signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
+  const estimatedTokens = Math.max(1, estimatePromptTokens(request.prompt) + Math.max(0, request.maxOutputTokens ?? 0));
+  const release = await acquireProviderCapacity(request.provider, estimatedTokens, signal);
+  try {
+    const result = await run();
+    throwIfAborted(signal);
+    return result;
+  } finally {
+    release();
+  }
+}
+
+async function acquireProviderCapacity(provider: ProviderAccount, estimatedTokens: number, signal?: AbortSignal): Promise<() => void> {
+  const state = providerRateStates.get(provider.id) ?? { active: 0, usage: [], waiters: [] };
+  providerRateStates.set(provider.id, state);
+  const concurrency = positiveLimit(provider.rateLimit?.concurrency);
+
+  while (concurrency !== undefined && state.active >= concurrency) {
+    await waitForProviderSlot(state, signal);
+  }
+  throwIfAborted(signal);
+
+  const now = Date.now();
+  state.usage = state.usage.filter((event) => now - event.at < PROVIDER_RATE_WINDOW_MS);
+  const rpm = positiveLimit(provider.rateLimit?.rpm);
+  if (rpm !== undefined && state.usage.length >= rpm) {
+    throw new ProviderRateLimitError(`供应商限流：${provider.name} 已达到每分钟 ${rpm} 次请求上限，请稍后重试。`);
+  }
+  const tpm = positiveLimit(provider.rateLimit?.tpm);
+  const usedTokens = state.usage.reduce((sum, event) => sum + event.tokens, 0);
+  if (tpm !== undefined && usedTokens + estimatedTokens > tpm) {
+    throw new ProviderRateLimitError(
+      `供应商限流：${provider.name} 本次预计 ${estimatedTokens} tokens，当前分钟已预留 ${usedTokens}/${tpm} tokens。`
+    );
+  }
+
+  state.active += 1;
+  state.usage.push({ at: now, tokens: estimatedTokens });
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    state.active = Math.max(0, state.active - 1);
+    const waiters = state.waiters.splice(0);
+    for (const wake of waiters) wake();
+  };
+}
+
+function waitForProviderSlot(state: ProviderRateState, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const wake = () => {
+      cleanup();
+      resolve();
+    };
+    const abort = () => {
+      cleanup();
+      const error = new Error("AI 请求已取消");
+      error.name = "AbortError";
+      reject(error);
+    };
+    const cleanup = () => {
+      const index = state.waiters.indexOf(wake);
+      if (index >= 0) state.waiters.splice(index, 1);
+      signal?.removeEventListener("abort", abort);
+    };
+    state.waiters.push(wake);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function positiveLimit(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error("AI 请求已取消");
+  error.name = "AbortError";
+  throw error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function cancelledDecision(
+  request: AIDecisionRequest,
+  onProgress?: AIDecisionProgressCallback,
+  pending?: PendingAction
+): AIDecisionResponse {
+  const reason = "AI 请求已取消";
+  onProgress?.({
+    requestId: request.requestId,
+    status: "failed",
+    seatId: pending?.seatId ?? request.seatId,
+    phase: request.state.phase.label,
+    message: reason,
+    error: reason
+  });
+  return { ok: false, fallback: false, error: reason };
+}
+
 function resolveBrowserApiKey(provider: ProviderAccount, request: AIDecisionRequest): string | undefined {
   const apiKey = request.providerApiKeys?.[provider.id]?.trim();
   return apiKey || undefined;
@@ -407,8 +603,8 @@ function selectPendingAction(state: GameState, seatId?: PlayerId): PendingAction
   });
 }
 
-function fallbackDecision(state: GameState, reason: string, retryCount = 0, promptPackage?: PromptPackage): AIDecisionResponse {
-  const decision = createMockDecision(state);
+function fallbackDecision(state: GameState, pending: PendingAction, reason: string, retryCount = 0, promptPackage?: PromptPackage): AIDecisionResponse {
+  const decision = createMockDecision({ ...state, pendingActions: [pending] });
   if (!decision) {
     return { ok: false, fallback: true, error: reason };
   }
@@ -439,7 +635,8 @@ function recoverTextDecisionFromParseError(
   try {
     const command = commandFromModelObject(state, pending, result.object);
     return { result, command, memoryUpdate: extractMemoryUpdate(result.object) };
-  } catch {
+  } catch (error) {
+    if (isAbortError(error) || error instanceof ProviderRateLimitError) throw error;
     return undefined;
   }
 }
@@ -481,7 +678,8 @@ async function recoverWithTextGeneration({
       reasoningEffort: providerReasoningEffort(provider, persona),
       timeoutMs
     });
-  } catch {
+  } catch (error) {
+    if (isAbortError(error) || error instanceof ProviderRateLimitError) throw error;
     return undefined;
   }
   let result: LLMObjectResponse<Record<string, unknown>> | undefined;
@@ -511,8 +709,10 @@ function coercePlainTextResponse(
   if (!text) return undefined;
   const privateReason = "模型返回自然语言而非 JSON，但内容明确完成当前阶段动作，服务端按原文抽取结构化字段。";
 
-  if (canWolfSelfExplode(state, pending.seatId) && mentionsWolfSelfExplosion(text)) {
-    return { ...response, text, object: { self_explode: true, public_speech: text, private_reason: privateReason, memory_update: {} } };
+  // Self-explosion is irreversible and must never be inferred from prose. Force
+  // a structured repair whenever plain text mentions it, including negations.
+  if (canWolfSelfExplode(state, pending.seatId) && /自爆|self[_\s-]?explode/i.test(text)) {
+    return undefined;
   }
 
   if (pending.kind === "speech") {
@@ -1380,25 +1580,21 @@ function schemaNameForPending(pending: PendingAction): keyof typeof OUTPUT_SCHEM
 }
 
 function commandFromModelObject(state: GameState, pending: PendingAction, object: Record<string, unknown>): GameCommand {
-  if (
-    canWolfSelfExplode(state, pending.seatId) &&
-    isExplicitTrue(firstValue(object, ["self_explode", "selfExplode", "wolf_self_explode", "wolfSelfExplode", "self_destruct", "selfDestruct"]))
-  ) {
+  if (!isRecord(object)) {
+    throw new Error("模型输出必须是 JSON 对象");
+  }
+  const rawSelfExplosion = firstValue(object, ["self_explode", "selfExplode", "wolf_self_explode", "wolfSelfExplode", "self_destruct", "selfDestruct"]);
+  const selfExplosion = optionalSchemaBoolean(rawSelfExplosion, "self_explode");
+  if (selfExplosion === true) {
+    if (!canWolfSelfExplode(state, pending.seatId)) {
+      throw new Error("当前玩家或阶段不允许狼人自爆");
+    }
     return {
       type: "SubmitWolfSelfExplosion",
       seatId: pending.seatId,
       privateReason: requiredPrivateReason(object)
     };
   }
-  const publicSpeechIntent = textValue(firstValue(object, ["public_speech", "publicSpeech", "speech"]));
-  if (publicSpeechIntent && canWolfSelfExplode(state, pending.seatId) && mentionsWolfSelfExplosion(publicSpeechIntent)) {
-    return {
-      type: "SubmitWolfSelfExplosion",
-      seatId: pending.seatId,
-      privateReason: requiredPrivateReason(object)
-    };
-  }
-
   if (pending.kind === "guard_protect") {
     const rawTarget = firstValue(object, ["target_id", "targetId", "target"]);
     return {
@@ -1420,11 +1616,21 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
   }
   if (pending.kind === "witch_action") {
     const poisonTarget = firstValue(object, ["poison_target_id", "poisonTargetId", "poison_target", "poisonTarget"]);
+    const save = requiredSchemaBoolean(firstValue(object, ["save", "use_save", "useAntidote"]), "save");
+    if (save && !pending.canSave) {
+      throw new Error("女巫当前不能使用解药");
+    }
+    if (poisonTarget !== undefined && poisonTarget !== null && typeof poisonTarget !== "string") {
+      throw new Error("poison_target_id 必须是合法玩家 ID 或 null");
+    }
+    if (typeof poisonTarget === "string" && poisonTarget.trim() && !pending.canPoison) {
+      throw new Error("女巫当前不能使用毒药");
+    }
     return {
       type: "SubmitWitchAction",
       seatId: pending.seatId,
-      save: Boolean(firstValue(object, ["save", "use_save", "useAntidote"])) && pending.canSave,
-      poisonTargetId: typeof poisonTarget === "string" ? requireLegalTarget(state, poisonTarget, pending.legalTargets) : undefined,
+      save,
+      poisonTargetId: typeof poisonTarget === "string" && poisonTarget.trim() ? requireLegalTarget(state, poisonTarget, pending.legalTargets) : undefined,
       privateReason: requiredPrivateReason(object)
     };
   }
@@ -1438,7 +1644,7 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
       seatId: pending.seatId,
       messageToWolves,
       proposedTargetId: requireLegalTarget(state, firstValue(object, ["proposed_target", "proposed_target_id", "proposedTarget", "target_id", "targetId"]), pending.legalTargets),
-      agreeCurrentProposal: Boolean(firstValue(object, ["agree_current_proposal", "agreeCurrentProposal", "agree"])),
+      agreeCurrentProposal: requiredSchemaBoolean(firstValue(object, ["agree_current_proposal", "agreeCurrentProposal", "agree"]), "agree_current_proposal"),
       privateReason: requiredPrivateReason(object)
     };
   }
@@ -1497,21 +1703,29 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
     };
   }
   if (pending.kind === "vote") {
-    const rawTarget = String(firstValue(object, ["vote_target", "voteTarget", "target_id", "targetId", "target"]) ?? "");
-    const targetId =
-      rawTarget.trim() === "abstain" || (state.rulePreset.voteRules.allowAbstain && referencesSeat(state, rawTarget, pending.seatId))
-        ? "abstain"
-        : requireLegalTarget(state, rawTarget, pending.legalTargets);
+    const rawTarget = requiredFieldText(object, ["vote_target", "voteTarget", "target_id", "targetId", "target"]);
+    const wantsAbstain = rawTarget.trim().toLowerCase() === "abstain" || referencesSeat(state, rawTarget, pending.seatId);
+    if (wantsAbstain && !state.rulePreset.voteRules.allowAbstain) {
+      throw new Error("当前规则不允许弃票");
+    }
+    const targetId = wantsAbstain ? "abstain" : requireLegalTarget(state, rawTarget, pending.legalTargets);
+    const confidence = requiredFiniteNumber(firstValue(object, ["confidence"]), "confidence");
+    if (confidence < 0 || confidence > 1) {
+      throw new Error("confidence 必须在 0 到 1 之间");
+    }
     return {
       type: "SubmitVote",
       seatId: pending.seatId,
       targetId,
       privateReason: requiredVotePrivateReason(state, targetId, object),
-      confidence: typeof object.confidence === "number" ? Math.max(0, Math.min(1, object.confidence)) : 0.5
+      confidence
     };
   }
   if (pending.kind === "badge_decision") {
-    const rawTarget = String(firstValue(object, ["target_id", "targetId", "badge_target", "badgeTarget", "target"]) ?? "destroy");
+    const rawTarget = requiredFieldText(object, ["target_id", "targetId", "badge_target", "badgeTarget", "target"]);
+    if (rawTarget.trim() === "destroy" && !pending.canDestroy) {
+      throw new Error("当前规则不允许撕毁警徽");
+    }
     return {
       type: "SubmitBadgeDecision",
       seatId: pending.seatId,
@@ -1519,7 +1733,10 @@ function commandFromModelObject(state: GameState, pending: PendingAction, object
       privateReason: requiredPrivateReason(object)
     };
   }
-  const rawTarget = String(firstValue(object, ["target_id", "targetId", "shot_target", "shotTarget"]) ?? "skip");
+  const rawTarget = requiredFieldText(object, ["target_id", "targetId", "shot_target", "shotTarget"]);
+  if (rawTarget.trim() === "skip" && !pending.canSkip) {
+    throw new Error("猎人当前不能选择不开枪");
+  }
   return {
     type: "SubmitHunterShot",
     seatId: pending.seatId,
@@ -1835,10 +2052,6 @@ function mentionsGuardSkip(text: string): boolean {
   return /(空守|不守|不守护|跳过守护|skip)/i.test(text);
 }
 
-function mentionsWolfSelfExplosion(text: string): boolean {
-  return /(我自爆|选择自爆|直接自爆|狼人自爆|自爆身份|认狼自爆|self[_\s-]?explode)/i.test(text);
-}
-
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -2112,8 +2325,28 @@ function firstValue(object: Record<string, unknown>, keys: string[]): unknown {
   return undefined;
 }
 
-function isExplicitTrue(value: unknown): boolean {
-  return value === true || value === 1 || (typeof value === "string" && /^(true|yes|1)$/i.test(value.trim()));
+function optionalSchemaBoolean(value: unknown, fieldName: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  throw new Error(`${fieldName} 必须是布尔值`);
+}
+
+function requiredSchemaBoolean(value: unknown, fieldName: string): boolean {
+  const parsed = optionalSchemaBoolean(value, fieldName);
+  if (parsed === undefined) throw new Error(`模型输出缺少 ${fieldName} 布尔字段`);
+  return parsed;
+}
+
+function requiredFiniteNumber(value: unknown, fieldName: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${fieldName} 必须是有限数字`);
+  }
+  return value;
 }
 
 function textValue(value: unknown): string | undefined {
